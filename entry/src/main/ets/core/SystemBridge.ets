@@ -81,7 +81,7 @@ export async function notifyGenerationComplete(
     return;
   }
   try {
-    const cleanTitle = title.trim().length > 0 ? title.trim() : 'LexiKelivo';
+    const cleanTitle = title.trim().length > 0 ? title.trim() : 'Kelivo';
     const cleanBody = previewText.trim().length > 0 ? previewText.trim().slice(0, 120) : '回复已生成完成';
     const basic: notificationManager.NotificationBasicContent = {
       title: cleanTitle,

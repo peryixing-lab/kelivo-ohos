@@ -1,6 +1,6 @@
-# LexiKelivo 鸿蒙原生版
+# Kelivo 鸿蒙原生版
 
-LexiKelivo 是基于 HarmonyOS NEXT（ArkTS、ArkUI 与 Stage 模型）打造的原生多模型 AI 对话、Agent 工具与自动化工作台客户端。工程包名沿用 `com.lovexjy.lexikelivo`，交互体验、协议能力与生态格式全面对齐上游 [Chevey339/kelivo](https://github.com/Chevey339/kelivo)，针对鸿蒙手机与平板形态（宽屏三栏分栏、系统安全沙箱、Asset Store、RelationalStore SQLite、ArkWeb 等）进行了原生重构与适配。
+Kelivo 是基于 HarmonyOS NEXT（ArkTS、ArkUI 与 Stage 模型）打造的原生多模型 AI 对话、Agent 工具与自动化工作台客户端。工程包名沿用 `com.lovexjy.lexikelivo`，交互体验、协议能力与生态格式全面对齐上游 [Chevey339/kelivo](https://github.com/Chevey339/kelivo)，针对鸿蒙手机与平板形态（宽屏三栏分栏、系统安全沙箱、Asset Store、RelationalStore SQLite、ArkWeb 等）进行了原生重构与适配。
 
 ## 核心特性总览
 

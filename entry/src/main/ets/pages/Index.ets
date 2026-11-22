@@ -5475,7 +5475,6 @@ struct Index {
             providerCount: this.workspace.providers.length,
             conversationCount: this.workspace.conversations.length,
             embeddedInNav: true,
-            onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
             onClose: () => { this.navigateBack(); }
           })
         }

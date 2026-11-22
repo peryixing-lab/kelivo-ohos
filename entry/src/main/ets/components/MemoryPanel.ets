@@ -748,7 +748,7 @@ export struct MemoryPanel {
   }
 
   private async copyAllMemoriesMarkdown(): Promise<void> {
-    const lines: string[] = ['# LexiKelivo 长期记忆导出', ''];
+    const lines: string[] = ['# Kelivo 长期记忆导出', ''];
     const profile = normalizeUserProfileFields(this.userProfile);
     if (profile.length > 0) {
       lines.push('## 用户画像');

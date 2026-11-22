@@ -47,7 +47,7 @@ export interface UiStrings {
 }
 
 const STRINGS_ZH_HANS: UiStrings = {
-  appTitle: 'LexiKelivo',
+  appTitle: 'Kelivo',
   newChat: '新对话',
   ephemeralChat: '无痕对话',
   searchHint: '搜索对话标题或正文...',
@@ -79,7 +79,7 @@ const STRINGS_ZH_HANS: UiStrings = {
 };
 
 const STRINGS_ZH_HANT: UiStrings = {
-  appTitle: 'LexiKelivo',
+  appTitle: 'Kelivo',
   newChat: '新對話',
   ephemeralChat: '無痕對話',
   searchHint: '搜尋對話標題或內文...',
@@ -111,7 +111,7 @@ const STRINGS_ZH_HANT: UiStrings = {
 };
 
 const STRINGS_EN: UiStrings = {
-  appTitle: 'LexiKelivo',
+  appTitle: 'Kelivo',
   newChat: 'New Chat',
   ephemeralChat: 'Incognito',
   searchHint: 'Search chats & messages...',
@@ -143,7 +143,7 @@ const STRINGS_EN: UiStrings = {
 };
 
 const STRINGS_KO: UiStrings = {
-  appTitle: 'LexiKelivo',
+  appTitle: 'Kelivo',
   newChat: '새 대화',
   ephemeralChat: '시크릿 대화',
   searchHint: '대화 및 메시지 검색...',
@@ -175,7 +175,7 @@ const STRINGS_KO: UiStrings = {
 };
 
 const STRINGS_RU: UiStrings = {
-  appTitle: 'LexiKelivo',
+  appTitle: 'Kelivo',
   newChat: 'Новый чат',
   ephemeralChat: 'Инкогнито',
   searchHint: 'Поиск по чатам...',
@@ -207,7 +207,7 @@ const STRINGS_RU: UiStrings = {
 };
 
 const STRINGS_TR: UiStrings = {
-  appTitle: 'LexiKelivo',
+  appTitle: 'Kelivo',
   newChat: 'Yeni Sohbet',
   ephemeralChat: 'Gizli',
   searchHint: 'Sohbetlerde ara...',
