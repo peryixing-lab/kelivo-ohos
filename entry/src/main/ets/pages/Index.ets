@@ -4153,12 +4153,13 @@ struct Index {
 
     TextArea({ text: this.draft, placeholder: this.composerPlaceholder() })
       .id('composer')
+      .width('100%')
       .enabled(!this.working && !this.picking)
       .fontSize(16)
       .fontColor(ImmersiveMaterialStyle.isActive(this.immersiveLightOn()) ? $r('sys.color.font_primary') : $r('app.color.ink'))
       .placeholderColor(ImmersiveMaterialStyle.isActive(this.immersiveLightOn()) ? $r('sys.color.font_secondary') : $r('app.color.muted'))
-      .maxLines(5)
-      .constraintSize({ minHeight: 40, maxHeight: 130 })
+      .barState(BarState.Auto)
+      .constraintSize({ minHeight: 40, maxHeight: 160 })
       .backgroundColor(Color.Transparent)
       .onSubmit((enterKey: EnterKeyType) => {
         if (this.appearanceCfg().enterToSend && !this.working && !this.picking && (this.draft.trim().length > 0 || this.attachedList.length > 0)) {
