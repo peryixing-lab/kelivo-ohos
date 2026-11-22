@@ -1,0 +1,48 @@
+{
+  "color": [
+    {
+      "name": "canvas",
+      "value": "#F7F7F7"
+    },
+    {
+      "name": "surface",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "panel",
+      "value": "#EFEFF3"
+    },
+    {
+      "name": "ink",
+      "value": "#202020"
+    },
+    {
+      "name": "muted",
+      "value": "#646464"
+    },
+    {
+      "name": "accent",
+      "value": "#4D5C92"
+    },
+    {
+      "name": "on_accent",
+      "value": "#FFFFFF"
+    },
+    {
+      "name": "tint",
+      "value": "#DCE1FF"
+    },
+    {
+      "name": "line",
+      "value": "#1A000000"
+    },
+    {
+      "name": "warning",
+      "value": "#BB0947"
+    },
+    {
+      "name": "start_window_background",
+      "value": "#F7F7F7"
+    }
+  ]
+}

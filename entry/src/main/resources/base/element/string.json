@@ -1,0 +1,28 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "Kelivo 原生聊天客户端"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "多模型 AI 对话"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "LexiKelivo"
+    },
+    {
+      "name": "perm_mic_reason",
+      "value": "用于语音输入与语音转文字对话"
+    },
+    {
+      "name": "perm_calendar_reason",
+      "value": "用于在对话中按您的授权查询或创建日程提醒"
+    },
+    {
+      "name": "perm_location_reason",
+      "value": "用于在对话中按您的授权获取当前位置信息"
+    }
+  ]
+}
