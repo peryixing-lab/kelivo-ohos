@@ -101,8 +101,8 @@ import {
 } from '../core/MemoryLogic';
 import {
   buildMemoryTools,
+  buildMemoryOrganizeBatch,
   executeMemoryToolCall,
-  memoryTurnBatch,
   runMemoryPipeline
 } from '../core/MemoryEngine';
 import { PaletteTokens, resolveEffectiveDark, resolveThemeTokens, resolveWallpaperColor } from '../core/ThemeManager';
@@ -170,6 +170,15 @@ interface ResolvedProviderAuth {
 interface ResolvedRoleTarget {
   prov: Provider;
   model: string;
+}
+
+interface MemoryQueueJob {
+  workspace: Workspace;
+  chatId: string;
+  personaId: string;
+  fallback: ResolvedRoleTarget;
+  manual: boolean;
+  fromEditor?: boolean;
 }
 
 @Entry
@@ -265,6 +274,8 @@ struct Index {
   @State lastSendError: string = '';
   @State lastSendErrorChatId: string = '';
   @State expandedLongMsgIds: string[] = [];
+  @State organizingMemoryChatId: string = '';
+  @State organizingMemoryAssistantId: string = '';
   @StorageProp('windowTopInsetVp') winTopInset: number = 0;
   @StorageProp('windowBottomInsetVp') winBottomInset: number = 0;
   @StorageProp('windowKeyboardHeightVp') @Watch('onKeyboardHeightChanged') winKeyboardHeight: number = 0;
@@ -286,7 +297,9 @@ struct Index {
   private askUserResolver?: (val: string) => void;
   private stopped: boolean = false;
   private scrollView: Scroller = new Scroller();
-  private memoryJobs: Map<string, Promise<void>> = new Map<string, Promise<void>>();
+  private memoryQueue: MemoryQueueJob[] = [];
+  private memoryQueueRunning: boolean = false;
+  private memoryWindowFailures: Map<string, number> = new Map<string, number>();
   private drafts: Map<string, ComposerDraftData> = new Map<string, ComposerDraftData>();
   private speaker: Narration = new Narration();
   private followBottom: boolean = true;
@@ -1524,18 +1537,60 @@ struct Index {
   }
 
   private queueMemoryOrganization(
-    chat: Conversation, persona: Persona, fallback: ResolvedRoleTarget, manual: boolean = false
-  ): void {
+    chat: Conversation, persona: Persona, fallback: ResolvedRoleTarget, manual: boolean = false, fromEditor: boolean = false
+  ): boolean {
     const workspace = this.workspace;
-    const previous = this.memoryJobs.get(chat.id) || Promise.resolve();
-    const job = previous.then(async (): Promise<void> => {
-      if (workspace !== this.workspace) return;
-      await this.organizeMemory(chat.id, persona.id, fallback, manual);
-    }).catch(() => {});
-    this.memoryJobs.set(chat.id, job);
-    job.then(() => {
-      if (this.memoryJobs.get(chat.id) === job) this.memoryJobs.delete(chat.id);
+    if (this.organizingMemoryChatId === chat.id) {
+      if (manual) return false;
+      const hasAuto = this.memoryQueue.some((item: MemoryQueueJob): boolean =>
+        item.workspace === workspace && item.chatId === chat.id && !item.manual
+      );
+      if (hasAuto) return false;
+    }
+    const existingIdx = this.memoryQueue.findIndex((item: MemoryQueueJob): boolean =>
+      item.workspace === workspace && item.chatId === chat.id
+    );
+    if (existingIdx >= 0) {
+      const existing = this.memoryQueue[existingIdx];
+      if (manual) {
+        if (existing.manual) return false;
+        existing.manual = true;
+        existing.fromEditor = fromEditor;
+        existing.fallback = fallback;
+        this.drainMemoryQueue().catch(() => {});
+        return true;
+      }
+      return false;
+    }
+    this.memoryQueue.push({
+      workspace,
+      chatId: chat.id,
+      personaId: persona.id,
+      fallback,
+      manual,
+      fromEditor
     });
+    while (this.memoryQueue.length > 8) {
+      this.memoryQueue.shift();
+    }
+    this.drainMemoryQueue().catch(() => {});
+    return true;
+  }
+
+  private async drainMemoryQueue(): Promise<void> {
+    if (this.memoryQueueRunning) return;
+    this.memoryQueueRunning = true;
+    try {
+      while (this.memoryQueue.length > 0) {
+        const job = this.memoryQueue.shift()!;
+        if (job.workspace !== this.workspace) continue;
+        try {
+          await this.organizeMemory(job.chatId, job.personaId, job.fallback, job.manual, job.fromEditor === true);
+        } catch (_) {}
+      }
+    } finally {
+      this.memoryQueueRunning = false;
+    }
   }
 
   private organizeCurrentConversation(): void {
@@ -1545,13 +1600,28 @@ struct Index {
       this.toast('请打开已启用长期记忆的普通对话');
       return;
     }
-    this.queueMemoryOrganization(chat, persona, { prov: this.provider(), model: this.activeModelId() }, true);
+    const memSettings = normalizeMemorySettings(this.workspace.memorySettings);
+    if (memSettings.useLegacyMemory) {
+      this.toast('当前为旧版记忆模式，无需整理');
+      return;
+    }
+    const queued = this.queueMemoryOrganization(chat, persona, { prov: this.provider(), model: this.activeModelId() }, true, false);
+    if (!queued) {
+      this.toast('正在整理当前对话记忆，请稍候');
+      return;
+    }
+    this.toast('正在后台整理当前对话记忆...');
   }
 
   private organizeMemoryForAssistant(assistantId: string): void {
     const persona = this.workspace.personas.find((item: Persona): boolean => item.id === assistantId);
     if (!persona || persona.memoryEnabled === false) {
       this.toast('请先启用该助手的长期记忆');
+      return;
+    }
+    const memSettings = normalizeMemorySettings(this.workspace.memorySettings);
+    if (memSettings.useLegacyMemory) {
+      this.toast('当前为旧版记忆模式，无需整理');
       return;
     }
     const active = this.activeChat();
@@ -1569,12 +1639,11 @@ struct Index {
       this.toast('该助手暂无可整理的对话记录');
       return;
     }
-    this.toast('正在后台整理该助手的记忆...');
-    this.queueMemoryOrganization(targetChat, persona, { prov: this.provider(), model: this.activeModelId() }, true);
+    this.queueMemoryOrganization(targetChat, persona, { prov: this.provider(), model: this.activeModelId() }, true, true);
   }
 
   private async organizeMemory(
-    chatId: string, assistantId: string, fallback: ResolvedRoleTarget, manual: boolean
+    chatId: string, assistantId: string, fallback: ResolvedRoleTarget, manual: boolean, fromEditor: boolean = false
   ): Promise<void> {
     const workspace = this.workspace;
     const chat = workspace.conversations.find((item: Conversation): boolean => item.id === chatId);
@@ -1582,83 +1651,141 @@ struct Index {
     if (!chat || chat.ephemeral || chat.personaId !== assistantId || !persona || persona.memoryEnabled === false) return;
 
     const memSettings = normalizeMemorySettings(workspace.memorySettings);
+    if (memSettings.useLegacyMemory) return;
     const auto = persona.autoOrganizeMemory ?? (memSettings.autoExtract === true);
     if (!manual && !auto) return;
     const cadence = Math.max(1, Math.min(20, Math.floor(persona.memoryOrganizeEveryNTurns || 1)));
-    const batch = memoryTurnBatch(chat.messages, cadence, chat.memoryOrganizedThrough, manual);
-    if (!batch) {
-      if (manual) this.toast('没有待整理的完整对话');
+    const memLang = resolveMemoryPromptLang(memSettings, this.appearanceCfg().language);
+    const prevWatermark = chat.memoryOrganizedThrough || '';
+    const batchInfo = buildMemoryOrganizeBatch(chat.messages, cadence, prevWatermark, manual, memLang);
+    if (!batchInfo.snippet) {
+      if (manual && !fromEditor) this.toast('当前对话暂无可整理内容');
       return;
     }
-    const lastMessageId = chat.messages[chat.messages.length - 1].id;
+    const endMessageId = batchInfo.endMessageId;
+    const failKey = `${chat.id}|${prevWatermark}|${endMessageId}`;
     const trace: MemoryTrace = {
-      id: newId(), ts: Date.now(), conversationId: chat.id, assistantId: persona.id, gatekeeperPassed: false,
-      extractedCount: 0, mergedCount: 0, conflictCount: 0, skippedCount: 0, profileUpdatedCount: 0, summary: ''
+      id: newId(),
+      ts: Date.now(),
+      conversationId: chat.id,
+      assistantId: persona.id,
+      trigger: manual ? 'manual' : 'auto',
+      gatekeeperPassed: false,
+      advanced: false,
+      extractedCount: 0,
+      mergedCount: 0,
+      conflictCount: 0,
+      skippedCount: 0,
+      profileUpdatedCount: 0,
+      summary: ''
     };
     let hadError = false;
+    this.organizingMemoryChatId = chatId;
+    this.organizingMemoryAssistantId = assistantId;
     try {
-      const defaults = workspace.modelDefaults;
-      const configured = workspace.providers.find((provider: Provider): boolean =>
-        provider.id === defaults?.memoryProviderId && provider.enabled !== false);
-      const provider = configured || fallback.prov;
-      const model = configured ? (defaults?.memoryModelId || configured.model) : fallback.model;
-      if (!model) throw new Error('请先配置记忆模型');
-      trace.modelId = model;
-      const auth = await this.resolveProviderKeyAndProxy(provider);
-      if (!auth.key && !isProviderConfigured(provider)) throw new Error('记忆模型的服务商未配置');
-      const pipelineOut = await runMemoryPipeline({
-        provider,
-        apiKey: auth.key,
-        modelId: model,
-        proxyPassword: auth.proxyPass,
-        conversationId: chat.id,
-        assistantId: persona.id,
-        snippet: batch,
-        existingMemories: workspace.memories || [],
-        existingProfile: workspace.userProfile || [],
-        settings: memSettings,
-        writeScope: persona.memoryWriteScope || 'alwaysGlobal',
-        smartAddMode: persona.memorySmartAddMode || 'batched',
-        uiLanguage: this.appearanceCfg().language,
-        onLog: (logEntry: RequestLogEntry) => {
-          this.store?.addRequestLog(logEntry).catch(() => {});
+      try {
+        const defaults = workspace.modelDefaults;
+        const configured = workspace.providers.find((provider: Provider): boolean =>
+          provider.id === defaults?.memoryProviderId && provider.enabled !== false && isProviderConfigured(provider));
+        const provider = configured || fallback.prov;
+        const model = configured ? (defaults?.memoryModelId || configured.model || fallback.model) : fallback.model;
+        if (!model) throw new Error('请先配置记忆模型');
+        trace.modelId = model;
+        const auth = await this.resolveProviderKeyAndProxy(provider);
+        if (!auth.key && !isProviderConfigured(provider)) throw new Error('记忆模型的服务商未配置');
+        const pipelineOut = await runMemoryPipeline({
+          provider,
+          apiKey: auth.key,
+          modelId: model,
+          proxyPassword: auth.proxyPass,
+          conversationId: chat.id,
+          assistantId: persona.id,
+          snippet: batchInfo.snippet,
+          existingMemories: workspace.memories || [],
+          existingProfile: workspace.userProfile || [],
+          settings: memSettings,
+          writeScope: persona.memoryWriteScope || 'alwaysGlobal',
+          smartAddMode: persona.memorySmartAddMode || 'batched',
+          assistantReasoning: persona.params?.reasoningEffort,
+          uiLanguage: this.appearanceCfg().language,
+          onLog: (logEntry: RequestLogEntry) => {
+            this.store?.addRequestLog(logEntry).catch(() => {});
+          }
+        });
+        const current = workspace.personas.find((item: Persona): boolean => item.id === persona.id);
+        const saved = workspace.conversations.find((item: Conversation): boolean => item.id === chat.id);
+        if (workspace !== this.workspace || !saved || saved.ephemeral || saved.personaId !== persona.id ||
+          !saved.messages.some((message: ChatMessage): boolean => message.id === endMessageId) ||
+          !current || current.memoryEnabled === false ||
+          (!manual && !(current.autoOrganizeMemory ?? (workspace.memorySettings?.autoExtract === true)))) return;
+
+        if (pipelineOut.advanced) {
+          saved.memoryOrganizedThrough = endMessageId;
+          this.memoryWindowFailures.delete(failKey);
+          trace.advanced = true;
+        } else {
+          hadError = true;
+          const fails = (this.memoryWindowFailures.get(failKey) || 0) + 1;
+          this.memoryWindowFailures.set(failKey, fails);
+          if (fails >= 3) {
+            saved.memoryOrganizedThrough = endMessageId;
+            this.memoryWindowFailures.delete(failKey);
+            trace.advanced = true;
+          } else {
+            trace.advanced = false;
+          }
         }
-      });
-      const current = workspace.personas.find((item: Persona): boolean => item.id === persona.id);
-      const saved = workspace.conversations.find((item: Conversation): boolean => item.id === chat.id);
-      if (workspace !== this.workspace || !saved || saved.ephemeral || saved.personaId !== persona.id ||
-        !saved.messages.some((message: ChatMessage): boolean => message.id === lastMessageId) ||
-        !current || current.memoryEnabled === false ||
-        (!manual && !(current.autoOrganizeMemory ?? (workspace.memorySettings?.autoExtract === true)))) return;
-      saved.memoryOrganizedThrough = lastMessageId;
 
-      trace.gatekeeperPassed = pipelineOut.shouldSave || (pipelineOut.steps.length > 0 && !pipelineOut.summary.includes('门控跳过'));
-      trace.extractedCount = pipelineOut.addedCount;
-      trace.mergedCount = pipelineOut.mergedCount;
-      trace.conflictCount = pipelineOut.conflictCount;
-      trace.skippedCount = pipelineOut.skippedCount;
-      trace.profileUpdatedCount = pipelineOut.profileUpdatedCount;
-      trace.summary = pipelineOut.summary;
-      trace.steps = pipelineOut.steps;
+        trace.gatekeeperPassed = pipelineOut.gateStatus === 'worthRemembering';
+        trace.error = pipelineOut.error;
+        trace.extractedCount = pipelineOut.addedCount;
+        trace.mergedCount = pipelineOut.mergedCount;
+        trace.conflictCount = pipelineOut.conflictCount;
+        trace.skippedCount = pipelineOut.skippedCount;
+        trace.profileUpdatedCount = pipelineOut.profileUpdatedCount;
+        trace.summary = pipelineOut.summary + (trace.advanced && pipelineOut.error ? '（连续 3 次失败，已跳过该窗口）' : '');
+        trace.steps = pipelineOut.steps;
 
-      if (pipelineOut.addedCount > 0 || pipelineOut.mergedCount > 0 || pipelineOut.conflictCount > 0) {
-        workspace.memories = pipelineOut.memories;
+        if (pipelineOut.addedCount > 0 || pipelineOut.mergedCount > 0 || pipelineOut.conflictCount > 0) {
+          workspace.memories = pipelineOut.memories;
+        }
+        if (pipelineOut.profileUpdatedCount > 0) {
+          workspace.userProfile = pipelineOut.profile;
+        }
+        if (manual && !fromEditor) {
+          if (pipelineOut.shouldSave) {
+            this.toast(`记忆整理完成：${pipelineOut.summary}`);
+          } else if (pipelineOut.error) {
+            this.toast(`记忆整理失败：${pipelineOut.error}`);
+          } else {
+            this.toast('整理完成，暂无新增记忆');
+          }
+        } else if (manual && fromEditor) {
+          if (pipelineOut.error) {
+            this.toast(`记忆整理失败：${pipelineOut.error}`);
+          } else if (pipelineOut.shouldSave) {
+            this.toast(`已更新记忆：${pipelineOut.summary}`);
+          }
+        }
+      } catch (err) {
+        hadError = true;
+        const errMsg = (err as Error).message || String(err);
+        trace.error = errMsg;
+        trace.summary = '记忆整理失败：' + errMsg;
+        if (manual) this.toast(errMsg || '记忆整理失败');
       }
-      if (pipelineOut.profileUpdatedCount > 0) {
-        workspace.userProfile = pipelineOut.profile;
+      if (workspace !== this.workspace ||
+        !workspace.conversations.some((item: Conversation): boolean => item.id === chat.id)) return;
+      if (memSettings.recordTraces !== false || manual || hadError) {
+        workspace.memoryTraces = [trace, ...(workspace.memoryTraces || [])].slice(0, 24);
       }
-      if (manual) this.toast(pipelineOut.shouldSave ? `记忆整理完成：${pipelineOut.summary}` : pipelineOut.summary);
-    } catch (err) {
-      hadError = true;
-      trace.summary = '记忆整理失败：' + String(err);
-      if (manual) this.toast((err as Error).message || '记忆整理失败');
+      this.persistAction();
+    } finally {
+      if (this.organizingMemoryChatId === chatId) {
+        this.organizingMemoryChatId = '';
+        this.organizingMemoryAssistantId = '';
+      }
     }
-    if (workspace !== this.workspace ||
-      !workspace.conversations.some((item: Conversation): boolean => item.id === chat.id)) return;
-    if (memSettings.recordTraces !== false || manual || hadError) {
-      workspace.memoryTraces = [trace, ...(workspace.memoryTraces || [])].slice(0, 50);
-    }
-    this.persistAction();
   }
 
   async attach(): Promise<void> {
@@ -1770,7 +1897,15 @@ struct Index {
   private async executeRegisteredTool(
     tool: RegisteredTool, argsJson: string, chat: Conversation, persona: Persona
   ): Promise<ToolExecutionOutput> {
-    const parsed = JSON.parse(argsJson || '{}') as Record<string, Object>;
+    let parsed: Record<string, Object> = {};
+    try {
+      const obj = JSON.parse(argsJson || '{}') as Record<string, Object>;
+      if (obj && typeof obj === 'object') {
+        parsed = obj;
+      }
+    } catch (_) {
+      return { text: '工具参数 JSON 解析失败', isError: true };
+    }
     if (tool.declaration.name === 'web_search') {
       const query = String(parsed['query'] || '');
       const svc = this.activeSearchService();
@@ -2105,7 +2240,7 @@ struct Index {
         const memSettings = normalizeMemorySettings(this.workspace.memorySettings);
         const memLang = resolveMemoryPromptLang(memSettings, this.appearanceCfg().language);
         const memRules = persona.memoryEnabled !== false
-          ? buildMemoryRulesSystemPrompt(memSettings, this.appearanceCfg().language)
+          ? buildMemoryRulesSystemPrompt(memSettings, this.appearanceCfg().language, persona.allowPastConversationRecall === true)
           : '';
         const memBlock = persona.memoryEnabled !== false
           ? buildMemoryInjectionBlock(this.workspace.memories || [], this.workspace.userProfile || [], memSettings,
@@ -2356,9 +2491,16 @@ struct Index {
           };
         }
         const finalMessages = [...history, nextMsg, ...tailMessages];
+        const prevConvState = this.workspace.conversations.find((item: Conversation): boolean => item.id === target.id);
+        const curThrough = prevConvState?.memoryOrganizedThrough;
+        const rewindThrough = (retry && tailMessages.length === 0 && curThrough &&
+          (curThrough === targetReplaceMsg?.id || !finalMessages.some((m: ChatMessage): boolean => m.id === curThrough)))
+          ? (history.length >= 2 ? history[history.length - 2].id : '')
+          : undefined;
         this.putChat({
           id: target.id, title: target.title, updated: Date.now(),
-          personaId: target.personaId, messages: finalMessages
+          personaId: target.personaId, messages: finalMessages,
+          memoryOrganizedThrough: rewindThrough
         });
         if (!target.ephemeral) {
           try { await this.persist(); } catch (_) { this.notice = '回复保存在当前页面，写入设备失败'; }
@@ -2382,8 +2524,9 @@ struct Index {
         }
         if (completed) {
           this.fetchSuggestions(target.id, history[history.length - 1].text, answer);
-          if (!retry && !target.ephemeral && answer.trim().length > 0) {
-            this.queueMemoryOrganization(target, persona, { prov: p, model: modelId });
+          if (!target.ephemeral && answer.trim().length > 0 && tailMessages.length === 0) {
+            const latestPersona = this.workspace.personas.find((item: Persona): boolean => item.id === persona.id) || persona;
+            this.queueMemoryOrganization(target, latestPersona, { prov: p, model: modelId });
           }
           const sysAfter = this.workspace.systemSettings;
           if (sysAfter?.autoCompactEnabled && !target.ephemeral) {
@@ -5146,6 +5289,8 @@ struct Index {
         localWorkspaces: this.workspace.workspaces || [],
         memories: this.workspace.memories || [],
         memorySettings: normalizeMemorySettings(this.workspace.memorySettings),
+        organizingMemoryAssistantId: this.organizingMemoryAssistantId,
+        memoryTraces: this.workspace.memoryTraces || [],
         onSavePersona: (p: Persona, setActive: boolean) => this.savePersona(p, setActive),
         onDeletePersona: (id: string) => this.deletePersonaById(id),
         onApply: (p: Persona) => this.applyPersona(p),

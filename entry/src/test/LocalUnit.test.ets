@@ -35,23 +35,32 @@ import {
 import {
   SmartAddDecision,
   applySmartAddDecisions,
+  buildExistingMemoryXmlBlock,
   buildMemoryInjectionBlock,
   buildMemoryRulesSystemPrompt,
   buildProfileBlock,
   findOrphanedMemories,
+  findSmartAddCandidates,
   memoryDate,
   mergeMemoryCandidates,
   mergeProfileFields,
   normalizeMemoryTimestamp,
   normalizeUserProfileFields,
+  parseExtractedMemoriesResult,
   parseExtractedMemoriesXml,
+  parseGatekeeperResult,
   parseGatekeeperXml,
   parseMemoryExtractionResponse,
   parseProfileDistillerResponse,
   parseSmartAddBatchResponse,
   searchMemories
 } from '../main/ets/core/MemoryLogic';
-import { buildMemoryTools, executeMemoryToolCall, memoryTurnBatch } from '../main/ets/core/MemoryEngine';
+import {
+  buildMemoryOrganizeBatch,
+  buildMemoryTools,
+  executeMemoryToolCall,
+  memoryTurnBatch
+} from '../main/ets/core/MemoryEngine';
 import { BUILTIN_PALETTES, normalizePaletteId, parseCustomThemeJson, resolveThemeTokens } from '../main/ets/core/ThemeManager';
 import { formatContextWindowShort, resolveBrandIconId, splitAssistantParagraphs } from '../main/ets/core/BrandIcons';
 import { getUiStrings } from '../main/ets/core/I18n';
@@ -813,7 +822,8 @@ export default function localUnitTest() {
         key.toLowerCase() === 'x-opencode-session').length).assertEqual(1);
       expect(call.headers['User-Agent']).assertContain('LexiKelivo');
       expect(call.headers['X-Custom']).assertEqual('yes');
-      expect(call.body.indexOf('"reasoning_effort"') < 0).assertTrue();
+      expect(call.body).assertContain('"thinking":{"type":"enabled"}');
+      expect(call.body).assertContain('"reasoning_effort":"high"');
       expect(call.body).assertContain('"prompt_cache_key":"conv-42"');
 
       const autoUuidCall = makeAdvancedChatCall(openCode, 'k-oc', '', [user], {});
@@ -1186,7 +1196,9 @@ export default function localUnitTest() {
       expect(dsCall.address).assertEqual('https://api.deepseek.com/v1/chat/completions');
       expect(dsCall.body).assertContain('"messages"');
       expect(dsCall.body.includes('"input"')).assertFalse();
-      expect(dsCall.body.includes('"reasoning_effort"')).assertFalse();
+      expect(dsCall.body).assertContain('"thinking":{"type":"enabled"}');
+      expect(dsCall.body).assertContain('"reasoning_effort":"high"');
+      expect(dsCall.body.includes('"reasoning":{')).assertFalse();
 
       // 2. Anthropic must not send both temperature and top_p, and merges consecutive same-role turns
       const cl = preset('cl2', 'Claude', 'anthropic', 'https://api.anthropic.com/v1', 'claude-haiku-5-5');
@@ -1385,6 +1397,243 @@ export default function localUnitTest() {
       expect(afterDel0!.versions?.length).assertEqual(2);
       expect(afterDel0!.activeVersion).assertEqual(0);
       expect(afterDel0!.text).assertEqual('版本二');
+    });
+
+    it('MemoryPipelineRobustnessAndCompleteness', 0, () => {
+      // 1. 3-state Gatekeeper parsing
+      expect(parseGatekeeperResult('<gate><user_memory>true</user_memory></gate>')).assertEqual('worthRemembering');
+      expect(parseGatekeeperResult('<gate><user_memory>false</user_memory></gate>')).assertEqual('skip');
+      expect(parseGatekeeperResult('')).assertEqual('malformed');
+      expect(parseGatekeeperResult('我来帮你分析一下这段对话')).assertEqual('malformed');
+      expect(parseGatekeeperResult('<gate>\n  <user_memory>true')).assertEqual('worthRemembering');
+
+      // 2. Extract parsing: self-closing valid empty, malformed prose/empty, attribute ordering + scope
+      const selfClosing = parseExtractedMemoriesResult('<extracted/>');
+      expect(selfClosing.ok).assertTrue();
+      expect(selfClosing.items.length).assertEqual(0);
+      expect(parseExtractedMemoriesResult('').ok).assertFalse();
+      expect(parseExtractedMemoriesResult('没有找到').ok).assertFalse();
+
+      const scopedExt = parseExtractedMemoriesResult(
+        '<extracted><item scope="assistant" type="identity">用户正在撰写北京故事</item><item type="voice">偏好克制平实的文风</item></extracted>'
+      );
+      expect(scopedExt.ok).assertTrue();
+      expect(scopedExt.items.length).assertEqual(2);
+      expect(scopedExt.items[0].category).assertEqual('identity');
+      expect(scopedExt.items[0].scope).assertEqual('assistant');
+      expect(scopedExt.items[1].category).assertEqual('tone');
+      expect(scopedExt.items[1].scope).assertEqual(undefined);
+
+      // 3. Batch windowing: trailing user turn, manual already-organized fallback, 2000-char & 12000-char caps, English prefix
+      const msgs: ChatMessage[] = [
+        { id: 'u1', role: 'user', text: '喜欢喝冰美式', model: '' },
+        { id: 'a1', role: 'assistant', text: '好的，记住了。', model: 'm' },
+        { id: 'u2', role: 'user', text: '晚上十点后写稿', model: '' }
+      ];
+      // Auto mode stops at last assistant message and ignores trailing un-replied user message
+      const autoWithTrailingUser = buildMemoryOrganizeBatch(msgs, 1, '', false, 'zh');
+      expect(autoWithTrailingUser.endMessageId).assertEqual('a1');
+      expect(autoWithTrailingUser.snippet).assertContain('用户：喜欢喝冰美式');
+      expect(autoWithTrailingUser.snippet.includes('晚上十点后写稿')).assertFalse();
+
+      // Auto mode returns empty when pending only has a trailing user message
+      expect(buildMemoryOrganizeBatch(msgs, 1, 'a1', false, 'zh').snippet).assertEqual('');
+
+      // Manual mode succeeds even when trailing user exists or watermark is already at the latest message
+      const manualTrailing = buildMemoryOrganizeBatch(msgs, 1, '', true, 'zh');
+      expect(manualTrailing.endMessageId).assertEqual('u2');
+      expect(manualTrailing.snippet).assertContain('晚上十点后写稿');
+
+      const allComplete: ChatMessage[] = msgs.slice(0, 2);
+      const manualAlreadyDone = buildMemoryOrganizeBatch(allComplete, 1, 'a1', true, 'en');
+      expect(manualAlreadyDone.endMessageId).assertEqual('a1');
+      expect(manualAlreadyDone.snippet).assertContain('User: 喜欢喝冰美式');
+      expect(manualAlreadyDone.snippet).assertContain('Assistant: 好的，记住了。');
+
+      const longUserText = '甲'.repeat(2100);
+      const longTurn: ChatMessage[] = [
+        { id: 'lu1', role: 'user', text: longUserText, model: '' },
+        { id: 'la1', role: 'assistant', text: '收到', model: 'm' }
+      ];
+      const clippedBatch = buildMemoryOrganizeBatch(longTurn, 1, '', false, 'zh');
+      expect(clippedBatch.snippet).assertContain(`${'甲'.repeat(2000)}…`);
+
+      // 4. Smart Add candidates: pads to 5 recent same-category entries even on low token similarity
+      const pool: MemoryEntry[] = [
+        { id: 'm1', category: 'identity', content: '居住城市为北京', archived: false, createdAt: 100, updatedAt: 100 },
+        { id: 'm2', category: 'identity', content: '职业是产品设计师', archived: false, createdAt: 200, updatedAt: 200 },
+        { id: 'm3', category: 'identity', content: '养了一只狸花猫', archived: false, createdAt: 300, updatedAt: 300 },
+        { id: 'm4', category: 'identity', content: '周末喜欢爬山', archived: false, createdAt: 400, updatedAt: 400 },
+        { id: 'm5', category: 'identity', content: '早起会喝黑咖啡', archived: false, createdAt: 500, updatedAt: 500 },
+        { id: 'm6', category: 'identity', content: '最近在学摄影', archived: false, createdAt: 600, updatedAt: 600 },
+        { id: 'mw1', category: 'workflow', content: '习惯用键盘快捷键', archived: false, createdAt: 700, updatedAt: 700 }
+      ];
+      const smartCands = findSmartAddCandidates(pool, '日常使用左手写字', 'identity', undefined, true, 5);
+      expect(smartCands.length).assertEqual(5);
+      expect(smartCands.some((e: MemoryEntry): boolean => e.id === 'mw1')).assertFalse();
+
+      // 5. Scope isolation + identityChanged tracking in applySmartAddDecisions
+      const crossScopeDecisions = new Map<number, SmartAddDecision>();
+      crossScopeDecisions.set(1, { action: 'MERGE', targetId: 'm1', mergedContent: '不应该篡改全局', relatedIds: [] });
+      const crossApplied = applySmartAddDecisions(
+        pool,
+        [{ category: 'identity', content: '助手内独有身份信息', scope: 'assistant' }],
+        crossScopeDecisions,
+        'conv_x',
+        'asst_a',
+        'extracted',
+        ['asst_a']
+      );
+      expect(crossApplied.entries.find((e: MemoryEntry): boolean => e.id === 'm1')?.content).assertEqual('居住城市为北京');
+      expect(crossApplied.addedCount).assertEqual(1);
+      expect(crossApplied.identityChanged).assertTrue();
+
+      const skipDecs = new Map<number, SmartAddDecision>();
+      skipDecs.set(1, { action: 'SKIP', targetId: 'm1', relatedIds: [] });
+      const skipApplied = applySmartAddDecisions(
+        pool,
+        [{ category: 'identity', content: '居住城市为北京' }],
+        skipDecs,
+        'conv_x',
+        undefined,
+        'extracted',
+        [undefined]
+      );
+      expect(skipApplied.identityChanged).assertFalse();
+
+      // 6. Unlimited max_tokens for OpenAI reasoning vs Anthropic default; past-recall rules prompt
+      const reasoningProv = preset('ds', 'DeepSeek', 'openai', 'https://api.deepseek.com/v1', 'deepseek-v4.1-flash');
+      const unlimitedCall = makeAdvancedChatCall(reasoningProv, 'k-ds', '', [{ id: 'u', role: 'user', text: 'hi', model: '' }], {
+        modelId: 'deepseek-v4.1-flash',
+        params: { reasoningEffort: 'medium' }
+      });
+      expect(unlimitedCall.body.indexOf('"max_tokens"') < 0).assertTrue();
+      expect(unlimitedCall.body.indexOf('"temperature"') < 0).assertTrue();
+
+      const claudeProv = preset('cl', 'Claude', 'anthropic', 'https://api.anthropic.com/v1', 'claude-haiku-5-5');
+      const claudeCall = makeAdvancedChatCall(claudeProv, 'k-cl', '', [{ id: 'u', role: 'user', text: 'hi', model: '' }], {
+        modelId: 'claude-haiku-5-5',
+        params: { reasoningEffort: 'medium' }
+      });
+      expect(claudeCall.body).assertContain('"max_tokens":8192');
+
+      const xmlBlock = buildExistingMemoryXmlBlock(pool, { autoExtract: true, injectGlobal: true, maxInjectCount: 10 }, undefined, 'zh');
+      expect(xmlBlock).assertContain('<user_memory type="identity">');
+      const recallRules = buildMemoryRulesSystemPrompt({ autoExtract: true, injectGlobal: true, maxInjectCount: 10, promptLanguage: 'zh' }, 'zh-Hans', true);
+      expect(recallRules).assertContain('chat_search');
+    });
+
+    it('ReasoningDialectsAndMemorySpeedOptimization', 0, () => {
+      const msg: ChatMessage = { id: 'u1', role: 'user', text: 'hello', model: '' };
+
+      // 1. DeepSeek thinkingType dialect & thinking-only protection
+      const dsProv = preset('oc', 'opencode1', 'openai-responses', 'https://opencode.ai/zen/go/v1', 'deepseek-v4.1-flash');
+      dsProv.chatPath = '/chat/completions';
+      const dsOff = makeAdvancedChatCall(dsProv, 'k-oc', '', [msg], {
+        modelId: 'deepseek-v4.1-flash',
+        params: { reasoningEffort: 'off' }
+      });
+      expect(dsOff.body).assertContain('"thinking":{"type":"disabled"}');
+      expect(dsOff.body.indexOf('"reasoning_effort"') < 0).assertTrue();
+
+      const dsLow = makeAdvancedChatCall(dsProv, 'k-oc', '', [msg], {
+        modelId: 'deepseek-v4.1-flash',
+        params: { reasoningEffort: 'low' }
+      });
+      expect(dsLow.body).assertContain('"thinking":{"type":"enabled"}');
+      expect(dsLow.body).assertContain('"reasoning_effort":"low"');
+
+      const dsMedium = makeAdvancedChatCall(dsProv, 'k-oc', '', [msg], {
+        modelId: 'deepseek-v4.1-flash',
+        params: { reasoningEffort: 'medium' }
+      });
+      expect(dsMedium.body).assertContain('"thinking":{"type":"enabled"}');
+      expect(dsMedium.body).assertContain('"reasoning_effort":"low"');
+
+      const r1Off = makeAdvancedChatCall(dsProv, 'k-oc', '', [msg], {
+        modelId: 'deepseek-r1',
+        params: { reasoningEffort: 'off' }
+      });
+      expect(r1Off.body.indexOf('"disabled"') < 0).assertTrue();
+
+      // 2. Qwen & QwQ
+      const qwenProv = preset('qw', 'DashScope', 'openai', 'https://dashscope.aliyuncs.com/compatible-mode/v1', 'qwen3-32b');
+      const qwenOff = makeAdvancedChatCall(qwenProv, 'k-qw', '', [msg], {
+        modelId: 'qwen3-32b',
+        params: { reasoningEffort: 'off' }
+      });
+      expect(qwenOff.body).assertContain('"enable_thinking":false');
+      const qwenLow = makeAdvancedChatCall(qwenProv, 'k-qw', '', [msg], {
+        modelId: 'qwen3-32b',
+        params: { reasoningEffort: 'low' }
+      });
+      expect(qwenLow.body).assertContain('"enable_thinking":true');
+      const qwqOff = makeAdvancedChatCall(qwenProv, 'k-qw', '', [msg], {
+        modelId: 'qwq-32b',
+        params: { reasoningEffort: 'off' }
+      });
+      expect(qwqOff.body.indexOf('"enable_thinking"') < 0).assertTrue();
+
+      // 3. Gemini 2.5 Flash vs Pro & OpenAI Responses off
+      const gemProv = preset('gm', 'Gemini', 'gemini', 'https://generativelanguage.googleapis.com/v1beta', 'gemini-2.5-flash');
+      const gemFlashOff = makeAdvancedChatCall(gemProv, 'k-gm', '', [msg], {
+        modelId: 'gemini-2.5-flash',
+        params: { reasoningEffort: 'off' }
+      });
+      expect(gemFlashOff.body).assertContain('"thinkingBudget":0');
+      expect(gemFlashOff.body).assertContain('"includeThoughts":false');
+      const gemProOff = makeAdvancedChatCall(gemProv, 'k-gm', '', [msg], {
+        modelId: 'gemini-2.5-pro',
+        params: { reasoningEffort: 'off' }
+      });
+      expect(gemProOff.body.indexOf('"thinkingBudget":0') < 0).assertTrue();
+
+      const respProv = preset('oa', 'OpenAI', 'openai-responses', 'https://api.openai.com/v1', 'gpt-5');
+      const respOff = makeAdvancedChatCall(respProv, 'k-oa', '', [msg], {
+        modelId: 'gpt-5',
+        params: { reasoningEffort: 'off' }
+      });
+      expect(respOff.body).assertContain('"reasoning":{"effort":"none"}');
+
+      // 4. Compact batch caps: <=10 msgs / 6000 chars initial auto, <=4 msgs / 4000 chars manual fallback
+      const manyMsgs: ChatMessage[] = [];
+      for (let i = 0; i < 14; i++) {
+        manyMsgs.push({
+          id: `m${i}`,
+          role: i % 2 === 0 ? 'user' : 'assistant',
+          text: `条目${i}: ` + '内容'.repeat(300),
+          model: i % 2 === 0 ? '' : 'm'
+        });
+      }
+      const initialAuto = buildMemoryOrganizeBatch(manyMsgs, 1, '', false, 'zh');
+      expect(initialAuto.windowSize).assertEqual(10);
+      expect(initialAuto.snippet.length <= 6001).assertTrue();
+
+      const manualFallback = buildMemoryOrganizeBatch(manyMsgs, 1, 'm13', true, 'zh');
+      expect(manualFallback.windowSize).assertEqual(4);
+      expect(manualFallback.snippet.length <= 4001).assertTrue();
+
+      // 5. buildExistingMemoryXmlBlock maxPerCategoryOverride = 25
+      const largePool: MemoryEntry[] = [];
+      for (let i = 0; i < 40; i++) {
+        largePool.push({
+          id: `id_${i}`,
+          category: 'identity',
+          content: `用户特征_${i}`,
+          archived: false,
+          createdAt: 1000 + i,
+          updatedAt: 1000 + i
+        });
+      }
+      const compactXml = buildExistingMemoryXmlBlock(
+        largePool,
+        { autoExtract: true, injectGlobal: true, maxInjectCount: 100 },
+        undefined,
+        'zh',
+        [],
+        25
+      );
+      expect(compactXml).assertContain('total="40" shown="25"');
     });
   });
 }

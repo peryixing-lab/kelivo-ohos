@@ -13,6 +13,14 @@ import {
 export interface ExtractedMemoryCandidate {
   category: MemoryCategory;
   content: string;
+  scope?: 'global' | 'assistant';
+}
+
+export type GatekeeperDecision = 'worthRemembering' | 'skip' | 'malformed';
+
+export interface ExtractParseResult {
+  ok: boolean;
+  items: ExtractedMemoryCandidate[];
 }
 
 export interface ExtractedProfileCandidate {
@@ -33,6 +41,7 @@ export interface MemoryMergeResult {
   mergedCount: number;
   conflictCount?: number;
   skippedCount?: number;
+  identityChanged?: boolean;
 }
 
 export interface ProfileMergeResult {
@@ -369,33 +378,23 @@ export function buildProfileBlock(profile: UserProfileField[]): string {
   return lines.join('\n');
 }
 
-export function buildMemoryInjectionBlock(
+export function buildExistingMemoryXmlBlock(
   memories: MemoryEntry[],
-  profile: UserProfileField[],
   settings: MemorySettings,
   assistantId?: string,
-  fullTypes: MemoryCategory[] = []
+  lang: 'zh' | 'en' = 'zh',
+  fullTypes: MemoryCategory[] = [],
+  maxPerCategoryOverride?: number
 ): string {
-  if (settings.useLegacyMemory && Array.isArray(settings.legacyMemories) && settings.legacyMemories.length > 0) {
-    const legacyLines = settings.legacyMemories
-      .map((s: string): string => s.trim())
-      .filter((s: string): boolean => s.length > 0)
-      .map((s: string): string => `- ${s}`);
-    if (legacyLines.length === 0) return '';
-    return ['以下是长期记忆，请在与当前请求相关时参考。', '<legacy_memory>', ...legacyLines, '</legacy_memory>'].join('\n');
-  }
-
-  const maxCount = settings.maxInjectCount > 0 ? Math.max(1, Math.min(500, Math.floor(settings.maxInjectCount))) : 100;
+  const baseMax = settings.maxInjectCount > 0 ? Math.max(1, Math.min(500, Math.floor(settings.maxInjectCount))) : 100;
+  const maxCount = maxPerCategoryOverride !== undefined && maxPerCategoryOverride > 0
+    ? Math.min(baseMax, Math.floor(maxPerCategoryOverride))
+    : baseMax;
   const includeGlobal = settings.injectGlobal !== false;
   const active = memories.filter((entry: MemoryEntry): boolean =>
     !entry.archived && typeof entry.content === 'string' && entry.content.trim().length > 0 &&
       canReadMemory(entry, assistantId, includeGlobal));
-  const visibleProfile = includeGlobal ? normalizeUserProfileFields(profile) : [];
-  if (active.length === 0 && !visibleProfile.some((field: UserProfileField): boolean => Boolean(field.value.trim()))) {
-    return '';
-  }
-
-  const sections = ['以下是用户画像与长期记忆，请在与当前请求相关时参考。', buildProfileBlock(visibleProfile)];
+  const sections: string[] = [];
   for (const category of MEMORY_CATEGORIES) {
     const entries = active.filter((entry: MemoryEntry): boolean => entry.category === category);
     const tag = `<user_memory type="${memoryTypeName(category)}"`;
@@ -417,10 +416,44 @@ export function buildMemoryInjectionBlock(
       const scope = entry.assistantId ? '(assistant) ' : '';
       lines.push(`- [${memoryDate(entry.updatedAt)}] ${scope}${escapeXml(entry.content.trim().replace(/\s+/g, ' '))}`);
     }
-    if (truncated) lines.push('此分类还有更多条目，可通过记忆工具查阅。');
+    if (truncated) {
+      lines.push(lang === 'en'
+        ? 'More entries exist in this category; inspect them with memory tools.'
+        : '此分类还有更多条目，可通过记忆工具查阅。');
+    }
     lines.push('</user_memory>');
     sections.push(lines.join('\n'));
   }
+  return sections.join('\n');
+}
+
+export function buildMemoryInjectionBlock(
+  memories: MemoryEntry[],
+  profile: UserProfileField[],
+  settings: MemorySettings,
+  assistantId?: string,
+  fullTypes: MemoryCategory[] = []
+): string {
+  if (settings.useLegacyMemory && Array.isArray(settings.legacyMemories) && settings.legacyMemories.length > 0) {
+    const legacyLines = settings.legacyMemories
+      .map((s: string): string => s.trim())
+      .filter((s: string): boolean => s.length > 0)
+      .map((s: string): string => `- ${s}`);
+    if (legacyLines.length === 0) return '';
+    return ['以下是长期记忆，请在与当前请求相关时参考。', '<legacy_memory>', ...legacyLines, '</legacy_memory>'].join('\n');
+  }
+
+  const includeGlobal = settings.injectGlobal !== false;
+  const active = memories.filter((entry: MemoryEntry): boolean =>
+    !entry.archived && typeof entry.content === 'string' && entry.content.trim().length > 0 &&
+      canReadMemory(entry, assistantId, includeGlobal));
+  const visibleProfile = includeGlobal ? normalizeUserProfileFields(profile) : [];
+  if (active.length === 0 && !visibleProfile.some((field: UserProfileField): boolean => Boolean(field.value.trim()))) {
+    return '';
+  }
+
+  const sections = ['以下是用户画像与长期记忆，请在与当前请求相关时参考。', buildProfileBlock(visibleProfile)];
+  sections.push(buildExistingMemoryXmlBlock(memories, settings, assistantId, 'zh', fullTypes));
   return sections.join('\n');
 }
 
@@ -688,12 +721,33 @@ export function getEffectiveMemoryTemplate(
   return getDefaultMemoryTemplate(kind, lang);
 }
 
-export function buildMemoryRulesSystemPrompt(settings?: MemorySettings, uiLanguage: string = 'zh-Hans'): string {
+export const RULES_PAST_CONVERSATION_RECALL_ZH: string =
+  '需要回忆之前聊过的内容时，用 chat_search 按关键词搜索历史对话，不要凭印象作答。';
+
+export const RULES_PAST_CONVERSATION_RECALL_EN: string =
+  'When you need to recall something discussed before, use chat_search to search past conversations by keyword. Do not answer from impression.';
+
+export const EXTRACT_TOOL_DEFAULT_SCOPE_RULE_ZH: string =
+  '- 只对当前助手成立的信息，在 item 上加 scope="assistant"；对所有场景都成立的加 scope="global" 或省略';
+
+export const EXTRACT_TOOL_DEFAULT_SCOPE_RULE_EN: string =
+  '- For information that only applies to the current assistant, add scope="assistant" on the item; for information that applies everywhere, add scope="global" or omit it';
+
+export function buildMemoryRulesSystemPrompt(
+  settings?: MemorySettings,
+  uiLanguage: string = 'zh-Hans',
+  allowPastConversationRecall: boolean = false
+): string {
   if (settings?.useLegacyMemory) {
     return '';
   }
   const lang = resolveMemoryPromptLang(settings, uiLanguage);
-  return getEffectiveMemoryTemplate(settings, 'rules', lang);
+  const rules = getEffectiveMemoryTemplate(settings, 'rules', lang);
+  if (!allowPastConversationRecall) {
+    return rules;
+  }
+  const recallRule = lang === 'en' ? RULES_PAST_CONVERSATION_RECALL_EN : RULES_PAST_CONVERSATION_RECALL_ZH;
+  return rules ? `${rules}\n\n${recallRule}` : recallRule;
 }
 
 interface ScoredMemory {
@@ -751,6 +805,30 @@ export function searchMemories(
   return scored.map((item: ScoredMemory): MemoryEntry => item.entry);
 }
 
+export function normalizeMemoryContentForExact(text: string): string {
+  return text.trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+export function findExactActiveMemory(
+  existing: MemoryEntry[],
+  category: MemoryCategory,
+  content: string,
+  assistantId?: string,
+  includeGlobal: boolean = true
+): MemoryEntry | undefined {
+  const norm = normalizeMemoryContentForExact(content);
+  if (!norm) return undefined;
+  for (let i = 0; i < existing.length; i++) {
+    const m = existing[i];
+    if (m.archived || m.category !== category) continue;
+    if (!canReadMemory(m, assistantId, includeGlobal)) continue;
+    if (normalizeMemoryContentForExact(m.content) === norm) {
+      return m;
+    }
+  }
+  return undefined;
+}
+
 export function findSimilarActiveMemories(
   existing: MemoryEntry[],
   candidateContent: string,
@@ -775,49 +853,141 @@ export function findSimilarActiveMemories(
   return scored.slice(0, limit).map((s: ScoredMemory): MemoryEntry => s.entry);
 }
 
-export function parseGatekeeperXml(rawText: string): boolean {
-  const m = rawText.match(/<user_memory>\s*(true|false)\s*<\/user_memory>/i);
+/**
+ * Retrieve up to [limit] visible active memories of the same category for Smart Add:
+ * token/similarity hits first, then padded with the most recently updated entries.
+ */
+export function findSmartAddCandidates(
+  existing: MemoryEntry[],
+  candidateContent: string,
+  category: MemoryCategory,
+  visibilityAssistantId: string | undefined,
+  includeGlobal: boolean = true,
+  limit: number = 5
+): MemoryEntry[] {
+  const visibleSameCat: MemoryEntry[] = [];
+  const scored: ScoredMemory[] = [];
+  for (let i = 0; i < existing.length; i++) {
+    const m = existing[i];
+    if (m.archived || m.category !== category) continue;
+    if (!canReadMemory(m, visibilityAssistantId, includeGlobal)) continue;
+    visibleSameCat.push(m);
+    const sim = computeTextSimilarity(m.content, candidateContent);
+    if (sim > 0.08) {
+      scored.push({ entry: m, score: sim });
+    }
+  }
+  scored.sort((a: ScoredMemory, b: ScoredMemory): number =>
+    b.score - a.score ||
+      normalizeMemoryTimestamp(b.entry.updatedAt) - normalizeMemoryTimestamp(a.entry.updatedAt) ||
+      a.entry.id.localeCompare(b.entry.id)
+  );
+  const picked: MemoryEntry[] = [];
+  const seenIds = new Set<string>();
+  for (let i = 0; i < scored.length && picked.length < limit; i++) {
+    const entry = scored[i].entry;
+    if (!seenIds.has(entry.id)) {
+      seenIds.add(entry.id);
+      picked.push(entry);
+    }
+  }
+  if (picked.length < limit) {
+    visibleSameCat.sort((a: MemoryEntry, b: MemoryEntry): number =>
+      normalizeMemoryTimestamp(b.updatedAt) - normalizeMemoryTimestamp(a.updatedAt) ||
+        a.id.localeCompare(b.id)
+    );
+    for (let i = 0; i < visibleSameCat.length && picked.length < limit; i++) {
+      const entry = visibleSameCat[i];
+      if (!seenIds.has(entry.id)) {
+        seenIds.add(entry.id);
+        picked.push(entry);
+      }
+    }
+  }
+  return picked;
+}
+
+export function parseGatekeeperResult(rawText: string): GatekeeperDecision {
+  const m = rawText.match(/<user_memory>\s*(true|false)/i);
   if (m && m[1]) {
-    return m[1].toLowerCase() === 'true';
+    return m[1].toLowerCase() === 'true' ? 'worthRemembering' : 'skip';
   }
-  const parsed = parseMemoryExtractionResponse(rawText);
-  if (parsed.shouldSave || parsed.memories.length > 0) {
-    return true;
+  const obj = extractFirstJsonObject(rawText);
+  if (obj) {
+    if (typeof obj['shouldSave'] === 'boolean') {
+      return obj['shouldSave'] === true ? 'worthRemembering' : 'skip';
+    }
+    if (Array.isArray(obj['memories']) && (obj['memories'] as Object[]).length > 0) {
+      return 'worthRemembering';
+    }
   }
-  return false;
+  return 'malformed';
+}
+
+export function parseGatekeeperXml(rawText: string): boolean {
+  return parseGatekeeperResult(rawText) === 'worthRemembering';
+}
+
+function unescapeXmlEntities(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, '\'')
+    .replace(/&amp;/g, '&')
+    .trim();
+}
+
+export function parseExtractedMemoriesResult(rawText: string): ExtractParseResult {
+  const maxItems = 10;
+  if (/<extracted\b/i.test(rawText)) {
+    const out: ExtractedMemoryCandidate[] = [];
+    const itemRe = /<item\b([^>]*)>([\s\S]*?)<\/item>/gi;
+    let match = itemRe.exec(rawText);
+    while (match !== null && out.length < maxItems) {
+      const attrs = match[1] || '';
+      const rawContent = unescapeXmlEntities(match[2] || '');
+      if (rawContent.length > 0) {
+        const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']+)["']/i);
+        if (typeMatch && typeMatch[1]) {
+          const scopeMatch = attrs.match(/\bscope\s*=\s*["'](global|assistant)["']/i);
+          const scopeVal = scopeMatch && scopeMatch[1]
+            ? (scopeMatch[1].toLowerCase() === 'assistant' ? 'assistant' : 'global')
+            : undefined;
+          out.push({
+            category: normalizeMemoryCategory(typeMatch[1]),
+            content: rawContent,
+            scope: scopeVal
+          });
+        }
+      }
+      match = itemRe.exec(rawText);
+    }
+    return { ok: true, items: out };
+  }
+  const obj = extractFirstJsonObject(rawText);
+  if (obj && Array.isArray(obj['memories'])) {
+    const parsed = parseMemoryExtractionResponse(rawText);
+    return { ok: true, items: parsed.memories.slice(0, maxItems) };
+  }
+  return { ok: false, items: [] };
 }
 
 export function parseExtractedMemoriesXml(rawText: string): ExtractedMemoryCandidate[] {
-  const out: ExtractedMemoryCandidate[] = [];
-  if (/<extracted\s*\/>/i.test(rawText)) {
-    return out;
-  }
-  const itemRe = /<item\s+type=["']([^"']+)["'][^>]*>([\s\S]*?)<\/item>/gi;
-  let match = itemRe.exec(rawText);
-  while (match !== null) {
-    const rawType = match[1] || 'instruction';
-    const rawContent = (match[2] || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&').trim();
-    if (rawContent.length > 0) {
-      out.push({
-        category: normalizeMemoryCategory(rawType),
-        content: rawContent
-      });
-    }
-    match = itemRe.exec(rawText);
-  }
-  if (out.length > 0) {
-    return out;
-  }
-  const fallback = parseMemoryExtractionResponse(rawText);
-  return fallback.memories;
+  return parseExtractedMemoriesResult(rawText).items;
 }
 
 function extractFirstJsonObject(rawText: string): Record<string, Object> | undefined {
-  const start = rawText.indexOf('{');
-  const end = rawText.lastIndexOf('}');
+  let text = rawText.trim();
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence && fence[1]) {
+    text = fence[1].trim();
+  }
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
   if (start < 0 || end <= start) return undefined;
   try {
-    const parsed = JSON.parse(rawText.slice(start, end + 1)) as Record<string, Object>;
+    const parsed = JSON.parse(text.slice(start, end + 1)) as Record<string, Object>;
     if (parsed && typeof parsed === 'object') return parsed;
   } catch (_) {}
   return undefined;
@@ -889,7 +1059,8 @@ export function applySmartAddDecisions(
   decisions: Map<number, SmartAddDecision>,
   conversationId?: string,
   assistantId?: string,
-  source: MemorySourceKind = 'extracted'
+  source: MemorySourceKind = 'extracted',
+  itemOwners?: Array<string | undefined>
 ): MemoryMergeResult {
   let next: MemoryEntry[] = existing.map((m: MemoryEntry): MemoryEntry => ({
     id: m.id,
@@ -907,18 +1078,23 @@ export function applySmartAddDecisions(
   let mergedCount = 0;
   let conflictCount = 0;
   let skippedCount = 0;
+  let identityChanged = false;
   const now = Date.now();
 
   for (let i = 0; i < candidates.length; i++) {
     const cand = candidates[i];
     const clean = cand.content.trim();
     if (!clean) continue;
+    const itemOwner = itemOwners && i < itemOwners.length ? itemOwners[i] : assistantId;
     const dec = decisions.get(i + 1);
     if (!dec) {
-      const fallback = mergeMemoryCandidates(next, [cand], conversationId, assistantId, source);
+      const fallback = mergeMemoryCandidates(next, [cand], conversationId, itemOwner, source);
       next = fallback.entries;
       addedCount += fallback.addedCount;
       mergedCount += fallback.mergedCount;
+      if (cand.category === 'identity' && (fallback.addedCount > 0 || fallback.mergedCount > 0)) {
+        identityChanged = true;
+      }
       continue;
     }
 
@@ -928,12 +1104,17 @@ export function applySmartAddDecisions(
     }
 
     const targetIdx = dec.targetId
-      ? next.findIndex((m: MemoryEntry): boolean => m.id === dec.targetId && !m.archived && (m.assistantId || '') === (assistantId || ''))
+      ? next.findIndex((m: MemoryEntry): boolean =>
+          m.id === dec.targetId && !m.archived && (m.assistantId || '') === (itemOwner || ''))
       : -1;
 
     if (dec.action === 'MERGE' && targetIdx >= 0) {
+      const mergedText = dec.mergedContent ? dec.mergedContent.trim() : '';
+      if (!mergedText) {
+        skippedCount += 1;
+        continue;
+      }
       const target = next[targetIdx];
-      const mergedText = dec.mergedContent && dec.mergedContent.trim().length > 0 ? dec.mergedContent.trim() : clean;
       const relSet = new Set<string>(target.relatedIds || []);
       for (let r = 0; r < dec.relatedIds.length; r++) {
         if (dec.relatedIds[r] !== target.id) relSet.add(dec.relatedIds[r]);
@@ -951,6 +1132,9 @@ export function applySmartAddDecisions(
         relatedIds: Array.from(relSet)
       };
       mergedCount += 1;
+      if (target.category === 'identity') {
+        identityChanged = true;
+      }
       continue;
     }
 
@@ -968,13 +1152,16 @@ export function applySmartAddDecisions(
         source: oldEntry.source,
         relatedIds: oldEntry.relatedIds
       };
-      const relSet = new Set<string>(dec.relatedIds);
+      const relSet = new Set<string>();
+      for (let r = 0; r < dec.relatedIds.length; r++) {
+        relSet.add(dec.relatedIds[r]);
+      }
       relSet.add(oldEntry.id);
       next.push({
         id: nextMemId('mem'),
         category: cand.category,
         content: clean,
-        assistantId,
+        assistantId: itemOwner,
         archived: false,
         createdAt: now + i,
         updatedAt: now + i,
@@ -984,17 +1171,27 @@ export function applySmartAddDecisions(
       });
       conflictCount += 1;
       addedCount += 1;
+      if (cand.category === 'identity') {
+        identityChanged = true;
+      }
       continue;
     }
 
-    // NEW (or MERGE/CONFLICT without valid targetId: run similarity check to avoid exact duplicates)
-    const simResult = mergeMemoryCandidates(next, [cand], conversationId, assistantId, source, dec.relatedIds);
+    // NEW (or MERGE/CONFLICT without valid same-scope targetId: degrade to NEW with similarity safety)
+    const activeIds = new Set<string>(
+      next.filter((m: MemoryEntry): boolean => !m.archived).map((m: MemoryEntry): string => m.id)
+    );
+    const validRelated = dec.relatedIds.filter((rid: string): boolean => activeIds.has(rid));
+    const simResult = mergeMemoryCandidates(next, [cand], conversationId, itemOwner, source, validRelated);
     next = simResult.entries;
     addedCount += simResult.addedCount;
     mergedCount += simResult.mergedCount;
+    if (cand.category === 'identity' && (simResult.addedCount > 0 || simResult.mergedCount > 0)) {
+      identityChanged = true;
+    }
   }
 
-  return { entries: next, addedCount, mergedCount, conflictCount, skippedCount };
+  return { entries: next, addedCount, mergedCount, conflictCount, skippedCount, identityChanged };
 }
 
 export function parseProfileDistillerResponse(rawText: string): ExtractedProfileCandidate[] {

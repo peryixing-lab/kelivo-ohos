@@ -367,6 +367,8 @@ export interface MemoryTraceStep {
   response?: string;
   summary: string;
   durationMs?: number;
+  status?: 'success' | 'skipped' | 'failed';
+  error?: string;
 }
 
 export interface MemoryTrace {
@@ -375,7 +377,10 @@ export interface MemoryTrace {
   conversationId: string;
   assistantId?: string;
   modelId?: string;
+  trigger?: 'auto' | 'manual';
   gatekeeperPassed: boolean;
+  advanced?: boolean;
+  error?: string;
   extractedCount: number;
   mergedCount: number;
   conflictCount?: number;

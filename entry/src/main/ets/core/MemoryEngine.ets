@@ -1,21 +1,26 @@
 import { completeOnce } from './ChatClient';
 import {
   applySmartAddDecisions,
+  buildExistingMemoryXmlBlock,
   buildProfileBlock,
   canReadMemory,
+  EXTRACT_TOOL_DEFAULT_SCOPE_RULE_EN,
+  EXTRACT_TOOL_DEFAULT_SCOPE_RULE_ZH,
   ExtractedMemoryCandidate,
   ExtractedProfileCandidate,
-  findSimilarActiveMemories,
+  findExactActiveMemory,
+  findSmartAddCandidates,
+  GatekeeperDecision,
   getEffectiveMemoryTemplate,
   memoryDate,
-   MemoryExtractionResult,
+  MemoryExtractionResult,
   memoryTypeName,
   memoryWriteAssistantId,
   mergeMemoryCandidates,
   mergeProfileFields,
   normalizeMemoryCategory,
-  parseExtractedMemoriesXml,
-  parseGatekeeperXml,
+  parseExtractedMemoriesResult,
+  parseGatekeeperResult,
   parseMemoryExtractionResponse,
   parseProfileDistillerResponse,
   parseSmartAddBatchResponse,
@@ -30,11 +35,12 @@ import {
   MemoryEntry,
   MemorySettings,
   MemorySmartAddMode,
-  MemoryTrace,
   MemoryTraceStep,
   MemoryWriteScope,
+  messageText,
   Persona,
   Provider,
+  ReasoningEffort,
   RequestLogEntry,
   UserProfileField
 } from './Models';
@@ -45,6 +51,12 @@ export interface MemoryToolOutcome {
   memories?: MemoryEntry[];
   profile?: UserProfileField[];
   isError?: boolean;
+}
+
+export interface MemoryBatchResult {
+  snippet: string;
+  endMessageId: string;
+  windowSize: number;
 }
 
 export interface MemoryPipelineRunInput {
@@ -60,12 +72,16 @@ export interface MemoryPipelineRunInput {
   settings: MemorySettings;
   writeScope: MemoryWriteScope;
   smartAddMode: MemorySmartAddMode;
+  assistantReasoning?: ReasoningEffort;
   uiLanguage?: string;
   onLog?: (entry: RequestLogEntry) => void;
 }
 
 export interface MemoryPipelineRunOutput {
   shouldSave: boolean;
+  advanced: boolean;
+  gateStatus: GatekeeperDecision;
+  error?: string;
   summary: string;
   memories: MemoryEntry[];
   profile: UserProfileField[];
@@ -338,37 +354,118 @@ export function executeMemoryToolCall(
   return { text: '未知或未启用的记忆工具。', isError: true };
 }
 
-export function memoryTurnBatch(messages: ChatMessage[], cadence: number, through?: string, manual: boolean = false): string {
-  if (!messages.length || messages[messages.length - 1].role !== 'assistant') return '';
+function replaceTemplatePlaceholder(template: string, key: string, value: string): string {
+  const re = new RegExp('\\{\\{\\s*' + key + '\\s*\\}\\}', 'g');
+  return template.replace(re, (): string => value);
+}
+
+function clipTraceText(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars)}\n…[truncated]`;
+}
+
+export function buildMemoryOrganizeBatch(
+  messages: ChatMessage[],
+  cadence: number,
+  through?: string,
+  manual: boolean = false,
+  lang: 'zh' | 'en' = 'zh'
+): MemoryBatchResult {
+  const empty: MemoryBatchResult = { snippet: '', endMessageId: '', windowSize: 0 };
+  if (!messages.length) return empty;
   const watermark = through ? messages.findIndex((message: ChatMessage): boolean => message.id === through) : -1;
   const pending = messages.slice(watermark + 1);
-  const turns = pending.filter((message: ChatMessage): boolean => message.role === 'user');
-  if (!turns.length || (!manual && turns.length < cadence)) return '';
-  const count = manual || watermark >= 0 ? Math.min(turns.length, 20) : cadence;
-  const start = pending.indexOf(turns[turns.length - count]);
-  return pending.slice(start).map((message: ChatMessage): string =>
-    (message.role === 'user' ? '用户：' : '助手：') + message.text.slice(0, 1500)).join('\n\n').slice(-12000);
+  let windowMsgs: ChatMessage[] = [];
+  let isManualFallback = false;
+
+  if (!manual) {
+    let lastAsstIdx = -1;
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (pending[i].role === 'assistant' && messageText(pending[i]).trim().length > 0) {
+        lastAsstIdx = i;
+        break;
+      }
+    }
+    if (lastAsstIdx < 0) return empty;
+    const eligible = pending.slice(0, lastAsstIdx + 1);
+    let assistantTurns = 0;
+    for (let i = 0; i < eligible.length; i++) {
+      if (eligible[i].role === 'assistant' && messageText(eligible[i]).trim().length > 0) {
+        assistantTurns += 1;
+      }
+    }
+    const minTurns = Math.max(1, cadence);
+    if (assistantTurns < minTurns) return empty;
+    windowMsgs = watermark < 0 && eligible.length > 10 ? eligible.slice(-10) : eligible;
+  } else {
+    const nonEmptyPending = pending.filter((m: ChatMessage): boolean =>
+      (m.role === 'user' || m.role === 'assistant') && messageText(m).trim().length > 0
+    );
+    if (nonEmptyPending.length > 0) {
+      windowMsgs = watermark < 0 && nonEmptyPending.length > 10 ? nonEmptyPending.slice(-10) : nonEmptyPending;
+    } else {
+      isManualFallback = true;
+      const recent = messages.filter((m: ChatMessage): boolean =>
+        (m.role === 'user' || m.role === 'assistant') && messageText(m).trim().length > 0
+      );
+      if (!recent.length) return empty;
+      windowMsgs = recent.length > 4 ? recent.slice(-4) : recent;
+    }
+  }
+
+  if (!windowMsgs.length) return empty;
+  const maxMessageChars = 2000;
+  const maxTotalChars = isManualFallback ? 4000 : 6000;
+  const reversedLines: string[] = [];
+  let totalLen = 0;
+
+  for (let i = windowMsgs.length - 1; i >= 0; i--) {
+    const msg = windowMsgs[i];
+    const body = messageText(msg).trim();
+    if (!body) continue;
+    const prefix = msg.role === 'user'
+      ? (lang === 'en' ? 'User: ' : '用户：')
+      : (lang === 'en' ? 'Assistant: ' : '助手：');
+    const clipped = body.length > maxMessageChars ? `${body.slice(0, maxMessageChars)}…` : body;
+    const line = `${prefix}${clipped}`;
+    totalLen += (reversedLines.length === 0 ? 0 : 2) + line.length;
+    reversedLines.push(line);
+    if (totalLen > maxTotalChars) break;
+  }
+
+  if (!reversedLines.length) return empty;
+  const joined = reversedLines.reverse().join('\n\n');
+  const snippet = joined.length > maxTotalChars ? `…${joined.slice(joined.length - maxTotalChars)}` : joined;
+  return {
+    snippet,
+    endMessageId: windowMsgs[windowMsgs.length - 1].id,
+    windowSize: windowMsgs.length
+  };
+}
+
+export function memoryTurnBatch(messages: ChatMessage[], cadence: number, through?: string, manual: boolean = false): string {
+  return buildMemoryOrganizeBatch(messages, cadence, through, manual, 'zh').snippet;
 }
 
 export async function extractMemory(
   provider: Provider, key: string, modelId: string, snippet: string, conversationId: string, proxyPassword?: string
 ): Promise<MemoryExtractionResult> {
-  const raw = await completeOnce(provider, key, EXTRACTION_SYSTEM_PROMPT, snippet, modelId, 1000, proxyPassword, conversationId);
+  const raw = await completeOnce(provider, key, EXTRACTION_SYSTEM_PROMPT, snippet, modelId, 0, proxyPassword, conversationId);
   return parseMemoryExtractionResponse(raw);
 }
 
-function formatExistingMemoriesForExtract(entries: MemoryEntry[], assistantId?: string, includeGlobal: boolean = true): string {
-  const visible = entries.filter((e: MemoryEntry): boolean => !e.archived && canReadMemory(e, assistantId, includeGlobal));
-  if (visible.length === 0) return '(无)';
-  const recent = visible.slice(0, 60);
-  return recent.map((e: MemoryEntry): string => `- [${memoryTypeName(e.category)}] ${e.content}`).join('\n');
+function formatSmartAddEntriesPerItem(entries: MemoryEntry[]): string {
+  if (entries.length === 0) return '';
+  return entries.map((e: MemoryEntry): string => `${e.id} ${e.content}`).join('\n');
 }
 
-function formatSimilarEntriesForSmartAdd(entries: MemoryEntry[]): string {
-  if (entries.length === 0) return '(none)';
-  return entries.map((e: MemoryEntry): string =>
-    `- id=${e.id} | type=${memoryTypeName(e.category)} | ${e.content}`
-  ).join('\n');
+function formatSmartAddEntriesBatched(entries: MemoryEntry[]): string {
+  if (entries.length === 0) return '';
+  return entries.map((e: MemoryEntry): string => `${e.id} (${memoryTypeName(e.category)}) ${e.content}`).join('\n');
+}
+
+function formatIdentityEntriesForDistill(entries: MemoryEntry[]): string {
+  if (entries.length === 0) return '';
+  return entries.map((e: MemoryEntry): string => `${e.id} ${e.content}`).join('\n');
 }
 
 /**
@@ -385,30 +482,92 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
     ? memoryWriteAssistantId(input.writeScope, input.assistantId)
     : input.assistantId;
   const recordSteps = input.settings.recordTraces !== false;
-  const enableThinking = input.settings.enableThinking !== false;
+  const thinkingEnabled = input.settings.enableThinking !== false;
+  const stageEffort: ReasoningEffort = thinkingEnabled ? (input.assistantReasoning || 'low') : 'off';
+  const gateEffort: ReasoningEffort = 'off';
   const steps: MemoryTraceStep[] = [];
 
   // Stage 1: Gatekeeper
   const gateStart = Date.now();
   const gateTpl = getEffectiveMemoryTemplate(input.settings, 'gate', lang);
-  const gatePrompt = gateTpl.replace(/\{\{\s*conversation\s*\}\}/g, input.snippet);
-  const gateResp = await completeOnce(
-    input.provider,
-    input.apiKey,
-    '',
-    gatePrompt,
-    input.modelId,
-    256,
-    input.proxyPassword,
-    input.conversationId,
-    enableThinking,
-    input.onLog
-  );
-  const gatePassed = parseGatekeeperXml(gateResp);
+  const gatePrompt = replaceTemplatePlaceholder(gateTpl, 'conversation', input.snippet);
+  let gateResp = '';
+  try {
+    gateResp = await completeOnce(
+      input.provider,
+      input.apiKey,
+      '',
+      gatePrompt,
+      input.modelId,
+      0,
+      input.proxyPassword,
+      input.conversationId,
+      gateEffort,
+      input.onLog
+    );
+  } catch (e) {
+    const errText = (e as Error).message || String(e);
+    steps.push({
+      stage: 'Gatekeeper',
+      status: 'failed',
+      error: `gate_request_failed: ${errText}`,
+      prompt: recordSteps ? clipTraceText(gatePrompt, 3000) : undefined,
+      response: recordSteps ? '' : undefined,
+      summary: `门控请求失败：${errText}`,
+      durationMs: Date.now() - gateStart
+    });
+    return {
+      shouldSave: false,
+      advanced: false,
+      gateStatus: 'malformed',
+      error: `gate_request_failed:${errText}`,
+      summary: `门控请求失败：${errText}`,
+      memories: input.existingMemories,
+      profile: input.existingProfile,
+      addedCount: 0,
+      mergedCount: 0,
+      conflictCount: 0,
+      skippedCount: 0,
+      profileUpdatedCount: 0,
+      steps
+    };
+  }
+
+  const gateDecision = parseGatekeeperResult(gateResp);
+  if (gateDecision === 'malformed') {
+    const reason = gateResp.trim().length === 0 ? '门控返回空响应（将保留未整理进度以便重试）' : '门控输出格式无效（将保留未整理进度以便重试）';
+    steps.push({
+      stage: 'Gatekeeper',
+      status: 'failed',
+      error: 'gate_parse_failed',
+      prompt: recordSteps ? clipTraceText(gatePrompt, 3000) : undefined,
+      response: recordSteps ? clipTraceText(gateResp, 2000) : undefined,
+      summary: reason,
+      durationMs: Date.now() - gateStart
+    });
+    return {
+      shouldSave: false,
+      advanced: false,
+      gateStatus: 'malformed',
+      error: 'gate_parse_failed',
+      summary: reason,
+      memories: input.existingMemories,
+      profile: input.existingProfile,
+      addedCount: 0,
+      mergedCount: 0,
+      conflictCount: 0,
+      skippedCount: 0,
+      profileUpdatedCount: 0,
+      steps
+    };
+  }
+
+  const gatePassed = gateDecision === 'worthRemembering';
   steps.push({
     stage: 'Gatekeeper',
-    prompt: recordSteps ? gatePrompt : undefined,
-    response: recordSteps ? gateResp : undefined,
+    status: 'success',
+    prompt: recordSteps ? clipTraceText(gatePrompt, 3000) : undefined,
+    response: recordSteps ? clipTraceText(gateResp, 2000) : undefined,
     summary: gatePassed ? '门控判定：包含值得长期记忆的用户信息 (true)' : '门控判定：无需记录长期记忆 (false)',
     durationMs: Date.now() - gateStart
   });
@@ -416,6 +575,8 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
   if (!gatePassed) {
     return {
       shouldSave: false,
+      advanced: true,
+      gateStatus: 'skip',
       summary: '门控跳过：未发现需要长期记忆的用户信息',
       memories: input.existingMemories,
       profile: input.existingProfile,
@@ -430,28 +591,97 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
 
   // Stage 2: Extract
   const extStart = Date.now();
-  const extTpl = getEffectiveMemoryTemplate(input.settings, 'extract', lang);
-  const existingMemStr = formatExistingMemoriesForExtract(input.existingMemories, input.assistantId, includeGlobal);
-  const extPrompt = extTpl
-    .replace(/\{\{\s*existingMemory\s*\}\}/g, existingMemStr)
-    .replace(/\{\{\s*conversation\s*\}\}/g, input.snippet);
-  const extResp = await completeOnce(
-    input.provider,
-    input.apiKey,
-    '',
-    extPrompt,
-    input.modelId,
-    1200,
-    input.proxyPassword,
-    input.conversationId,
-    enableThinking,
-    input.onLog
+  let extTpl = getEffectiveMemoryTemplate(input.settings, 'extract', lang);
+  if (includeGlobal && (input.writeScope === 'toolDefaultGlobal' || input.writeScope === 'toolDefaultAssistant')) {
+    const rule = lang === 'en' ? EXTRACT_TOOL_DEFAULT_SCOPE_RULE_EN : EXTRACT_TOOL_DEFAULT_SCOPE_RULE_ZH;
+    const marker = lang === 'en' ? '## Existing memory' : '## 已有记忆';
+    extTpl = extTpl.includes(marker)
+      ? extTpl.replace(marker, (): string => `${rule}\n\n${marker}`)
+      : `${extTpl}\n\n${rule}`;
+  }
+  const existingMemStr = buildExistingMemoryXmlBlock(input.existingMemories, input.settings, input.assistantId, lang, [], 25);
+  const extPrompt = replaceTemplatePlaceholder(
+    replaceTemplatePlaceholder(extTpl, 'existingMemory', existingMemStr),
+    'conversation',
+    input.snippet
   );
-  const candidates: ExtractedMemoryCandidate[] = parseExtractedMemoriesXml(extResp);
+  let extResp = '';
+  try {
+    extResp = await completeOnce(
+      input.provider,
+      input.apiKey,
+      '',
+      extPrompt,
+      input.modelId,
+      0,
+      input.proxyPassword,
+      input.conversationId,
+      stageEffort,
+      input.onLog
+    );
+  } catch (e) {
+    const errText = (e as Error).message || String(e);
+    steps.push({
+      stage: 'Extract',
+      status: 'failed',
+      error: `extract_request_failed: ${errText}`,
+      prompt: recordSteps ? clipTraceText(extPrompt, 3000) : undefined,
+      response: recordSteps ? '' : undefined,
+      summary: `提取请求失败：${errText}`,
+      durationMs: Date.now() - extStart
+    });
+    return {
+      shouldSave: false,
+      advanced: false,
+      gateStatus: 'worthRemembering',
+      error: `extract_request_failed:${errText}`,
+      summary: `提取请求失败：${errText}`,
+      memories: input.existingMemories,
+      profile: input.existingProfile,
+      addedCount: 0,
+      mergedCount: 0,
+      conflictCount: 0,
+      skippedCount: 0,
+      profileUpdatedCount: 0,
+      steps
+    };
+  }
+
+  const extParsed = parseExtractedMemoriesResult(extResp);
+  if (!extParsed.ok) {
+    const extReason = extResp.trim().length === 0 ? '提取阶段返回空响应（将重试）' : '提取阶段输出格式无效（将重试）';
+    steps.push({
+      stage: 'Extract',
+      status: 'failed',
+      error: 'extract_parse_failed',
+      prompt: recordSteps ? clipTraceText(extPrompt, 3000) : undefined,
+      response: recordSteps ? clipTraceText(extResp, 2000) : undefined,
+      summary: extReason,
+      durationMs: Date.now() - extStart
+    });
+    return {
+      shouldSave: false,
+      advanced: false,
+      gateStatus: 'worthRemembering',
+      error: 'extract_parse_failed',
+      summary: extReason,
+      memories: input.existingMemories,
+      profile: input.existingProfile,
+      addedCount: 0,
+      mergedCount: 0,
+      conflictCount: 0,
+      skippedCount: 0,
+      profileUpdatedCount: 0,
+      steps
+    };
+  }
+
+  const candidates: ExtractedMemoryCandidate[] = extParsed.items;
   steps.push({
     stage: 'Extract',
-    prompt: recordSteps ? extPrompt : undefined,
-    response: recordSteps ? extResp : undefined,
+    status: 'success',
+    prompt: recordSteps ? clipTraceText(extPrompt, 3000) : undefined,
+    response: recordSteps ? clipTraceText(extResp, 2000) : undefined,
     summary: candidates.length > 0 ? `提取出 ${candidates.length} 条候选记忆` : '未提取到新候选记忆 (<extracted/>)',
     durationMs: Date.now() - extStart
   });
@@ -459,7 +689,9 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
   if (candidates.length === 0) {
     return {
       shouldSave: false,
-      summary: '门控通过，但未提取出新的独立记忆条目',
+      advanced: true,
+      gateStatus: 'worthRemembering',
+      summary: '无新增记忆条目',
       memories: input.existingMemories,
       profile: input.existingProfile,
       addedCount: 0,
@@ -474,100 +706,157 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
   // Stage 3: Smart Add (Batched or Per-item)
   const smartStart = Date.now();
   const decisions = new Map<number, SmartAddDecision>();
-  if (input.smartAddMode === 'perItem') {
-    const singleTpl = getEffectiveMemoryTemplate(input.settings, 'smartAddSingle', lang);
-    for (let i = 0; i < candidates.length; i++) {
-      const cand = candidates[i];
-      const similar = findSimilarActiveMemories(input.existingMemories, cand.content, undefined, owner, 5);
-      if (similar.length === 0) {
-        decisions.set(i + 1, { action: 'NEW', relatedIds: [] });
-        continue;
-      }
-      const singlePrompt = singleTpl
-        .replace(/\{\{\s*type\s*\}\}/g, memoryTypeName(cand.category))
-        .replace(/\{\{\s*newInfo\s*\}\}/g, cand.content)
-        .replace(/\{\{\s*entriesText\s*\}\}/g, formatSimilarEntriesForSmartAdd(similar));
-      try {
-        const sResp = await completeOnce(
-          input.provider,
-          input.apiKey,
-          '',
-          singlePrompt,
-          input.modelId,
-          512,
-          input.proxyPassword,
-          input.conversationId,
-          enableThinking,
-          input.onLog
-        );
-        const dec = parseSmartAddSingleResponse(sResp);
-        if (dec) decisions.set(i + 1, dec);
-      } catch (_) {}
+  const itemOwners: Array<string | undefined> = [];
+  const pendingIndexes: number[] = [];
+  const perItemCandidates: MemoryEntry[][] = [];
+  const unionMap = new Map<string, MemoryEntry>();
+
+  for (let i = 0; i < candidates.length; i++) {
+    const cand = candidates[i];
+    const itemOwner = includeGlobal
+      ? memoryWriteAssistantId(input.writeScope, input.assistantId, cand.scope)
+      : input.assistantId;
+    itemOwners.push(itemOwner);
+
+    const exact = findExactActiveMemory(input.existingMemories, cand.category, cand.content, input.assistantId, includeGlobal);
+    if (exact) {
+      perItemCandidates.push([]);
+      decisions.set(i + 1, { action: 'SKIP', targetId: exact.id, relatedIds: [] });
+      continue;
     }
+
+    const cands = findSmartAddCandidates(input.existingMemories, cand.content, cand.category, input.assistantId, includeGlobal, 5);
+    perItemCandidates.push(cands);
+    if (cands.length === 0) {
+      decisions.set(i + 1, { action: 'NEW', relatedIds: [] });
+      continue;
+    }
+    for (let j = 0; j < cands.length; j++) {
+      unionMap.set(cands[j].id, cands[j]);
+    }
+    pendingIndexes.push(i);
+  }
+
+  if (pendingIndexes.length === 0) {
+    steps.push({
+      stage: input.smartAddMode === 'perItem' ? 'Smart Add (Per-item)' : 'Smart Add (Batched)',
+      status: 'success',
+      summary: input.existingMemories.length === 0
+        ? `库中无已有条目，直接新增 ${candidates.length} 条记忆`
+        : `完成 ${candidates.length} 条候选记忆的快速去重判定`,
+      durationMs: Date.now() - smartStart
+    });
+  } else if (input.smartAddMode === 'perItem') {
+    const singleTpl = getEffectiveMemoryTemplate(input.settings, 'smartAddSingle', lang);
+    const promptParts: string[] = [];
+    const respParts: string[] = [];
+    for (let k = 0; k < pendingIndexes.length; k++) {
+      promptParts.push('');
+      respParts.push('');
+    }
+    let cursor = 0;
+    const workerCount = Math.min(3, pendingIndexes.length);
+    const workers: Array<Promise<void>> = [];
+    const runWorker = async (): Promise<void> => {
+      while (true) {
+        const pIdx = cursor;
+        if (pIdx >= pendingIndexes.length) break;
+        cursor += 1;
+        const idx = pendingIndexes[pIdx];
+        const cand = candidates[idx];
+        const similar = perItemCandidates[idx];
+        const singlePrompt = replaceTemplatePlaceholder(
+          replaceTemplatePlaceholder(
+            replaceTemplatePlaceholder(singleTpl, 'type', memoryTypeName(cand.category)),
+            'newInfo',
+            cand.content
+          ),
+          'entriesText',
+          formatSmartAddEntriesPerItem(similar)
+        );
+        if (recordSteps) promptParts[pIdx] = singlePrompt;
+        try {
+          const sResp = await completeOnce(
+            input.provider,
+            input.apiKey,
+            '',
+            singlePrompt,
+            input.modelId,
+            0,
+            input.proxyPassword,
+            input.conversationId,
+            stageEffort,
+            input.onLog
+          );
+          if (recordSteps) respParts[pIdx] = sResp;
+          const dec = parseSmartAddSingleResponse(sResp);
+          if (dec) decisions.set(idx + 1, dec);
+        } catch (e) {
+          if (recordSteps) respParts[pIdx] = `<request failed> ${(e as Error).message || String(e)}`;
+        }
+      }
+    };
+    for (let w = 0; w < workerCount; w++) {
+      workers.push(runWorker());
+    }
+    await Promise.all(workers);
     steps.push({
       stage: 'Smart Add (Per-item)',
+      status: 'success',
+      prompt: recordSteps && promptParts.length > 0 ? clipTraceText(promptParts.join('\n\n─── ───\n\n'), 3000) : undefined,
+      response: recordSteps && respParts.length > 0 ? clipTraceText(respParts.join('\n\n─── ───\n\n'), 2000) : undefined,
       summary: `已完成 ${candidates.length} 条候选记忆的逐条去重判定`,
       durationMs: Date.now() - smartStart
     });
   } else {
-    // Gather union of similar existing memories across all candidates
-    const simMap = new Map<string, MemoryEntry>();
-    for (let i = 0; i < candidates.length; i++) {
-      const simList = findSimilarActiveMemories(input.existingMemories, candidates[i].content, undefined, owner, 5);
-      for (let j = 0; j < simList.length; j++) {
-        simMap.set(simList[j].id, simList[j]);
-      }
-    }
-    const unionSimilar = Array.from(simMap.values()).slice(0, 15);
-    if (unionSimilar.length === 0) {
-      for (let i = 0; i < candidates.length; i++) {
-        decisions.set(i + 1, { action: 'NEW', relatedIds: [] });
+    const unionSimilar = Array.from(unionMap.values()).slice(0, 12);
+    const batchTpl = getEffectiveMemoryTemplate(input.settings, 'smartAddBatch', lang);
+    const itemsText = pendingIndexes.map((origIdx: number, k: number): string =>
+      `[${k + 1}] ${memoryTypeName(candidates[origIdx].category)} ${candidates[origIdx].content}`
+    ).join('\n');
+    const entriesText = formatSmartAddEntriesBatched(unionSimilar);
+    const batchPrompt = replaceTemplatePlaceholder(
+      replaceTemplatePlaceholder(batchTpl, 'itemsText', itemsText),
+      'entriesText',
+      entriesText
+    );
+    try {
+      const bResp = await completeOnce(
+        input.provider,
+        input.apiKey,
+        '',
+        batchPrompt,
+        input.modelId,
+        0,
+        input.proxyPassword,
+        input.conversationId,
+        stageEffort,
+        input.onLog
+      );
+      const parsedMap = parseSmartAddBatchResponse(bResp);
+      for (let k = 0; k < pendingIndexes.length; k++) {
+        const dec = parsedMap.get(k + 1);
+        if (dec) {
+          decisions.set(pendingIndexes[k] + 1, dec);
+        }
       }
       steps.push({
         stage: 'Smart Add (Batched)',
-        summary: `库中无相似条目，直接新增 ${candidates.length} 条记忆`,
+        status: 'success',
+        prompt: recordSteps ? clipTraceText(batchPrompt, 3000) : undefined,
+        response: recordSteps ? clipTraceText(bResp, 2000) : undefined,
+        summary: `批量去重判定完成（比对 ${unionSimilar.length} 条同类已有记忆）`,
         durationMs: Date.now() - smartStart
       });
-    } else {
-      const batchTpl = getEffectiveMemoryTemplate(input.settings, 'smartAddBatch', lang);
-      const itemsText = candidates.map((c: ExtractedMemoryCandidate, idx: number): string =>
-        `${idx + 1}. [${memoryTypeName(c.category)}] ${c.content}`
-      ).join('\n');
-      const entriesText = formatSimilarEntriesForSmartAdd(unionSimilar);
-      const batchPrompt = batchTpl
-        .replace(/\{\{\s*itemsText\s*\}\}/g, itemsText)
-        .replace(/\{\{\s*entriesText\s*\}\}/g, entriesText);
-      try {
-        const bResp = await completeOnce(
-          input.provider,
-          input.apiKey,
-          '',
-          batchPrompt,
-          input.modelId,
-          1024,
-          input.proxyPassword,
-          input.conversationId,
-          enableThinking,
-          input.onLog
-        );
-        const parsedMap = parseSmartAddBatchResponse(bResp);
-        parsedMap.forEach((v: SmartAddDecision, k: number) => {
-          decisions.set(k, v);
-        });
-        steps.push({
-          stage: 'Smart Add (Batched)',
-          prompt: recordSteps ? batchPrompt : undefined,
-          response: recordSteps ? bResp : undefined,
-          summary: `批量去重判定完成（匹配 ${unionSimilar.length} 条相似记忆）`,
-          durationMs: Date.now() - smartStart
-        });
-      } catch (e) {
-        steps.push({
-          stage: 'Smart Add (Batched)',
-          summary: `批量去重回退至本地相似度合并：${(e as Error).message || String(e)}`,
-          durationMs: Date.now() - smartStart
-        });
-      }
+    } catch (e) {
+      steps.push({
+        stage: 'Smart Add (Batched)',
+        status: 'failed',
+        error: (e as Error).message || String(e),
+        prompt: recordSteps ? clipTraceText(batchPrompt, 3000) : undefined,
+        summary: `批量去重请求失败，已降级为本地去重合并：${(e as Error).message || String(e)}`,
+        durationMs: Date.now() - smartStart
+      });
     }
   }
 
@@ -577,25 +866,25 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
     decisions,
     input.conversationId,
     owner,
-    'extracted'
+    'extracted',
+    itemOwners
   );
 
-  // Stage 4: Profile Distiller (when global profile is active and identity candidates were extracted)
+  // Stage 4: Profile Distiller (when global profile is active and identity entries changed)
   let nextProfile = input.existingProfile;
   let profileUpdatedCount = 0;
-  const hasNewIdentity = candidates.some((c: ExtractedMemoryCandidate): boolean => c.category === 'identity');
-  if (!owner && includeGlobal && hasNewIdentity) {
+  if (includeGlobal && mergedOut.identityChanged) {
     const distStart = Date.now();
     const identityEntries = mergedOut.entries
-      .filter((m: MemoryEntry): boolean => !m.archived && m.category === 'identity' && !m.assistantId)
-      .slice(-25)
-      .map((m: MemoryEntry): string => `- ${m.content}`)
-      .join('\n');
+      .filter((m: MemoryEntry): boolean => !m.archived && m.category === 'identity' && canReadMemory(m, input.assistantId, includeGlobal))
+      .slice(-30);
     if (identityEntries.length > 0) {
       const distTpl = getEffectiveMemoryTemplate(input.settings, 'profileDistill', lang);
-      const distPrompt = distTpl
-        .replace(/\{\{\s*profileBlock\s*\}\}/g, buildProfileBlock(input.existingProfile))
-        .replace(/\{\{\s*identityEntries\s*\}\}/g, identityEntries);
+      const distPrompt = replaceTemplatePlaceholder(
+        replaceTemplatePlaceholder(distTpl, 'profileBlock', buildProfileBlock(input.existingProfile)),
+        'identityEntries',
+        formatIdentityEntriesForDistill(identityEntries)
+      );
       try {
         const distResp = await completeOnce(
           input.provider,
@@ -603,10 +892,10 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
           '',
           distPrompt,
           input.modelId,
-          512,
+          0,
           input.proxyPassword,
           input.conversationId,
-          enableThinking,
+          stageEffort,
           input.onLog
         );
         const distilledFields = parseProfileDistillerResponse(distResp);
@@ -617,12 +906,22 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
         }
         steps.push({
           stage: 'Profile Distiller',
-          prompt: recordSteps ? distPrompt : undefined,
-          response: recordSteps ? distResp : undefined,
+          status: 'success',
+          prompt: recordSteps ? clipTraceText(distPrompt, 3000) : undefined,
+          response: recordSteps ? clipTraceText(distResp, 2000) : undefined,
           summary: profileUpdatedCount > 0 ? `更新了 ${profileUpdatedCount} 个用户画像字段` : '画像字段无需变更',
           durationMs: Date.now() - distStart
         });
-      } catch (_) {}
+      } catch (e) {
+        steps.push({
+          stage: 'Profile Distiller',
+          status: 'failed',
+          error: (e as Error).message || String(e),
+          prompt: recordSteps ? clipTraceText(distPrompt, 3000) : undefined,
+          summary: `画像提炼失败：${(e as Error).message || String(e)}`,
+          durationMs: Date.now() - distStart
+        });
+      }
     }
   }
 
@@ -637,6 +936,8 @@ export async function runMemoryPipeline(input: MemoryPipelineRunInput): Promise<
 
   return {
     shouldSave: mergedOut.addedCount > 0 || mergedOut.mergedCount > 0 || profileUpdatedCount > 0,
+    advanced: true,
+    gateStatus: 'worthRemembering',
     summary: summaryParts.length > 0 ? summaryParts.join(' · ') : '已判重，无新增记忆变更',
     memories: mergedOut.entries,
     profile: nextProfile,

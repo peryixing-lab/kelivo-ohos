@@ -109,6 +109,9 @@ export class KelivoDatabase {
   private store?: relationalStore.RdbStore;
   private context: common.UIAbilityContext;
   private queue: Promise<void> = Promise.resolve();
+  private savedConvMetaSig: Map<string, string> = new Map<string, string>();
+  private savedConvMsgsSig: Map<string, string> = new Map<string, string>();
+  private hasSyncedChats: boolean = false;
 
   constructor(context: common.UIAbilityContext) {
     this.context = context;
@@ -171,7 +174,54 @@ export class KelivoDatabase {
     }
   }
 
+  private attachmentNeedsOffload(att?: Attachment): boolean {
+    if (!att || !att.data || att.filePath) return false;
+    const isBinary = att.mime.startsWith('image/') || att.mime.startsWith('audio/');
+    return isBinary || att.data.length >= 32 * 1024;
+  }
+
+  private buildConversationMetaJson(chat: Conversation): string {
+    const meta: ConversationMetaPayload = {
+      ephemeral: chat.ephemeral,
+      contextStartIndex: chat.contextStartIndex,
+      memoryOrganizedThrough: chat.memoryOrganizedThrough,
+      overrideProviderId: chat.overrideProviderId,
+      overrideModel: chat.overrideModel,
+      overridePrompt: chat.overridePrompt,
+      enabledMcpIds: chat.enabledMcpIds,
+      enabledSkillIds: chat.enabledSkillIds,
+      workspaceId: chat.workspaceId,
+      toolPermissionMode: chat.toolPermissionMode,
+      draftText: chat.draftText,
+      imageGenMode: chat.imageGenMode,
+      suggestions: chat.suggestions
+    };
+    return JSON.stringify(meta);
+  }
+
+  private conversationMetaSignature(chat: Conversation, metaJson: string): string {
+    return `${chat.title}\u0000${chat.updated}\u0000${chat.pinned ? 1 : 0}\u0000${chat.personaId}\u0000${metaJson}`;
+  }
+
   private async offloadConversationAttachments(chat: Conversation): Promise<Conversation> {
+    let dirty = false;
+    for (let i = 0; i < chat.messages.length; i++) {
+      const m = chat.messages[i];
+      if (this.attachmentNeedsOffload(m.attachment)) {
+        dirty = true;
+        break;
+      }
+      if (m.attachments && m.attachments.length > 0) {
+        for (let j = 0; j < m.attachments.length; j++) {
+          if (this.attachmentNeedsOffload(m.attachments[j])) {
+            dirty = true;
+            break;
+          }
+        }
+        if (dirty) break;
+      }
+    }
+    if (!dirty) return chat;
     const messages: ChatMessage[] = [];
     for (let i = 0; i < chat.messages.length; i++) {
       const msg = chat.messages[i];
@@ -303,6 +353,19 @@ export class KelivoDatabase {
       msgRs.close();
     }
 
+    this.savedConvMetaSig.clear();
+    this.savedConvMsgsSig.clear();
+    for (let i = 0; i < chats.length; i++) {
+      const c = chats[i];
+      const metaJson = this.buildConversationMetaJson(c);
+      this.savedConvMetaSig.set(c.id, this.conversationMetaSignature(c, metaJson));
+      const payloads: string[] = [];
+      for (let j = 0; j < c.messages.length; j++) {
+        payloads.push(JSON.stringify(c.messages[j]));
+      }
+      this.savedConvMsgsSig.set(c.id, payloads.join('\u0001'));
+    }
+    this.hasSyncedChats = true;
     ws.conversations = chats;
     return ws;
   }
@@ -365,40 +428,82 @@ export class KelivoDatabase {
       rdb.beginTransaction();
       try {
         await this.putMeta('workspace_meta', metaJson);
-        await rdb.executeSql('DELETE FROM messages');
-        await rdb.executeSql('DELETE FROM conversations');
-        for (let i = 0; i < processedChats.length; i++) {
-          const chat = processedChats[i];
-          const meta: ConversationMetaPayload = {
-            ephemeral: chat.ephemeral,
-            contextStartIndex: chat.contextStartIndex,
-            memoryOrganizedThrough: chat.memoryOrganizedThrough,
-            overrideProviderId: chat.overrideProviderId,
-            overrideModel: chat.overrideModel,
-            overridePrompt: chat.overridePrompt,
-            enabledMcpIds: chat.enabledMcpIds,
-            enabledSkillIds: chat.enabledSkillIds,
-            workspaceId: chat.workspaceId,
-            toolPermissionMode: chat.toolPermissionMode,
-            draftText: chat.draftText,
-            imageGenMode: chat.imageGenMode,
-            suggestions: chat.suggestions
-          };
-          await rdb.executeSql(
-            'INSERT OR REPLACE INTO conversations (id, title, updated, pinned, persona_id, meta_json) VALUES (?, ?, ?, ?, ?, ?)',
-            [chat.id, chat.title, chat.updated, chat.pinned ? 1 : 0, chat.personaId, JSON.stringify(meta)]
-          );
-          for (let j = 0; j < chat.messages.length; j++) {
-            const msg = chat.messages[j];
+        const nextMetaSig = new Map<string, string>();
+        const nextMsgsSig = new Map<string, string>();
+        if (!this.hasSyncedChats) {
+          await rdb.executeSql('DELETE FROM messages');
+          await rdb.executeSql('DELETE FROM conversations');
+          for (let i = 0; i < processedChats.length; i++) {
+            const chat = processedChats[i];
+            const convMetaJson = this.buildConversationMetaJson(chat);
+            nextMetaSig.set(chat.id, this.conversationMetaSignature(chat, convMetaJson));
             await rdb.executeSql(
-              'INSERT OR REPLACE INTO messages (id, conversation_id, seq, role, text, model, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-              [msg.id, chat.id, j, msg.role, msg.text, msg.model, JSON.stringify(msg), msg.createdAt || chat.updated]
+              'INSERT OR REPLACE INTO conversations (id, title, updated, pinned, persona_id, meta_json) VALUES (?, ?, ?, ?, ?, ?)',
+              [chat.id, chat.title, chat.updated, chat.pinned ? 1 : 0, chat.personaId, convMetaJson]
             );
+            const payloads: string[] = [];
+            for (let j = 0; j < chat.messages.length; j++) {
+              const msg = chat.messages[j];
+              const payload = JSON.stringify(msg);
+              payloads.push(payload);
+              await rdb.executeSql(
+                'INSERT OR REPLACE INTO messages (id, conversation_id, seq, role, text, model, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [msg.id, chat.id, j, msg.role, msg.text, msg.model, payload, msg.createdAt || chat.updated]
+              );
+            }
+            nextMsgsSig.set(chat.id, payloads.join('\u0001'));
+          }
+        } else {
+          const liveIds = new Set<string>();
+          for (let i = 0; i < processedChats.length; i++) {
+            liveIds.add(processedChats[i].id);
+          }
+          const prevIds = Array.from(this.savedConvMetaSig.keys());
+          for (let i = 0; i < prevIds.length; i++) {
+            const oldId = prevIds[i];
+            if (!liveIds.has(oldId)) {
+              await rdb.executeSql('DELETE FROM messages WHERE conversation_id = ?', [oldId]);
+              await rdb.executeSql('DELETE FROM conversations WHERE id = ?', [oldId]);
+            }
+          }
+          for (let i = 0; i < processedChats.length; i++) {
+            const chat = processedChats[i];
+            const convMetaJson = this.buildConversationMetaJson(chat);
+            const metaSig = this.conversationMetaSignature(chat, convMetaJson);
+            nextMetaSig.set(chat.id, metaSig);
+            if (this.savedConvMetaSig.get(chat.id) !== metaSig) {
+              await rdb.executeSql(
+                'INSERT OR REPLACE INTO conversations (id, title, updated, pinned, persona_id, meta_json) VALUES (?, ?, ?, ?, ?, ?)',
+                [chat.id, chat.title, chat.updated, chat.pinned ? 1 : 0, chat.personaId, convMetaJson]
+              );
+            }
+            const payloads: string[] = [];
+            for (let j = 0; j < chat.messages.length; j++) {
+              payloads.push(JSON.stringify(chat.messages[j]));
+            }
+            const msgsSig = payloads.join('\u0001');
+            nextMsgsSig.set(chat.id, msgsSig);
+            if (this.savedConvMsgsSig.get(chat.id) !== msgsSig) {
+              await rdb.executeSql('DELETE FROM messages WHERE conversation_id = ?', [chat.id]);
+              for (let j = 0; j < chat.messages.length; j++) {
+                const msg = chat.messages[j];
+                await rdb.executeSql(
+                  'INSERT OR REPLACE INTO messages (id, conversation_id, seq, role, text, model, payload_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                  [msg.id, chat.id, j, msg.role, msg.text, msg.model, payloads[j], msg.createdAt || chat.updated]
+                );
+              }
+            }
           }
         }
         rdb.commit();
+        this.savedConvMetaSig = nextMetaSig;
+        this.savedConvMsgsSig = nextMsgsSig;
+        this.hasSyncedChats = true;
       } catch (e) {
         try { rdb.rollBack(); } catch (_) {}
+        this.hasSyncedChats = false;
+        this.savedConvMetaSig.clear();
+        this.savedConvMsgsSig.clear();
         throw e as Error;
       }
     });

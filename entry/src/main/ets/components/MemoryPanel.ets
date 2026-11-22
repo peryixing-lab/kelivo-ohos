@@ -777,6 +777,28 @@ export struct MemoryPanel {
     return tr.steps || [];
   }
 
+  private traceStatusLabel(tr: MemoryTrace): string {
+    if (tr.error) return '✕ 失败';
+    if (tr.gatekeeperPassed) return '✓ 门控通过';
+    return '○ 门控跳过';
+  }
+
+  private traceStepStatusLabel(st: MemoryTraceStep): string {
+    if (st.status === 'failed' || st.error) return '失败';
+    if (st.status === 'skipped') return '跳过';
+    return '成功';
+  }
+
+  private traceStepResponseText(st: MemoryTraceStep): string {
+    if (st.response && st.response.trim().length > 0) {
+      return st.response.slice(0, 600);
+    }
+    if (st.status === 'failed' || st.error) {
+      return st.error ? `错误：${st.error}` : '(模型返回空响应)';
+    }
+    return '';
+  }
+
   private subPageTitle(): string {
     if (this.subPage === 'list') return '记忆列表';
     if (this.subPage === 'profile') return '用户画像';
@@ -877,7 +899,7 @@ export struct MemoryPanel {
               .fontSize(15)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.ink'))
-            Text('支持时允许记忆模型在整理阶段使用推理')
+            Text('关闭可显著加快整理速度；开启时提取/去重按低强度推理（门控始终免思考）')
               .fontSize(12)
               .fontColor($r('app.color.muted'))
           }
@@ -1830,10 +1852,18 @@ export struct MemoryPanel {
         ForEach(this.memoryTraces, (tr: MemoryTrace) => {
           Column({ space: 6 }) {
             Row({ space: 6 }) {
-              Text(tr.gatekeeperPassed ? '✓ 门控通过' : '○ 门控跳过')
+              Text(this.traceStatusLabel(tr))
                 .fontSize(12)
                 .fontWeight(FontWeight.Medium)
-                .fontColor(tr.gatekeeperPassed ? $r('app.color.accent') : $r('app.color.muted'))
+                .fontColor(tr.error ? $r('app.color.warning') : (tr.gatekeeperPassed ? $r('app.color.accent') : $r('app.color.muted')))
+              if (tr.trigger) {
+                Text(tr.trigger === 'manual' ? '手动' : '自动')
+                  .fontSize(10)
+                  .fontColor($r('app.color.muted'))
+                  .backgroundColor($r('app.color.canvas'))
+                  .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                  .borderRadius(6)
+              }
               Text(`新增 ${tr.extractedCount} · 合并 ${tr.mergedCount}${tr.conflictCount ? ' · 冲突 ' + tr.conflictCount : ''}${tr.skippedCount ? ' · 跳过 ' + tr.skippedCount : ''}`)
                 .fontSize(11)
                 .fontColor($r('app.color.muted'))
@@ -1851,7 +1881,7 @@ export struct MemoryPanel {
             }
             Text(tr.summary)
               .fontSize(13)
-              .fontColor($r('app.color.ink'))
+              .fontColor(tr.error ? $r('app.color.warning') : $r('app.color.ink'))
 
             if (this.traceStepsFor(tr).length > 0) {
               Button(this.expandedTraceId === tr.id ? '收起阶段详情' : `查看 ${this.traceStepsFor(tr).length} 个阶段详情`)
@@ -1869,11 +1899,14 @@ export struct MemoryPanel {
             if (this.expandedTraceId === tr.id && this.traceStepsFor(tr).length > 0) {
               ForEach(this.traceStepsFor(tr), (st: MemoryTraceStep, si: number) => {
                 Column({ space: 4 }) {
-                  Row() {
+                  Row({ space: 6 }) {
                     Text(st.stage)
                       .fontSize(12)
                       .fontWeight(FontWeight.Medium)
                       .fontColor($r('app.color.accent'))
+                    Text(this.traceStepStatusLabel(st))
+                      .fontSize(10)
+                      .fontColor((st.status === 'failed' || st.error) ? $r('app.color.warning') : $r('app.color.muted'))
                     Blank()
                     if (st.durationMs !== undefined) {
                       Text(`${st.durationMs}ms`)
@@ -1885,10 +1918,10 @@ export struct MemoryPanel {
                   Text(st.summary)
                     .fontSize(12)
                     .fontColor($r('app.color.ink'))
-                  if (st.response) {
-                    Text(st.response.slice(0, 600))
+                  if (this.traceStepResponseText(st).length > 0) {
+                    Text(this.traceStepResponseText(st))
                       .fontSize(11)
-                      .fontColor($r('app.color.muted'))
+                      .fontColor((st.status === 'failed' || st.error) ? $r('app.color.warning') : $r('app.color.muted'))
                       .copyOption(CopyOptions.LocalDevice)
                   }
                 }

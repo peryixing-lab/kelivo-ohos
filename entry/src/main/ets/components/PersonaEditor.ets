@@ -16,6 +16,7 @@ import {
   MemorySettings,
   MemorySmartAddMode,
   MemorySourceKind,
+  MemoryTrace,
   MemoryWriteScope,
   ModelSpec,
   Persona,
@@ -62,6 +63,8 @@ export struct PersonaEditor {
   @Prop localWorkspaces: LocalWorkspace[] = [];
   @Prop memories: MemoryEntry[] = [];
   @Prop memorySettings: MemorySettings = { autoExtract: false, injectGlobal: true, maxInjectCount: 100 };
+  @Prop organizingMemoryAssistantId: string = '';
+  @Prop memoryTraces: MemoryTrace[] = [];
 
   onSavePersona: (persona: Persona, setActive: boolean) => Promise<void> = async () => {};
   onDeletePersona: (id: string) => Promise<void> = async () => {};
@@ -252,6 +255,37 @@ export struct PersonaEditor {
       return v as ReasoningEffort;
     }
     return undefined;
+  }
+
+  private isOrganizingSelectedAssistant(): boolean {
+    return this.organizingMemoryAssistantId.length > 0 && this.organizingMemoryAssistantId === this.selectedId;
+  }
+
+  private latestAssistantOrganizeStatus(): string {
+    if (this.isOrganizingSelectedAssistant()) {
+      return '正在整理记忆…';
+    }
+    let latest: MemoryTrace | undefined = undefined;
+    for (let i = 0; i < this.memoryTraces.length; i++) {
+      const tr = this.memoryTraces[i];
+      if (tr.assistantId === this.selectedId) {
+        latest = tr;
+        break;
+      }
+    }
+    if (!latest) return '';
+    const diffMs = Math.max(0, Date.now() - (latest.ts || 0));
+    const mins = Math.floor(diffMs / 60000);
+    const when = mins < 1
+      ? '刚刚'
+      : (mins < 60 ? `${mins} 分钟前` : (mins < 1440 ? `${Math.floor(mins / 60)} 小时前` : `${Math.floor(mins / 1440)} 天前`));
+    if (latest.error && latest.error.length > 0) {
+      return `上次整理：${when} · 失败`;
+    }
+    if (!latest.gatekeeperPassed || (latest.extractedCount === 0 && latest.mergedCount === 0)) {
+      return `上次整理：${when} · 无新增记忆`;
+    }
+    return `上次整理：${when} · ${latest.summary || `新增 ${latest.extractedCount} 条`}`;
   }
 
   private parseTags(): string[] {
@@ -1268,11 +1302,16 @@ export struct PersonaEditor {
             Text(`共 ${this.visibleAssistantMemoryCount()} 条有效记忆`)
               .fontSize(11)
               .fontColor($r('app.color.muted'))
+            if (this.latestAssistantOrganizeStatus().length > 0) {
+              Text(this.latestAssistantOrganizeStatus())
+                .fontSize(11)
+                .fontColor($r('app.color.muted'))
+            }
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
 
-          Button('整理记忆')
+          Button(this.isOrganizingSelectedAssistant() ? '整理中…' : '整理记忆')
             .type(ButtonType.Normal)
             .height(30)
             .fontSize(12)
@@ -1280,6 +1319,8 @@ export struct PersonaEditor {
             .borderRadius(10)
             .fontColor($r('app.color.accent'))
             .backgroundColor($r('app.color.tint'))
+            .enabled(!this.isOrganizingSelectedAssistant())
+            .opacity(this.isOrganizingSelectedAssistant() ? 0.55 : 1)
             .onClick(() => { this.onOrganizeMemory(this.selectedId); })
 
           Button('+ 添加')

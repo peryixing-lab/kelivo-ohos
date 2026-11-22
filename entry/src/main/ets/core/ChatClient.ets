@@ -5,6 +5,7 @@ import {
   ModelSpec,
   Provider,
   ProxyConfig,
+  ReasoningEffort,
   RequestLogEntry,
   checkEndpoint,
   defaultModelSpec,
@@ -245,17 +246,22 @@ export class ChatStream {
       const startTs = Date.now();
       let capturedStatus = 0;
       let respPreview = '';
+      let reasoningPreview = '';
       try {
         await this.runOnce(call, (frag: RichFragment) => {
           if (frag.text || frag.reasoning || frag.toolCalls.length || frag.generatedImages.length) {
             emittedAny = true;
             if (respPreview.length < 2000 && frag.text) respPreview += frag.text;
+            if (reasoningPreview.length < 1800 && frag.reasoning) reasoningPreview += frag.reasoning;
           }
           onFragment(frag);
         }, (status: number) => {
           capturedStatus = status;
         }, options);
 
+        const loggedResp = respPreview.length > 0
+          ? respPreview.slice(0, 2000)
+          : (reasoningPreview.length > 0 ? '[thinking_only] ' + reasoningPreview.slice(0, 1800) : '');
         options?.onLog?.({
           id: util.generateRandomUUID(true),
           ts: startTs,
@@ -265,14 +271,16 @@ export class ChatStream {
           status: capturedStatus || 200,
           durationMs: Date.now() - startTs,
           reqPreview: call.body.slice(0, 2000),
-          respPreview: respPreview.slice(0, 2000),
+          respPreview: loggedResp,
           error: ''
         });
         return;
       } catch (err) {
         const errObj = err as Error;
         const status = err instanceof HttpStatusError ? err.status : capturedStatus;
-        const errBody = err instanceof HttpStatusError && err.rawBody ? err.rawBody : respPreview;
+        const errBody = err instanceof HttpStatusError && err.rawBody
+          ? err.rawBody
+          : (respPreview.length > 0 ? respPreview : (reasoningPreview.length > 0 ? '[thinking_only] ' + reasoningPreview : ''));
         options?.onLog?.({
           id: util.generateRandomUUID(true),
           ts: startTs,
@@ -414,14 +422,18 @@ export async function completeOnce(
   systemPrompt: string,
   userPrompt: string,
   modelId?: string,
-  maxTokens: number = 1024,
+  maxTokens?: number,
   proxyPassword?: string,
   conversationId?: string,
-  enableThinking: boolean = false,
+  thinking: boolean | ReasoningEffort = false,
   onLog?: (log: RequestLogEntry) => void
 ): Promise<string> {
   const chosenModel = (modelId || provider.model).trim();
   const spec = findProviderModelSpec(provider, chosenModel);
+  const cappedTokens = maxTokens !== undefined && maxTokens > 0 ? maxTokens : undefined;
+  const resolvedEffort: ReasoningEffort = !spec.reasoning
+    ? 'off'
+    : (typeof thinking === 'string' ? thinking : (thinking ? 'low' : 'off'));
   const call = makeAdvancedChatCall(
     provider,
     key,
@@ -432,9 +444,9 @@ export async function completeOnce(
       modelSpec: spec,
       conversationId,
       params: {
-        temperature: spec.reasoning ? undefined : 0.3,
-        maxTokens,
-        reasoningEffort: enableThinking && spec.reasoning ? 'medium' : 'off'
+        temperature: (cappedTokens === undefined || spec.reasoning) ? undefined : 0.3,
+        maxTokens: cappedTokens,
+        reasoningEffort: resolvedEffort
       }
     }
   );
