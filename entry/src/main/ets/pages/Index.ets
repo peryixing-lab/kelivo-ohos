@@ -321,9 +321,13 @@ struct Index {
       nextSide = 'right';
     }
     if (nextSide !== this.chatScrollNavSide) {
-      SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
+      if (this.chatScrollNavVisible) {
+        SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
+          this.chatScrollNavSide = nextSide;
+        });
+      } else {
         this.chatScrollNavSide = nextSide;
-      });
+      }
     }
   };
 
@@ -4417,40 +4421,47 @@ struct Index {
   chatScrollNavButton(symbolRes: Resource, rotate180: boolean, a11yText: string, onTap: () => void) {
     Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
       SymbolGlyph(symbolRes)
-        .fontSize(17)
-        .fontColor([$r('app.color.ink')])
+        .fontSize(13)
+        .fontColor([$r('app.color.muted')])
         .rotate({ angle: rotate180 ? 180 : 0 })
     }
-    .width(38)
-    .height(38)
+    .width(30)
+    .height(30)
     .padding(0)
     .accessibilityText(a11yText)
-    .backgroundColor(hexWithAlpha(this.themeTokens().surface, this.effectiveDark() ? 'E0' : 'E8'))
-    .border({ width: 0.8, color: $r('app.color.line') })
+    .backgroundColor(hexWithAlpha(this.themeTokens().surface, this.effectiveDark() ? '98' : 'A8'))
+    .backgroundBlurStyle(BlurStyle.Thin)
+    .border({ width: 0.5, color: $r('app.color.line') })
     .shadow({
-      radius: 10,
-      color: this.effectiveDark() ? '#40000000' : '#18000000',
+      radius: 6,
+      color: this.effectiveDark() ? '#24000000' : '#0C000000',
       offsetX: 0,
-      offsetY: 2
+      offsetY: 1
     })
+    .opacity(0.82)
     .onClick(() => { onTap(); })
   }
 
   @Builder
-  chatScrollNavButtons() {
-    Column({ space: 8 }) {
-      this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), false, '跳转到顶部对话', () => { this.jumpChatTop(); })
-      this.chatScrollNavButton($r('sys.symbol.chevron_up'), false, '跳转到上一条对话', () => { this.jumpChatPrev(); })
-      this.chatScrollNavButton($r('sys.symbol.chevron_down'), false, '跳转到下一条对话', () => { this.jumpChatNext(); })
-      this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), true, '跳转到最新对话', () => { this.jumpChatBottom(); })
+  chatScrollNavButtons(side: 'left' | 'right') {
+    Row() {
+      Column({ space: 6 }) {
+        this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), false, '跳转到顶部对话', () => { this.jumpChatTop(); })
+        this.chatScrollNavButton($r('sys.symbol.chevron_up'), false, '跳转到上一条对话', () => { this.jumpChatPrev(); })
+        this.chatScrollNavButton($r('sys.symbol.chevron_down'), false, '跳转到下一条对话', () => { this.jumpChatNext(); })
+        this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), true, '跳转到最新对话', () => { this.jumpChatBottom(); })
+      }
+      .margin({
+        left: side === 'left' ? ((this.wide ? 0 : this.winLeftInset) + 10) : 0,
+        right: side === 'right' ? ((this.sidePanelMode !== '' && this.wideSide ? 0 : this.winRightInset) + 10) : 0,
+        bottom: this.composerBarHeightVp + 4
+      })
     }
-    .margin({
-      left: this.chatScrollNavSide === 'left' ? ((this.wide ? 0 : this.winLeftInset) + 12) : 0,
-      right: this.chatScrollNavSide === 'right' ? ((this.sidePanelMode !== '' && this.wideSide ? 0 : this.winRightInset) + 12) : 0,
-      bottom: this.composerBarHeightVp + 4
-    })
+    .width('100%')
+    .justifyContent(side === 'left' ? FlexAlign.Start : FlexAlign.End)
+    .hitTestBehavior(HitTestMode.None)
     .transition(
-      this.chatScrollNavSide === 'left'
+      side === 'left'
         ? SystemMotion.startSlideTransition(this.reduceMotion)
         : SystemMotion.endSlideTransition(this.reduceMotion)
     )
@@ -4459,7 +4470,7 @@ struct Index {
   @Builder
   chatPane() {
     Stack({
-      alignContent: this.chatScrollNavSide === 'left' ? Alignment.BottomStart : Alignment.BottomEnd
+      alignContent: Alignment.Bottom
     }) {
       WithTheme({ theme: ImmersiveMaterialStyle.pageTheme(this.chatBgColor()) }) {
         Tabs({ barPosition: BarPosition.End }) {
@@ -4762,7 +4773,11 @@ struct Index {
       }
 
       if (this.chatScrollNavVisible && (this.activeChat()?.messages.length || 0) > 0 && !this.isIncognitoEmpty() && !this.showProviderHintBanner()) {
-        this.chatScrollNavButtons()
+        if (this.chatScrollNavSide === 'left') {
+          this.chatScrollNavButtons('left')
+        } else {
+          this.chatScrollNavButtons('right')
+        }
       }
     }
     .backgroundColor(this.chatBgColor())
