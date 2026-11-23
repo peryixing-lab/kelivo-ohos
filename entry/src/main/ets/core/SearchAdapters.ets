@@ -72,7 +72,7 @@ export function buildSearchRequestSpec(
     return {
       url: 'https://html.duckduckgo.com/html/?q=' + qEnc,
       method: 'GET',
-      headers: { 'User-Agent': 'Mozilla/5.0 (HarmonyOS; LexiKelivo)' },
+      headers: { 'User-Agent': 'Mozilla/5.0 (HarmonyOS; kelivo)' },
       body: '',
       parserKind: 'duckduckgo_html'
     };
@@ -81,7 +81,7 @@ export function buildSearchRequestSpec(
     return {
       url: 'https://www.bing.com/search?q=' + qEnc + '&count=' + maxR,
       method: 'GET',
-      headers: { 'User-Agent': 'Mozilla/5.0 (HarmonyOS; LexiKelivo)' },
+      headers: { 'User-Agent': 'Mozilla/5.0 (HarmonyOS; kelivo)' },
       body: '',
       parserKind: 'bing_html'
     };

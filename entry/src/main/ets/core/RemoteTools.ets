@@ -277,7 +277,7 @@ export class RemoteTools {
     const init: InitializeParams = {
       protocolVersion: '2025-06-18',
       capabilities: {},
-      clientInfo: { name: 'LexiKelivo', version: '1.0.0' }
+      clientInfo: { name: 'kelivo', version: '1.0.0' }
     };
     const reply = await this.post('initialize', init);
     if (!reply.protocolVersion) {

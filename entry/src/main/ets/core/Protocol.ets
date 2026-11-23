@@ -129,7 +129,11 @@ interface ReplyEvent {
   error?: RemoteError;
 }
 
-export interface Fragment { text: string; reasoning: string }
+export interface Fragment {
+  text: string;
+  reasoning: string;
+  reasoningPhase?: 'thinking' | 'finished';
+}
 
 export interface ToolDeclaration {
   name: string;
@@ -155,13 +159,34 @@ export interface WireToolTurn {
   toolResult?: string;
 }
 
-export interface RichFragment {
-  text: string;
-  reasoning: string;
+export interface RichFragment extends Fragment {
   toolCalls: ToolCallDelta[];
   usage?: TokenUsage;
   generatedImages: Attachment[];
   done: boolean;
+}
+
+// Some providers mark the reasoning boundary explicitly. Others first reveal it
+// by sending answer text, a tool call or an image.
+export class ReplyReasoningTimer {
+  private startedAt: number = -1;
+  elapsedMs: number = 0;
+
+  get active(): boolean { return this.startedAt >= 0; }
+
+  update(part: RichFragment, now: number): void {
+    if ((part.reasoning || part.reasoningPhase === 'thinking') && !this.active) this.startedAt = now;
+    const answering = part.text.length > 0 && part.reasoningPhase !== 'thinking';
+    if (part.reasoningPhase === 'finished' || part.done || answering || part.toolCalls.length || part.generatedImages.length) {
+      this.finish(now);
+    }
+  }
+
+  finish(now: number): void {
+    if (!this.active) return;
+    this.elapsedMs += Math.max(0, now - this.startedAt);
+    this.startedAt = -1;
+  }
 }
 
 export interface ChatCallOptions {
@@ -199,7 +224,7 @@ export function generateFallbackSessionId(): string {
   return out;
 }
 
-const OPEN_CODE_USER_AGENT = 'LexiKelivo/1.0 (HarmonyOS)';
+const OPEN_CODE_USER_AGENT = 'kelivo/1.0 (HarmonyOS)';
 
 function usesOpenCodeSession(provider: Provider): boolean {
   const host = extractUrlHost(provider.baseUrl).replace(/\.$/, '');
@@ -1024,6 +1049,15 @@ export function parseRichReply(data: string): RichFragment {
     throw new Error(event.error?.message || '模型服务返回错误');
   }
 
+  if ((event.type === 'content_block_start' && event.content_block?.type === 'thinking') ||
+    (event.type === 'response.output_item.added' && event.item?.type === 'reasoning')) {
+    result.reasoningPhase = 'thinking';
+  } else if (event.type === 'content_block_stop' || event.type === 'response.reasoning_summary_text.done' ||
+    event.type === 'response.reasoning_text.done' || (event.type === 'response.output_item.done' && event.item?.type === 'reasoning') ||
+    event.choices?.[0]?.finish_reason || event.candidates?.[0]?.finishReason) {
+    result.reasoningPhase = 'finished';
+  }
+
   // OpenAI Responses API events
   if (event.type === 'response.output_text.delta') {
     if (typeof event.delta === 'string') result.text = event.delta;
@@ -1147,6 +1181,7 @@ export class ThinkTagStreamParser {
   push(chunk: string): Fragment {
     let textOut = '';
     let reasonOut = '';
+    let closedReasoning = false;
     const buf = this.carry + chunk;
     this.carry = '';
     let i = 0;
@@ -1195,6 +1230,7 @@ export class ThinkTagStreamParser {
         if (idx >= 0) {
           reasonOut += buf.slice(i, idx);
           this.inThink = false;
+          closedReasoning = true;
           i = idx + tagLen;
           continue;
         }
@@ -1211,7 +1247,10 @@ export class ThinkTagStreamParser {
         break;
       }
     }
-    return { text: textOut, reasoning: reasonOut };
+    const fragment: Fragment = { text: textOut, reasoning: reasonOut };
+    if (this.inThink) fragment.reasoningPhase = 'thinking';
+    else if (closedReasoning) fragment.reasoningPhase = 'finished';
+    return fragment;
   }
 
   flush(): Fragment {

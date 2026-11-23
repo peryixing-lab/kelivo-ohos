@@ -244,6 +244,7 @@ export class KelivoDatabase {
         sources: msg.sources,
         createdAt: msg.createdAt,
         usage: msg.usage,
+        reasoningDurationMs: msg.reasoningDurationMs,
         toolCalls: msg.toolCalls,
         generatedImages: msg.generatedImages,
         quote: msg.quote,

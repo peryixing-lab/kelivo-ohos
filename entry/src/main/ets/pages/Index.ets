@@ -61,7 +61,7 @@ import {
   normalizeBackupConfig,
   resolveActiveModel
 } from '../core/Models';
-import { ChatCall, ChatCallOptions, RichFragment, makeAdvancedChatCall } from '../core/Protocol';
+import { ChatCall, ChatCallOptions, ReplyReasoningTimer, RichFragment, makeAdvancedChatCall } from '../core/Protocol';
 import { ChatStream, completeOnce, generateImages } from '../core/ChatClient';
 import { WorkspaceStore, exportChats, forgetKey, importChats, newId, readKey, storeKey } from '../core/Storage';
 import { ImportedProvider } from '../core/ProviderLink';
@@ -137,6 +137,7 @@ import { DefaultModelPanel } from '../components/DefaultModelPanel';
 import { AboutPanel } from '../components/AboutPanel';
 import { KelivoAvatarBadge, KelivoNavTitleBar } from '../components/KelivoChrome';
 import { BottomToolsSheet } from '../components/BottomToolsSheet';
+import { ChatListSheet } from '../components/ChatListSheet';
 import { ModelSelectSheet } from '../components/ModelSelectSheet';
 import { ChatToolsSheet, ReasoningLevelSheet, SearchQuickSheet } from '../components/ChatQuickSheets';
 import { OAuthLoginSheet } from '../components/OAuthLoginSheet';
@@ -155,6 +156,14 @@ import { computeFloatingBottomInsetVp, hexWithAlpha } from '../core/ImmersiveUti
 import { syncWindowBackgroundColor, syncWindowSystemBars } from '../core/WindowController';
 import { ImmersiveMaterialStyle } from '../core/ImmersiveMaterialStyle';
 import { SystemMotion } from '../core/SystemMotion';
+
+interface ReplyActivityData {
+  messageId: string;
+  reasoning: string;
+  records: ToolCallRecord[];
+  thinking: boolean;
+  durationMs: number;
+}
 
 interface ComposerDraftData {
   text: string;
@@ -201,6 +210,9 @@ struct Index {
   @State picking: boolean = false;
   @State liveText: string = '';
   @State liveReasoning: string = '';
+  @State liveMessageId: string = '';
+  @State liveThinking: boolean = false;
+  @State liveReasoningMs: number = 0;
   @State searchOn: boolean = false;
   @State imageGenMode: boolean = false;
   @State ephemeralMode: boolean = false;
@@ -2140,6 +2152,10 @@ struct Index {
     const sysPrompt = (target.overridePrompt || persona.prompt || '').trim();
     const params = this.effectiveParams();
 
+    this.liveMessageId = targetReplaceMsg?.id || newId();
+    this.liveThinking = false;
+    this.liveReasoningMs = 0;
+    if (this.expandedReasoning === this.liveMessageId) this.expandedReasoning = '';
     this.working = true;
     this.regeneratingMsgId = targetReplaceMsg ? targetReplaceMsg.id : '';
     this.stopped = false;
@@ -2158,7 +2174,33 @@ struct Index {
     let toolCallsUsed: ToolCallRecord[] = [];
     const finalUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, durationMs: 0 };
     let hasUsage = false;
+    const reasoningTimer = new ReplyReasoningTimer();
+    const syncReasoningPhase = (): void => {
+      this.liveReasoningMs = reasoningTimer.elapsedMs;
+      if (this.liveThinking === reasoningTimer.active) return;
+      this.liveThinking = reasoningTimer.active;
+      if (this.liveThinking) this.expandedReasoning = this.liveMessageId;
+      else if (this.expandedReasoning === this.liveMessageId) this.expandedReasoning = '';
+    };
+    const observeFragment = (part: RichFragment): void => {
+      reasoningTimer.update(part, Date.now());
+      syncReasoningPhase();
+    };
+    const endReasoning = (): void => {
+      reasoningTimer.finish(Date.now());
+      syncReasoningPhase();
+    };
     let timer = -1;
+    const scheduleLiveUpdate = (): void => {
+      if (timer >= 0) return;
+      timer = setTimeout(() => {
+        timer = -1;
+        this.liveText = answer;
+        this.liveReasoning = thoughts;
+        this.liveToolCalls = toolCallsUsed.slice();
+        this.scrollDown();
+      }, 80);
+    };
     let completed = false;
     const startTs = Date.now();
     let authKeyId = '';
@@ -2339,7 +2381,10 @@ struct Index {
             proxyPassword: auth.proxyPass,
             runStream: async (call: ChatCall, onFrag: (f: RichFragment) => void) => {
               this.stream = new ChatStream();
-              await this.stream.runRich(call, onFrag, {
+              await this.stream.runRich(call, (part: RichFragment) => {
+                observeFragment(part);
+                onFrag(part);
+              }, {
                 providerName: p.name,
                 modelId,
                 proxy: p.proxy,
@@ -2348,19 +2393,15 @@ struct Index {
                 retryBaseMs: params.retryBaseMs ?? 800,
                 onLog: (entry: RequestLogEntry) => { this.store?.addRequestLog(entry).catch(() => {}); }
               });
+              endReasoning();
             },
             executeTool: (tool: RegisteredTool, argsJson: string) => this.executeRegisteredTool(tool, argsJson, target, persona),
             requestApproval: (tool: RegisteredTool, argsJson: string) => this.requestToolApproval(tool, argsJson),
             onUpdate: (lText: string, lReason: string, recs: ToolCallRecord[]) => {
-              if (timer < 0) {
-                timer = setTimeout(() => {
-                  timer = -1;
-                  this.liveText = lText;
-                  this.liveReasoning = lReason;
-                  this.liveToolCalls = recs.slice();
-                  this.scrollDown();
-                }, 80);
-              }
+              answer = lText;
+              thoughts = lReason;
+              toolCallsUsed = recs;
+              scheduleLiveUpdate();
             },
             onContextLog: (payloadJson: string) => {
               if (target.ephemeral) return;
@@ -2412,6 +2453,7 @@ struct Index {
           this.scrollDown();
           this.stream = new ChatStream();
           await this.stream.runRich(call, (part: RichFragment) => {
+            observeFragment(part);
             answer += part.text;
             thoughts += part.reasoning;
             if (part.generatedImages.length) genImages.push(...part.generatedImages);
@@ -2422,12 +2464,7 @@ struct Index {
               finalUsage.totalTokens = part.usage.totalTokens;
               hasUsage = true;
             }
-            if (timer < 0) timer = setTimeout(() => {
-              timer = -1;
-              this.liveText = answer;
-              this.liveReasoning = thoughts;
-              this.scrollDown();
-            }, 80);
+            scheduleLiveUpdate();
           }, {
             providerName: p.name,
             modelId,
@@ -2460,6 +2497,7 @@ struct Index {
       }
     } finally {
       if (timer >= 0) clearTimeout(timer);
+      endReasoning();
       applyKeepScreenOn(this.host(), false).catch(() => {});
       const durationMs = Date.now() - startTs;
       finalUsage.durationMs = durationMs;
@@ -2475,6 +2513,7 @@ struct Index {
             id: newId(),
             text: answer,
             reasoning: thoughts,
+            reasoningDurationMs: reasoningTimer.elapsedMs || undefined,
             model: modelId,
             createdAt: Date.now(),
             usage: recordedUsage,
@@ -2483,11 +2522,12 @@ struct Index {
           });
         } else {
           nextMsg = {
-            id: newId(),
+            id: this.liveMessageId,
             role: 'assistant',
             text: answer,
             model: modelId,
             reasoning: thoughts,
+            reasoningDurationMs: reasoningTimer.elapsedMs || undefined,
             createdAt: Date.now(),
             usage: recordedUsage,
             toolCalls: toolCallsUsed.length ? toolCallsUsed : undefined,
@@ -3098,13 +3138,10 @@ struct Index {
   @Builder
   liveStreamBody() {
     Column({ space: 8 }) {
-      if (this.liveReasoning) {
-        Text(this.liveReasoning).fontSize(12).lineHeight(18).fontColor($r('app.color.muted'))
-          .padding(8).borderRadius(8).backgroundColor($r('app.color.panel'))
-      }
-      if (this.liveToolCalls.length) {
-        this.toolCallsView(this.liveToolCalls, 'live')
-      }
+      this.replyActivityCard({
+        messageId: this.liveMessageId, reasoning: this.liveReasoning, records: this.liveToolCalls,
+        thinking: this.liveThinking, durationMs: this.liveReasoningMs
+      })
       if (this.liveText) {
         MessageBody({
           source: this.liveText,
@@ -3117,7 +3154,8 @@ struct Index {
           onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
           onAskDraft: (draftStr: string) => { this.draft = draftStr; }
         })
-      } else if (!this.liveReasoning && !this.liveToolCalls.length) {
+      } else if (!(this.liveReasoning && this.chatDisplayCfg().showThinkingCards) &&
+        !(this.liveToolCalls.length && this.chatDisplayCfg().showToolCards)) {
         if (this.fetchingSources) {
           Text('正在检索网页…').fontSize(13).fontColor($r('app.color.accent'))
         } else {
@@ -3492,42 +3530,139 @@ struct Index {
     .transition(SystemMotion.drawerScrimTransition(this.reduceMotion))
   }
 
+  private toolRowLabel(name: string): string {
+    switch (name) {
+      case 'memory_update': return '更新记忆';
+      case 'memory_read': return '读取记忆';
+      case 'memory_search_profile': return '查找记忆';
+      case 'memory_edit': return '编辑记忆';
+      case 'memory_delete': return '归档记忆';
+      case 'update_user_profile': return '更新用户画像';
+      case 'web_search': return '搜索网页';
+      case 'web_fetch': return '读取网页';
+      default: return name;
+    }
+  }
+
   @Builder
-  toolCallsView(records: ToolCallRecord[], keyPrefix: string) {
+  toolApprovalControls() {
     Column({ space: 6 }) {
-      ForEach(records, (tc: ToolCallRecord, ti: number) => {
-        Column({ space: 4 }) {
-          Row({ space: 6 }) {
-            Text(tc.status === 'done' ? '✓' : tc.status === 'error' || tc.status === 'denied' ? '✕' : '⏳')
-              .fontSize(12).fontWeight(FontWeight.Bold)
-              .fontColor(tc.status === 'done' ? $r('app.color.accent') : $r('app.color.warning'))
-            Text('工具 · ' + tc.name).fontSize(12).fontWeight(FontWeight.Medium).fontColor($r('app.color.ink')).layoutWeight(1)
-            if (tc.durationMs > 0) {
-              Text(tc.durationMs + 'ms').fontSize(11).fontColor($r('app.color.muted'))
-            }
-            Button(this.expandedToolId === (keyPrefix + tc.id) ? '收起' : '详情')
-              .height(24).fontSize(11).backgroundColor($r('app.color.surface')).fontColor($r('app.color.accent'))
-              .onClick(() => {
-                const k = keyPrefix + tc.id;
-                this.expandedToolId = this.expandedToolId === k ? '' : k;
-              })
-          }.width('100%')
-          if (this.expandedToolId === (keyPrefix + tc.id)) {
-            Text('参数: ' + tc.argsJson).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
-              .copyOption(CopyOptions.LocalDevice)
-            if (tc.diffText) {
-              Text(tc.diffText).fontFamily('monospace').fontSize(11).fontColor($r('app.color.ink'))
-                .padding(6).borderRadius(6).backgroundColor($r('app.color.surface')).copyOption(CopyOptions.LocalDevice)
-            }
-            if (tc.resultText) {
-              Text(tc.resultText.slice(0, 2000)).fontSize(12).fontColor($r('app.color.ink'))
-                .copyOption(CopyOptions.LocalDevice)
-            }
+      Text('工具执行授权请求：' + this.pendingApprovalTool)
+        .fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.ink'))
+      Text(this.pendingApprovalArgs).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
+        .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis })
+      Row({ space: 6 }) {
+        Button('允许一次').height(28).fontSize(12).backgroundColor($r('app.color.accent')).fontColor($r('app.color.on_accent'))
+          .onClick(() => this.resolveToolApproval('allow_once'))
+        Button('本对话全部允许').height(28).fontSize(12).backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
+          .onClick(() => this.resolveToolApproval('allow_all'))
+        Button('拒绝').height(28).fontSize(12).backgroundColor($r('app.color.panel')).fontColor($r('app.color.warning'))
+          .onClick(() => this.resolveToolApproval('deny'))
+      }
+    }.width('100%').padding(10).alignItems(HorizontalAlign.Start)
+  }
+
+  @Builder
+  toolCallRow(tc: ToolCallRecord, rowId: string, isLive: boolean) {
+    Column({ space: 4 }) {
+      Button({ type: ButtonType.Normal }) {
+        Row({ space: 8 }) {
+          Text('•••').fontSize(11).fontColor($r('app.color.muted'))
+          Text(this.toolRowLabel(tc.name)).fontSize(13).fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.muted')).layoutWeight(1).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (tc.status !== 'done') {
+            Text(tc.status === 'pending' ? '待授权' : tc.status === 'running' ? '执行中' : tc.status === 'denied' ? '已拒绝' : '失败')
+              .fontSize(11).fontColor(tc.status === 'error' || tc.status === 'denied' ? $r('app.color.warning') : $r('app.color.accent'))
           }
-        }.width('100%').padding(8).borderRadius(10).backgroundColor($r('app.color.panel'))
-          .alignItems(HorizontalAlign.Start)
-      }, (tc: ToolCallRecord, ti: number) => keyPrefix + '-' + ti + '-' + tc.id + '-' + tc.status)
-    }.width('100%')
+          SymbolGlyph(this.expandedToolId === rowId ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
+            .fontSize(12).fontColor([$r('app.color.muted')])
+        }.width('100%')
+      }
+      .width('100%').height(36).padding({ left: 12, right: 12 }).backgroundColor(Color.Transparent)
+      .onClick(() => { this.expandedToolId = this.expandedToolId === rowId ? '' : rowId; })
+
+      if (this.expandedToolId === rowId) {
+        Column({ space: 4 }) {
+          Text(tc.name + (tc.durationMs > 0 ? ' · ' + tc.durationMs + ' ms' : ''))
+            .fontSize(11).fontColor($r('app.color.muted'))
+          Text('参数：' + tc.argsJson).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
+            .copyOption(CopyOptions.LocalDevice)
+          if (tc.diffText) {
+            Text(tc.diffText).fontFamily('monospace').fontSize(11).fontColor($r('app.color.ink'))
+              .padding(6).borderRadius(6).backgroundColor($r('app.color.surface')).copyOption(CopyOptions.LocalDevice)
+          }
+          if (tc.resultText) {
+            Text(tc.resultText.slice(0, 2000)).fontSize(12).fontColor($r('app.color.ink')).copyOption(CopyOptions.LocalDevice)
+          }
+        }.width('100%').alignItems(HorizontalAlign.Start).padding({ left: 12, right: 12, bottom: 8 })
+      }
+      if (isLive && tc.status === 'pending' && this.pendingApprovalTool === tc.name) {
+        this.toolApprovalControls()
+      }
+    }.width('100%').alignItems(HorizontalAlign.Start)
+  }
+
+  private toggleReasoning(messageId: string): void {
+    const nextId = this.expandedReasoning === messageId ? '' : messageId;
+    if (this.reduceMotion) {
+      this.expandedReasoning = nextId;
+      return;
+    }
+    SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
+      this.expandedReasoning = nextId;
+    });
+  }
+
+  @Builder
+  replyActivityCard($$: ReplyActivityData) {
+    if (($$.reasoning && this.chatDisplayCfg().showThinkingCards) || ($$.records.length && this.chatDisplayCfg().showToolCards)) {
+      Column() {
+        if ($$.reasoning && this.chatDisplayCfg().showThinkingCards) {
+          Button({ type: ButtonType.Normal }) {
+            Row({ space: 8 }) {
+              SymbolGlyph($r('sys.symbol.lightbulb')).fontSize(15).fontColor([$r('app.color.accent')])
+              Text($$.thinking ? '正在思考' : '深度思考').fontSize(13).fontWeight(FontWeight.Medium).fontColor($r('app.color.ink'))
+              if (!$$.thinking && $$.durationMs > 0) {
+                Text('(' + ($$.durationMs / 1000).toFixed(1) + 's)').fontSize(12).fontColor($r('app.color.muted'))
+              }
+              Blank().layoutWeight(1)
+              SymbolGlyph($r('sys.symbol.chevron_down'))
+                .fontSize(12).fontColor([$r('app.color.muted')])
+                .rotate({ angle: this.expandedReasoning === $$.messageId ? 180 : 0 })
+            }.width('100%')
+          }
+          .width('100%').height(36).padding({ left: 12, right: 12 }).backgroundColor(Color.Transparent)
+          .accessibilityText(this.expandedReasoning === $$.messageId ? '收起思考过程' : '展开思考过程')
+          .onClick(() => this.toggleReasoning($$.messageId))
+
+          if (this.expandedReasoning === $$.messageId) {
+            Column() {
+              if (!$$.thinking && this.appearanceCfg().enableReasoningMarkdown !== false) {
+                MessageBody({
+                  source: $$.reasoning, bodyFontSize: 13, codeFontSize: Math.max(11, this.codeTextSize() - 1),
+                  enableMarkdown: true, enableMathLatex: this.appearanceCfg().enableMathLatex !== false,
+                  onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
+                  onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
+                  onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
+                  onAskDraft: (draftStr: string) => { this.draft = draftStr; }
+                })
+              } else {
+                Text($$.reasoning).fontSize(13).lineHeight(20).fontColor($r('app.color.muted'))
+                  .copyOption(CopyOptions.LocalDevice).width('100%')
+              }
+            }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
+              .transition(SystemMotion.reasoningRevealTransition(this.reduceMotion))
+          }
+        }
+        if (this.chatDisplayCfg().showToolCards) {
+          ForEach($$.records, (tc: ToolCallRecord, index: number) => {
+            this.toolCallRow(tc, $$.messageId + '/' + index + '/' + tc.id, $$.messageId === this.liveMessageId && this.working)
+          }, (tc: ToolCallRecord, index: number) => $$.messageId + '/' + index + '/' + tc.id + '/' + tc.status)
+        }
+      }.width('100%').padding({ top: 2, bottom: 2 }).borderRadius(16)
+        .clip(true)
+        .backgroundColor(hexWithAlpha(this.themeTokens().tint, this.effectiveDark() ? '80' : '60'))
+    }
   }
 
   @Builder
@@ -3586,59 +3721,10 @@ struct Index {
         if (this.isRegeneratingMessage(msg)) {
           this.liveStreamBody()
         } else {
-          if (msg.reasoning && this.chatDisplayCfg().showThinkingCards) {
-            Button({ type: ButtonType.Normal }) {
-              Row({ space: 6 }) {
-                SymbolGlyph($r('sys.symbol.lightbulb'))
-                  .fontSize(13)
-                  .fontColor([$r('app.color.accent')])
-                Text(this.expandedReasoning === msg.id ? '深度思考过程（点击收起）' : '深度思考过程（点击展开）')
-                  .fontSize(12)
-                  .fontColor($r('app.color.muted'))
-                SymbolGlyph(this.expandedReasoning === msg.id ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
-                  .fontSize(13)
-                  .fontColor([$r('app.color.muted')])
-              }
-            }
-            .height(30)
-            .padding({ left: 10, right: 10 })
-            .borderRadius(15)
-            .backgroundColor($r('app.color.panel'))
-            .onClick(() => { this.expandedReasoning = this.expandedReasoning === msg.id ? '' : msg.id; })
-
-            if (this.expandedReasoning === msg.id) {
-              Column() {
-                if (this.appearanceCfg().enableReasoningMarkdown !== false) {
-                  MessageBody({
-                    source: msg.reasoning,
-                    bodyFontSize: 13,
-                    codeFontSize: Math.max(11, this.codeTextSize() - 1),
-                    enableMarkdown: true,
-                    enableMathLatex: this.appearanceCfg().enableMathLatex !== false,
-                    onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
-                    onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
-                    onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
-                    onAskDraft: (draftStr: string) => { this.draft = draftStr; }
-                  })
-                } else {
-                  Text(msg.reasoning)
-                    .fontSize(13)
-                    .lineHeight(20)
-                    .fontColor($r('app.color.muted'))
-                    .copyOption(CopyOptions.LocalDevice)
-                    .width('100%')
-                }
-              }
-              .padding(10)
-              .borderRadius(12)
-              .backgroundColor($r('app.color.panel'))
-              .width('100%')
-            }
-          }
-
-          if (msg.toolCalls?.length && this.chatDisplayCfg().showToolCards) {
-            this.toolCallsView(msg.toolCalls, msg.id)
-          }
+          this.replyActivityCard({
+            messageId: msg.id, reasoning: msg.reasoning || '', records: msg.toolCalls || [],
+            thinking: false, durationMs: msg.reasoningDurationMs || 0
+          })
 
           ForEach(this.assistantParagraphsFor(msg), (para: string, pi: number) => {
             Column() {
@@ -4348,23 +4434,8 @@ struct Index {
           .alignItems(HorizontalAlign.Start).margin({ bottom: 6 })
       }
 
-      if (this.pendingApprovalTool) {
-        Column({ space: 6 }) {
-          Text('工具执行授权请求：' + this.pendingApprovalTool)
-            .fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.ink'))
-          Text(this.pendingApprovalArgs).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
-            .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis })
-          Row({ space: 6 }) {
-            Button('允许一次').height(28).fontSize(12).backgroundColor($r('app.color.accent')).fontColor($r('app.color.on_accent'))
-              .onClick(() => this.resolveToolApproval('allow_once'))
-            Button('本对话全部允许').height(28).fontSize(12).backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-              .onClick(() => this.resolveToolApproval('allow_all'))
-            Button('拒绝').height(28).fontSize(12).backgroundColor($r('app.color.panel')).fontColor($r('app.color.warning'))
-              .onClick(() => this.resolveToolApproval('deny'))
-          }
-        }.width('94%').constraintSize({ maxWidth: 800 }).padding(10).borderRadius(12)
-          .backgroundColor($r('app.color.surface')).border({ width: 1, color: $r('app.color.accent') })
-          .alignItems(HorizontalAlign.Start).margin({ bottom: 6 })
+      if (this.pendingApprovalTool && !this.chatDisplayCfg().showToolCards) {
+        this.toolApprovalControls()
       }
 
       if (this.notice) { Text(this.notice).width('100%').padding({ left: 18, right: 18, bottom: 6 }).fontSize(13).fontColor($r('app.color.warning')) }
@@ -4404,7 +4475,7 @@ struct Index {
       left: this.wide ? 0 : this.winLeftInset,
       right: this.sidePanelMode !== '' && this.wideSide ? 0 : this.winRightInset,
       top: 10,
-      bottom: this.winKeyboardHeight > 0 ? 8 : Math.max(12, this.effectiveBottomInset() + 8)
+      bottom: this.winKeyboardHeight > 0 ? 8 : Math.max(8, this.effectiveBottomInset() + 2)
     })
     .linearGradient(this.immersiveLightOn()
       ? {
@@ -4788,28 +4859,27 @@ struct Index {
 
   @Builder
   modelQuickOverlay() {
-    Column() {
-      ModelSelectSheet({
-        providers: this.workspace.providers,
-        currentProviderId: this.provider().id,
-        currentModelId: this.activeModelId(),
-        favoriteModels: this.workspace.favoriteModels || [],
-        immersiveLightEnabled: this.immersiveLightOn(),
-        onSelectModel: (providerId: string, modelId: string) => {
-          this.selectModelQuick(providerId, modelId);
-        },
-        onToggleFavorite: (providerId: string, modelId: string) => {
-          this.toggleFavoriteModel(providerId, modelId);
-        },
-        onOpenProviders: () => {
-          this.showModelQuickSheet = false;
-          this.providerOpenProxy = false;
-          this.navigateTo('providers');
-        }
-      })
-    }
-    .width('100%')
-    .backgroundColor(Color.Transparent)
+    ModelSelectSheet({
+      palette: this.themeTokens(),
+      isDark: this.effectiveDark(),
+      onClose: () => { this.showModelQuickSheet = false; },
+      providers: this.workspace.providers,
+      currentProviderId: this.provider().id,
+      currentModelId: this.activeModelId(),
+      favoriteModels: this.workspace.favoriteModels || [],
+      immersiveLightEnabled: this.immersiveLightOn(),
+      onSelectModel: (providerId: string, modelId: string) => {
+        this.selectModelQuick(providerId, modelId);
+      },
+      onToggleFavorite: (providerId: string, modelId: string) => {
+        this.toggleFavoriteModel(providerId, modelId);
+      },
+      onOpenProviders: () => {
+        this.showModelQuickSheet = false;
+        this.providerOpenProxy = false;
+        this.navigateTo('providers');
+      }
+    })
   }
 
   @Builder
@@ -5023,100 +5093,106 @@ struct Index {
   }
 
   @Builder
-  miniMapOverlay() {
-    Column({ space: 10 }) {
-      Row({ space: 8 }) {
-        SymbolGlyph($r('sys.symbol.map'))
-          .fontSize(17)
-          .fontColor([$r('app.color.accent')])
-        Text('共 ' + (this.activeChat()?.messages.length || 0) + ' 条消息 · 点击跳转')
-          .fontSize(13)
-          .fontColor($r('app.color.muted'))
-          .layoutWeight(1)
-        if ((this.activeChat()?.messages.length || 0) > 1) {
-          Button('顶部')
-            .type(ButtonType.Normal)
-            .height(26)
-            .fontSize(11)
-            .padding({ left: 10, right: 10 })
-            .borderRadius(13)
-            .backgroundColor($r('app.color.tint'))
-            .fontColor($r('app.color.accent'))
-            .onClick(() => {
-              this.showMiniMap = false;
-              this.jumpChatTop();
-            })
-          Button('最新')
-            .type(ButtonType.Normal)
-            .height(26)
-            .fontSize(11)
-            .padding({ left: 10, right: 10 })
-            .borderRadius(13)
-            .backgroundColor($r('app.color.tint'))
-            .fontColor($r('app.color.accent'))
-            .onClick(() => {
-              this.showMiniMap = false;
-              this.jumpChatBottom();
-            })
-        }
-      }
-      .width('100%')
-      .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-      .borderRadius(14)
-      .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
-
-      if ((this.activeChat()?.messages.length || 0) === 0) {
-        Column({ space: 6 }) {
-          Text('当前对话暂无消息')
-            .fontSize(14)
-            .fontColor($r('app.color.muted'))
-        }
-        .width('100%')
-        .padding({ top: 24, bottom: 24 })
-        .alignItems(HorizontalAlign.Center)
-        .borderRadius(14)
-        .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
-      } else {
-        Scroll() {
-          Column({ space: 6 }) {
-            ForEach(this.activeChat()?.messages || [], (m: ChatMessage, idx: number) => {
-              Row({ space: 10 }) {
-                Text('#' + (idx + 1) + (m.role === 'user' ? ' 问' : ' 答'))
-                  .fontSize(12)
-                  .fontWeight(FontWeight.Bold)
-                  .fontColor(m.role === 'user' ? $r('app.color.accent') : $r('app.color.muted'))
-                  .width(54)
-                Text(m.text.replace(/\s+/g, ' ').slice(0, 80) || '[空/附件]')
-                  .fontSize(13)
-                  .fontColor($r('app.color.ink'))
-                  .maxLines(2)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .layoutWeight(1)
-              }
-              .width('100%')
-              .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-              .borderRadius(12)
-              .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
-              .onClick(() => {
-                this.showMiniMap = false;
-                const total = this.activeChat()?.messages.length || 0;
-                this.followBottom = idx >= total - 1;
-                this.chatNavTargetIdx = idx;
-                this.scrollView.scrollToIndex(idx, !this.reduceMotion, ScrollAlign.START);
-              })
-            }, (m: ChatMessage, idx: number) => 'mm-' + idx + '-' + m.id)
-          }
-          .width('100%')
-          .padding({ top: 2, bottom: 4 })
-        }
-        .constraintSize({ maxHeight: 380 })
-        .width('100%')
-        .edgeEffect(EdgeEffect.Spring)
+  miniMapControls() {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.map'))
+        .fontSize(17)
+        .fontColor([$r('app.color.accent')])
+      Text('共 ' + (this.activeChat()?.messages.length || 0) + ' 条消息 · 点击跳转')
+        .fontSize(13)
+        .fontColor($r('app.color.muted'))
+        .layoutWeight(1)
+      if ((this.activeChat()?.messages.length || 0) > 1) {
+        Button('顶部')
+          .type(ButtonType.Normal)
+          .height(26)
+          .fontSize(11)
+          .padding({ left: 10, right: 10 })
+          .borderRadius(13)
+          .backgroundColor($r('app.color.tint'))
+          .fontColor($r('app.color.accent'))
+          .onClick(() => {
+            this.showMiniMap = false;
+            this.jumpChatTop();
+          })
+        Button('最新')
+          .type(ButtonType.Normal)
+          .height(26)
+          .fontSize(11)
+          .padding({ left: 10, right: 10 })
+          .borderRadius(13)
+          .backgroundColor($r('app.color.tint'))
+          .fontColor($r('app.color.accent'))
+          .onClick(() => {
+            this.showMiniMap = false;
+            this.jumpChatBottom();
+          })
       }
     }
     .width('100%')
-    .padding({ left: 16, right: 16, top: 4, bottom: 20 })
-    .backgroundColor(Color.Transparent)
+    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+    .borderRadius(14)
+    .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
+  }
+
+  @Builder
+  miniMapItems() {
+    if ((this.activeChat()?.messages.length || 0) === 0) {
+      Column({ space: 6 }) {
+        Text('当前对话暂无消息')
+          .fontSize(14)
+          .fontColor($r('app.color.muted'))
+      }
+      .width('100%')
+      .padding({ top: 24, bottom: 24 })
+      .alignItems(HorizontalAlign.Center)
+      .borderRadius(14)
+      .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
+    } else {
+      Column({ space: 6 }) {
+        ForEach(this.activeChat()?.messages || [], (m: ChatMessage, idx: number) => {
+          Row({ space: 10 }) {
+            Text('#' + (idx + 1) + (m.role === 'user' ? ' 问' : ' 答'))
+              .fontSize(12)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(m.role === 'user' ? $r('app.color.accent') : $r('app.color.muted'))
+              .width(54)
+            Text(m.text.replace(/\s+/g, ' ').slice(0, 80) || '[空/附件]')
+              .fontSize(13)
+              .fontColor($r('app.color.ink'))
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          }
+          .width('100%')
+          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+          .borderRadius(12)
+          .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
+          .onClick(() => {
+            this.showMiniMap = false;
+            const total = this.activeChat()?.messages.length || 0;
+            this.followBottom = idx >= total - 1;
+            this.chatNavTargetIdx = idx;
+            this.scrollView.scrollToIndex(idx, !this.reduceMotion, ScrollAlign.START);
+          })
+        }, (m: ChatMessage, idx: number) => 'mm-' + idx + '-' + m.id)
+      }
+      .width('100%')
+      .padding({ top: 2, bottom: 4 })
+    }
+  }
+
+  @Builder
+  miniMapOverlay() {
+    ChatListSheet({
+      heading: '对话大纲',
+      palette: this.themeTokens(),
+      isDark: this.effectiveDark(),
+      immersiveLightEnabled: this.immersiveLightOn(),
+      onClose: () => { this.showMiniMap = false; },
+      controls: () => { this.miniMapControls(); },
+      items: () => { this.miniMapItems(); }
+    })
   }
 
   @Builder
@@ -6245,12 +6321,10 @@ struct Index {
         .bindSheet(
           $$this.showModelQuickSheet,
           this.modelQuickOverlay(),
-          ImmersiveMaterialStyle.sheetOptions(
+          ImmersiveMaterialStyle.chatListSheetOptions(
             this.immersiveLightOn(),
             this.themeTokens().surface,
-            '选择模型',
-            () => { this.showModelQuickSheet = false; },
-            true
+            () => { this.showModelQuickSheet = false; }
           )
         )
 
@@ -6260,12 +6334,10 @@ struct Index {
         .bindSheet(
           $$this.showMiniMap,
           this.miniMapOverlay(),
-          ImmersiveMaterialStyle.sheetOptions(
+          ImmersiveMaterialStyle.chatListSheetOptions(
             this.immersiveLightOn(),
             this.themeTokens().surface,
-            '对话大纲',
-            () => { this.showMiniMap = false; },
-            true
+            () => { this.showMiniMap = false; }
           )
         )
 

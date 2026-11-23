@@ -1,6 +1,8 @@
 import { BrandIconId, formatContextWindowShort, resolveBrandIconId } from '../core/BrandIcons';
 import { ImmersiveMaterialStyle } from '../core/ImmersiveMaterialStyle';
 import { ModelSpec, Provider, isProviderConfigured, providerEnabledModels } from '../core/Models';
+import { ChatListSheet } from './ChatListSheet';
+import { BUILTIN_PALETTES, PaletteTokens } from '../core/ThemeManager';
 import { KelivoAvatarBadge } from './KelivoChrome';
 
 interface ModelPickerGroup {
@@ -25,6 +27,10 @@ export struct ModelSelectSheet {
   @Prop currentModelId: string = '';
   @Prop favoriteModels: string[] = [];
   @Prop immersiveLightEnabled: boolean = true;
+
+  @Require @Prop palette: PaletteTokens = BUILTIN_PALETTES[0].light;
+  @Prop isDark: boolean = false;
+  onClose: () => void = () => {};
 
   onSelectModel: (providerId: string, modelId: string) => void = () => {};
   onToggleFavorite: (providerId: string, modelId: string) => void = () => {};
@@ -226,151 +232,162 @@ export struct ModelSelectSheet {
     .onClick(() => { this.onSelectModel(item.provider.id, item.spec.id); })
   }
 
-  build() {
-    Column({ space: 10 }) {
-      Row({ space: 8 }) {
-        SymbolGlyph($r('sys.symbol.magnifyingglass'))
-          .fontSize(17)
-          .fontColor([$r('app.color.muted')])
-        TextInput({ text: this.queryText, placeholder: '搜索模型或服务商' })
-          .layoutWeight(1)
-          .height(36)
-          .backgroundColor(Color.Transparent)
-          .padding(0)
-          .fontSize(14)
-          .fontColor(ImmersiveMaterialStyle.isActive(this.immersiveLightEnabled) ? $r('sys.color.font_primary') : $r('app.color.ink'))
-          .placeholderColor(ImmersiveMaterialStyle.isActive(this.immersiveLightEnabled) ? $r('sys.color.font_secondary') : $r('app.color.muted'))
-          .onChange((v: string) => { this.queryText = v; })
-        if (this.queryText.length > 0) {
-          Button({ type: ButtonType.Circle }) {
-            SymbolGlyph($r('sys.symbol.xmark'))
-              .fontSize(13)
-              .fontColor([$r('app.color.muted')])
-          }
-          .width(26)
-          .height(26)
-          .padding(0)
-          .backgroundColor(Color.Transparent)
-          .onClick(() => { this.queryText = ''; })
-        }
-      }
-      .width('100%')
-      .height(42)
-      .padding({ left: 14, right: 10 })
-      .borderRadius(21)
-      .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
-
-      Scroll() {
-        Column({ space: 12 }) {
-          ForEach(this.pickerGroups(), (grp: ModelPickerGroup) => {
-            Column({ space: 4 }) {
-              Text(grp.providerName)
-                .fontSize(12)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.muted'))
-                .padding({ left: 6, bottom: 2 })
-              Column({ space: 2 }) {
-                ForEach(grp.items, (row: ModelPickerRow) => {
-                  this.modelItemRow(row)
-                }, (row: ModelPickerRow) => row.rowKey + (row.favorite ? ':1' : ':0') + (this.currentModelId))
-              }
-              .width('100%')
-              .padding(4)
-              .borderRadius(14)
-              .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
-            }
-            .width('100%')
-            .alignItems(HorizontalAlign.Start)
-          }, (grp: ModelPickerGroup) => grp.groupId + '_' + grp.items.length)
-
-          if (this.pickerGroups().length === 0) {
-            Column({ space: 10 }) {
-              Text(this.queryText.trim().length > 0
-                ? '未找到匹配的模型，请调整关键词或前往“供应商”添加模型。'
-                : '暂无可用模型，请先在供应商中配置 API 密钥并添加模型。')
-                .fontSize(13)
-                .fontColor($r('app.color.muted'))
-                .textAlign(TextAlign.Center)
-              Button('配置供应商')
-                .type(ButtonType.Normal)
-                .height(36)
-                .fontSize(13)
-                .borderRadius(18)
-                .padding({ left: 16, right: 16 })
-                .backgroundColor($r('app.color.tint'))
-                .fontColor($r('app.color.accent'))
-                .onClick(() => { this.onOpenProviders(); })
-            }
-            .width('100%')
-            .padding(24)
-            .alignItems(HorizontalAlign.Center)
-          }
-        }
-        .width('100%')
-        .padding({ bottom: 6 })
-      }
-      .constraintSize({ maxHeight: 380 })
-      .width('100%')
-      .edgeEffect(EdgeEffect.Spring)
-
-      Row({ space: 8 }) {
-        Scroll() {
-          Row({ space: 6 }) {
-            Button('全部')
-              .type(ButtonType.Normal)
-              .height(32)
-              .fontSize(12)
-              .padding({ left: 12, right: 12 })
-              .borderRadius(16)
-              .backgroundColor(this.selectedFilterProviderId === ''
-                ? $r('app.color.accent')
-                : ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
-              .fontColor(this.selectedFilterProviderId === '' ? $r('app.color.on_accent') : $r('app.color.ink'))
-              .onClick(() => { this.selectedFilterProviderId = ''; })
-
-            ForEach(this.enabledProviders(), (p: Provider) => {
-              Row({ space: 5 }) {
-                KelivoAvatarBadge({
-                  brandId: resolveBrandIconId(p.name, p.family),
-                  avatarText: '',
-                  fallbackLetter: p.name,
-                  badgeSize: 18
-                })
-                Text(p.name)
-                  .fontSize(12)
-                  .fontColor(this.selectedFilterProviderId === p.id ? $r('app.color.on_accent') : $r('app.color.ink'))
-                  .maxLines(1)
-              }
-              .height(32)
-              .padding({ left: 8, right: 10 })
-              .borderRadius(16)
-              .backgroundColor(this.selectedFilterProviderId === p.id
-                ? $r('app.color.accent')
-                : ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
-              .onClick(() => {
-                this.selectedFilterProviderId = this.selectedFilterProviderId === p.id ? '' : p.id;
-              })
-            }, (p: Provider) => p.id)
-          }
-          .padding({ right: 8 })
-        }
-        .scrollable(ScrollDirection.Horizontal)
-        .scrollBar(BarState.Off)
+  @Builder
+  private searchField() {
+    Row({ space: 8 }) {
+      SymbolGlyph($r('sys.symbol.magnifyingglass'))
+        .fontSize(17)
+        .fontColor([$r('app.color.muted')])
+      TextInput({ text: this.queryText, placeholder: '搜索模型或服务商' })
         .layoutWeight(1)
-
-        Button('管理')
-          .type(ButtonType.Normal)
-          .height(32)
-          .fontSize(12)
-          .padding({ left: 12, right: 12 })
-          .borderRadius(16)
-          .backgroundColor($r('app.color.tint'))
-          .fontColor($r('app.color.accent'))
-          .onClick(() => { this.onOpenProviders(); })
+        .height(36)
+        .backgroundColor(Color.Transparent)
+        .padding(0)
+        .fontSize(14)
+        .fontColor(ImmersiveMaterialStyle.isActive(this.immersiveLightEnabled) ? $r('sys.color.font_primary') : $r('app.color.ink'))
+        .placeholderColor(ImmersiveMaterialStyle.isActive(this.immersiveLightEnabled) ? $r('sys.color.font_secondary') : $r('app.color.muted'))
+        .onChange((v: string) => { this.queryText = v; })
+      if (this.queryText.length > 0) {
+        Button({ type: ButtonType.Circle }) {
+          SymbolGlyph($r('sys.symbol.xmark'))
+            .fontSize(13)
+            .fontColor([$r('app.color.muted')])
+        }
+        .width(26)
+        .height(26)
+        .padding(0)
+        .backgroundColor(Color.Transparent)
+        .onClick(() => { this.queryText = ''; })
       }
-      .width('100%')
     }
     .width('100%')
-    .padding({ left: 16, right: 16, top: 4, bottom: 20 })
+    .height(42)
+    .padding({ left: 14, right: 10 })
+    .borderRadius(21)
+    .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
+  }
+
+  @Builder
+  private modelGroups() {
+    Column({ space: 12 }) {
+      ForEach(this.pickerGroups(), (grp: ModelPickerGroup) => {
+        Column({ space: 4 }) {
+          Text(grp.providerName)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.muted'))
+            .padding({ left: 6, bottom: 2 })
+          Column({ space: 2 }) {
+            ForEach(grp.items, (row: ModelPickerRow) => {
+              this.modelItemRow(row)
+            }, (row: ModelPickerRow) => row.rowKey + (row.favorite ? ':1' : ':0') + (this.currentModelId))
+          }
+          .width('100%')
+          .padding(4)
+          .borderRadius(14)
+          .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
+        }
+        .width('100%')
+        .alignItems(HorizontalAlign.Start)
+      }, (grp: ModelPickerGroup) => grp.groupId + '_' + grp.items.length)
+
+      if (this.pickerGroups().length === 0) {
+        Column({ space: 10 }) {
+          Text(this.queryText.trim().length > 0
+            ? '未找到匹配的模型，请调整关键词或前往“供应商”添加模型。'
+            : '暂无可用模型，请先在供应商中配置 API 密钥并添加模型。')
+            .fontSize(13)
+            .fontColor($r('app.color.muted'))
+            .textAlign(TextAlign.Center)
+          Button('配置供应商')
+            .type(ButtonType.Normal)
+            .height(36)
+            .fontSize(13)
+            .borderRadius(18)
+            .padding({ left: 16, right: 16 })
+            .backgroundColor($r('app.color.tint'))
+            .fontColor($r('app.color.accent'))
+            .onClick(() => { this.onOpenProviders(); })
+        }
+        .width('100%')
+        .padding(24)
+        .alignItems(HorizontalAlign.Center)
+      }
+    }
+    .width('100%')
+    .padding({ bottom: 6 })
+  }
+
+  @Builder
+  private providerFilters() {
+    Row({ space: 8 }) {
+      Scroll() {
+        Row({ space: 6 }) {
+          Button('全部')
+            .type(ButtonType.Normal)
+            .height(32)
+            .fontSize(12)
+            .padding({ left: 12, right: 12 })
+            .borderRadius(16)
+            .backgroundColor(this.selectedFilterProviderId === ''
+              ? $r('app.color.accent')
+              : ImmersiveMaterialStyle.composerBackground(this.palette.panel, this.immersiveLightEnabled))
+            .fontColor(this.selectedFilterProviderId === '' ? $r('app.color.on_accent') : $r('app.color.ink'))
+            .onClick(() => { this.selectedFilterProviderId = ''; })
+
+          ForEach(this.enabledProviders(), (p: Provider) => {
+            Row({ space: 5 }) {
+              KelivoAvatarBadge({
+                brandId: resolveBrandIconId(p.name, p.family),
+                avatarText: '',
+                fallbackLetter: p.name,
+                badgeSize: 18
+              })
+              Text(p.name)
+                .fontSize(12)
+                .fontColor(this.selectedFilterProviderId === p.id ? $r('app.color.on_accent') : $r('app.color.ink'))
+                .maxLines(1)
+            }
+            .height(32)
+            .padding({ left: 8, right: 10 })
+            .borderRadius(16)
+            .backgroundColor(this.selectedFilterProviderId === p.id
+              ? $r('app.color.accent')
+              : ImmersiveMaterialStyle.composerBackground(this.palette.panel, this.immersiveLightEnabled))
+            .onClick(() => {
+              this.selectedFilterProviderId = this.selectedFilterProviderId === p.id ? '' : p.id;
+            })
+          }, (p: Provider) => p.id)
+        }
+        .padding({ right: 8 })
+      }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
+      .layoutWeight(1)
+
+      Button('管理')
+        .type(ButtonType.Normal)
+        .height(32)
+        .fontSize(12)
+        .padding({ left: 12, right: 12 })
+        .borderRadius(16)
+        .backgroundColor($r('app.color.tint'))
+        .fontColor($r('app.color.accent'))
+        .onClick(() => { this.onOpenProviders(); })
+    }
+    .width('100%')
+  }
+
+  build() {
+    ChatListSheet({
+      heading: '选择模型',
+      palette: this.palette,
+      isDark: this.isDark,
+      immersiveLightEnabled: this.immersiveLightEnabled,
+      onClose: this.onClose,
+      controls: () => { this.searchField(); },
+      items: () => { this.modelGroups(); },
+      footer: () => { this.providerFilters(); }
+    })
   }
 }

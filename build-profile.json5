@@ -1,11 +1,26 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "/Users/thousandmiles/.ohos/config/default_kelivo_ayh-qndxHhEuVTexFo8gCQ7sMYIPfnE1QgU1hxMdN7k=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BF9F6D28ABACBBD83B31623EBEEC64CE8A8B6C5B6557FAE47550077A433289A329BECE7DED66D98",
+          "profile": "/Users/thousandmiles/.ohos/config/default_kelivo_ayh-qndxHhEuVTexFo8gCQ7sMYIPfnE1QgU1hxMdN7k=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "/Users/thousandmiles/.ohos/config/default_kelivo_ayh-qndxHhEuVTexFo8gCQ7sMYIPfnE1QgU1hxMdN7k=.p12",
+          "storePassword": "0000001BD555B3BB05F0F83F9228579B78874E0E17F9C700BB8575438C3CF60F6B7601EBD9655D67FA780B"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
+        "signingConfig": "default",
         "targetSdkVersion": "26.0.0",
-        "compatibleSdkVersion": "6.1.0(23)",
+        "compatibleSdkVersion": "26.0.0",
         "runtimeOS": "HarmonyOS",
         "buildOption": {
           "strictMode": {

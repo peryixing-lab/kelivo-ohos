@@ -366,6 +366,25 @@ export class ImmersiveMaterialStyle {
     return fallbackOpts;
   }
 
+  static chatListSheetOptions(enabled: boolean, pageHex: string, onDisappear: () => void): SheetOptions {
+    const options: SheetOptions = {
+      height: '65%',
+      detents: ['65%', SheetSize.LARGE],
+      scrollSizeMode: ScrollSizeMode.CONTINUOUS,
+      keyboardAvoidMode: SheetKeyboardAvoidMode.TRANSLATE_AND_RESIZE,
+      dragBar: true,
+      enableFloatingDragBar: true,
+      showClose: false,
+      onDisappear
+    };
+    if (ImmersiveMaterialStyle.isActive(enabled)) {
+      options.systemMaterial = ImmersiveMaterialStyle.ultraThickMaterial();
+    } else {
+      options.backgroundColor = normalizeHexColor(pageHex, '#F6F8FB');
+    }
+    return options;
+  }
+
   static actionSheetOptions(
     enabled: boolean,
     pageHex: string,

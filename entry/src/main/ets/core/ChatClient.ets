@@ -326,9 +326,10 @@ export class ChatStream {
       if (part.text) {
         const split = thinkParser.push(part.text);
         part.text = split.text;
+        part.reasoningPhase = part.reasoningPhase ?? split.reasoningPhase;
         part.reasoning = (part.reasoning || '') + split.reasoning;
       }
-      if (part.text || part.reasoning || part.toolCalls.length || part.generatedImages.length || part.usage || part.done) {
+      if (part.text || part.reasoning || part.reasoningPhase || part.toolCalls.length || part.generatedImages.length || part.usage || part.done) {
         onFragment(part);
       }
     };

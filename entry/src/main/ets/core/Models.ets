@@ -244,6 +244,7 @@ export interface MessageVersion {
   model: string;
   createdAt: number;
   usage?: TokenUsage;
+  reasoningDurationMs?: number;
   toolCalls?: ToolCallRecord[];
   generatedImages?: Attachment[];
   sources?: SearchHit[];
@@ -261,6 +262,7 @@ export interface ChatMessage {
   attachments?: Attachment[];
   createdAt?: number;
   usage?: TokenUsage;
+  reasoningDurationMs?: number;
   toolCalls?: ToolCallRecord[];
   generatedImages?: Attachment[];
   quote?: QuoteRef;

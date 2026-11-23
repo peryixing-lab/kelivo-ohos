@@ -173,6 +173,7 @@ async function hydrateWorkspaceAttachmentsForBackup(
         sources: m.sources,
         createdAt: m.createdAt,
         usage: m.usage,
+        reasoningDurationMs: m.reasoningDurationMs,
         toolCalls: m.toolCalls,
         generatedImages: m.generatedImages,
         quote: m.quote,

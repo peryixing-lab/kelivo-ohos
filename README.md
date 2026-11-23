@@ -39,13 +39,13 @@ Kelivo 是基于 HarmonyOS NEXT（ArkTS、ArkUI 与 Stage 模型）打造的原�
 2. 涉及敏感硬件或隐私的权限（麦克风、日历读写、精确定位、通知）均仅在用户主动开启对应功能或模型调用对应工具触发运行时授权对话框时申请，并可在系统设置中随时撤回。
 
 ### 5. HarmonyOS 沉浸光感与全屏窗口适配
-- **全局光感材质方案 (`ohos.arkui.UIMaterial.state = "enable"`)**：主对话页通过 `WithTheme` + `Navigation` (`BarStyle.STACK` + `ScrollEffectType.GRADUAL_BLUR`) 实现标题栏与对话列表的纵向渐进模糊融合；顶部标题栏圆形按键使用 `ButtonType.Circle` + `ButtonStyleMode.TEXTUAL` + `ImmersiveMaterial` (`ULTRA_THIN` / `colorInvert`)，仅附着在 `Navigation` 标题栏、弹出菜单 (`bindMenu`)、`promptAction.showToast`、`bindSheet`（互斥分支切换系统材质或 API < 26 降级模糊）及 `Toggle`/`Slider` 控件等官方支持作用域，避免越界失效。
+- **全局光感材质方案 (`ohos.arkui.UIMaterial.state = "enable"`)**：主对话页通过 `WithTheme` + `Navigation` (`BarStyle.STACK` + `ScrollEffectType.GRADUAL_BLUR`) 实现标题栏与对话列表的纵向渐进模糊融合；顶部标题栏圆形按键使用 `ButtonType.Circle` + `ButtonStyleMode.TEXTUAL` + `ImmersiveMaterial` (`ULTRA_THIN` / `colorInvert`)，仅附着在 `Navigation` 标题栏、弹出菜单 (`bindMenu`)、`promptAction.showToast`、`bindSheet`（按设备能力切换系统材质或降级模糊）及 `Toggle`/`Slider` 控件等官方支持作用域，避免越界失效。
 - **全屏沉浸窗口与多形态避让 (`WindowController`)**：在 `EntryAbility` 窗口加载后启用 `setWindowLayoutFullScreen(true)`，统一计算系统栏、手势导航条、屏幕挖孔（横竖屏/双挖孔）及悬浮窗/自由多窗右上角标题避让矩形 (`getTitleButtonRect()`，`vp`)，并将 `windowTopInsetVp`、`windowBottomInsetVp`、`windowTitleRightAvoidVp`、`reduceMotionEnabled` 等发布至 `AppStorage`；同步响应系统深浅色切换与减弱动画无障碍设置，并在窗口销毁时还原系统栏属性与注销命名监听。
-- **能力探测与优雅降级**：在 `ImmersiveMaterialStyle` 中先判断 `typeof deviceInfo.apiAvailable === 'function' && deviceInfo.apiAvailable('26.0.0')` 及 `uiMaterial.isImmersiveMaterialSupported()`，同时通过 `hdsMaterial.getSystemMaterialTypes()`（API 23+）探测设备实时支持等级；低于 API 26、设备不支持或用户在 **外观 -> 沉浸光感与空间视觉** 关闭开关时，自动退回到 `BlurStyle.COMPONENT_THICK` / `COMPONENT_ULTRA_THICK` 与标准半透明玻璃层，窗口安全区避让与极性随系统深浅色切换继续生效。
+- **能力探测与优雅降级**：在 `ImmersiveMaterialStyle` 中先判断 `typeof deviceInfo.apiAvailable === 'function' && deviceInfo.apiAvailable('26.0.0')` 及 `uiMaterial.isImmersiveMaterialSupported()`，同时通过 `hdsMaterial.getSystemMaterialTypes()`（API 23+）探测设备实时支持等级；设备不支持或用户在 **外观 -> 沉浸光感与空间视觉** 关闭开关时，自动退回到 `BlurStyle.COMPONENT_THICK` / `COMPONENT_ULTRA_THICK` 与标准半透明玻璃层，窗口安全区避让与极性随系统深浅色切换继续生效。
 
 ## 构建与单元测试
 
-工程使用 HarmonyOS SDK `26.0.0`，`compatibleSdkVersion: 6.1.0(23)`，声明支持 `phone` 与 `tablet`。
+工程的目标 SDK 和最低兼容 SDK 均为 HarmonyOS `26.0.0`（API 26），支持 `phone` 与 `tablet`。
 
 在 macOS 默认 DevEco Studio 安装目录下执行：
 

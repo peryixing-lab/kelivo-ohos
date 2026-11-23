@@ -74,6 +74,16 @@ export class SystemMotion {
       .animation({ curve: curves.responsiveSpringMotion(0.24, 0.92) });
   }
 
+  static reasoningRevealTransition(reduceMotion: boolean): TransitionEffect {
+    if (reduceMotion) return TransitionEffect.IDENTITY;
+    return TransitionEffect.asymmetric(
+      TransitionEffect.OPACITY
+        .combine(TransitionEffect.translate({ y: -6 }))
+        .animation({ duration: 180, curve: Curve.EaseOut }),
+      TransitionEffect.IDENTITY
+    );
+  }
+
   static springAnimate(uiCtx: UIContext | undefined, reduceMotion: boolean, fn: () => void): void {
     if (!uiCtx) {
       fn();

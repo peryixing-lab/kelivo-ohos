@@ -68,6 +68,7 @@ import {
   ChatCall,
   EventReader,
   RichFragment,
+  ReplyReasoningTimer,
   ThinkTagStreamParser,
   makeAdvancedChatCall,
   makeChatCall,
@@ -258,6 +259,43 @@ export default function localUnitTest() {
       expect(outText).assertEqual('前文正式回答');
     });
 
+    it('ReasoningClosesBeforeTheReplyFinishes', 0, () => {
+      const timer = new ReplyReasoningTimer();
+      const thought = parseRichReply('{"choices":[{"delta":{"reasoning_content":"考虑一下"}}]}');
+      timer.update(thought, 100);
+      timer.update(parseRichReply('{"usage":{"completion_tokens":2}}'), 400);
+      expect(timer.active).assertTrue();
+      const tool = parseRichReply('{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"memory_update"}}]}}]}');
+      timer.update(tool, 1900);
+      expect(timer.active).assertFalse();
+      expect(timer.elapsedMs).assertEqual(1800);
+      timer.update(thought, 7000);
+      expect(timer.active).assertTrue();
+      timer.update(parseRichReply('{"choices":[{"delta":{"content":"答案"}}]}'), 7300);
+      expect(timer.active).assertFalse();
+      timer.finish(11000);
+      expect(timer.elapsedMs).assertEqual(2100);
+
+      const boundaries: string[] = [
+        '{"type":"content_block_stop","index":0}',
+        '{"type":"response.output_item.done","item":{"type":"reasoning"}}',
+        '[DONE]'
+      ];
+      for (let i = 0; i < boundaries.length; i++) {
+        timer.update(thought, 12000);
+        timer.update(parseRichReply(boundaries[i]), 12100);
+        expect(timer.active).assertFalse();
+      }
+      const parser = new ThinkTagStreamParser();
+      const start = parser.push('前言<think>推理</thi');
+      timer.update({ text: start.text, reasoning: start.reasoning, reasoningPhase: start.reasoningPhase,
+        done: false, generatedImages: [], toolCalls: [] }, 13000);
+      expect(timer.active).assertTrue();
+      const close = parser.push('nk>');
+      expect(close.text).assertEqual('');
+      expect(close.reasoningPhase).assertEqual('finished');
+    });
+
     it('KeyPoolRotationAndCooldown', 0, () => {
       let pool: ApiKeyEntry[] = [
         { id: 'k1', label: 'A', secretRef: 'r1', priority: 2, usageCount: 5, errorCount: 0, disabledUntil: 0 },
@@ -307,10 +345,12 @@ export default function localUnitTest() {
       expect(restored.length).assertEqual(2);
       expect(restored[1].text).assertEqual('回答一');
 
-      const v2 = appendMessageVersion(msgs[1], { id: 'v2', text: '回答二', reasoning: '', model: 'm1', createdAt: 2 });
+      const v2 = appendMessageVersion(msgs[1], { id: 'v2', text: '回答二', reasoning: '思考', reasoningDurationMs: 1500, model: 'm1', createdAt: 2 });
       expect(v2.text).assertEqual('回答二');
+      expect(v2.reasoningDurationMs).assertEqual(1500);
       const switched = switchMessageVersion(v2, 0);
       expect(switched.text).assertEqual('回答一');
+      expect(switched.reasoningDurationMs === undefined).assertTrue();
       expect(estimateTokens('Hello 世界') > 0).assertTrue();
     });
 
@@ -820,7 +860,7 @@ export default function localUnitTest() {
       expect(call.headers['x-opencode-session']).assertEqual('conv-42');
       expect(Object.keys(call.headers).filter((key: string): boolean =>
         key.toLowerCase() === 'x-opencode-session').length).assertEqual(1);
-      expect(call.headers['User-Agent']).assertContain('LexiKelivo');
+      expect(call.headers['User-Agent']).assertContain('kelivo');
       expect(call.headers['X-Custom']).assertEqual('yes');
       expect(call.body).assertContain('"thinking":{"type":"enabled"}');
       expect(call.body).assertContain('"reasoning_effort":"high"');
@@ -983,12 +1023,16 @@ export default function localUnitTest() {
       const prov = preset('opencode', 'opencode', 'openai', 'https://opencode.ai/zen/go/v1', 'deepseek-v4.1-flash');
       prov.secretRef = 'sec-oc';
       ws.providers = [prov];
+      ws.personas[0].params = { reasoningEffort: 'high', reasoningBudget: 4096 };
+      ws.personas[1].params = { reasoningEffort: 'off' };
       ws.personas[0].memoryEnabled = true;
       ws.personas[0].autoOrganizeMemory = true;
       ws.personas[0].memoryOrganizeEveryNTurns = 3;
       ws.personas[0].memoryFullInjectionTypes = ['tone'];
       ws.personas[0].memoryWriteScope = 'alwaysAssistant';
       ws.personas[0].allowPastConversationRecall = true;
+      if (ws.memorySettings) ws.memorySettings.legacyMemories = ['请用中文'];
+      ws.searchServices![2].endpoint = 'https://search.example.com';
       ws.memories = [{
         id: 'mem1', category: 'tone', content: '用中文', assistantId: 'default', archived: false,
         createdAt: 1700000001000, updatedAt: 1700000002000
@@ -1009,8 +1053,35 @@ export default function localUnitTest() {
       const settingsJson = buildAndroidSettingsJson(ws, defaultBackupScope(), secrets);
       const chatsJson = buildAndroidChatsJson(ws.conversations);
 
+      const settings = JSON.parse(settingsJson) as Record<string, Object>;
+      const assistants = JSON.parse(settings['assistants_v1'] as string) as Record<string, Object | null>[];
+      const highReasoning = assistants[0]['reasoning'] as Record<string, Object>;
+      expect(highReasoning['level']).assertEqual('high');
+      expect(highReasoning['budgetTokens']).assertEqual(4096);
+      const offReasoning = assistants[1]['reasoning'] as Record<string, Object | null>;
+      expect(offReasoning['level']).assertEqual('off');
+      expect(offReasoning['budgetTokens']).assertEqual(null);
+      expect(assistants[2]['reasoning']).assertEqual(null);
+      const searchServices = JSON.parse(settings['search_services_v1'] as string) as Record<string, Object>[];
+      expect(searchServices[1]['type']).assertEqual('bing_local');
+      expect(searchServices[2]['type']).assertEqual('searxng');
+      expect(searchServices[2]['url']).assertEqual('https://search.example.com');
+      const legacyMemories = JSON.parse(settings['assistant_memories_v1'] as string) as Record<string, Object>[];
+      expect(legacyMemories.length).assertEqual(ws.personas.length);
+      expect(legacyMemories[0]['id']).assertEqual(1);
+      expect(legacyMemories[0]['assistantId']).assertEqual(ws.personas[0].id);
+      expect(legacyMemories[0]['content']).assertEqual('请用中文');
+
       const parsedSettings = parseAndroidSettingsJson(settingsJson);
       expect(parsedSettings.providers?.length).assertEqual(1);
+      expect(parsedSettings.personas?.[0].params?.reasoningEffort).assertEqual('high');
+      expect(parsedSettings.personas?.[0].params?.reasoningBudget).assertEqual(4096);
+      expect(parsedSettings.personas?.[1].params?.reasoningEffort).assertEqual('off');
+      expect(parsedSettings.personas?.[2].params?.reasoningEffort).assertEqual(undefined);
+      expect(parsedSettings.searchServices?.[1].kind).assertEqual('bing');
+      expect(parsedSettings.searchServices?.[2].endpoint).assertEqual('https://search.example.com');
+      expect(parsedSettings.memorySettings?.legacyMemories?.length).assertEqual(1);
+      expect(parsedSettings.memorySettings?.legacyMemories?.[0]).assertEqual('请用中文');
       expect(parsedSettings.personas?.[0].memoryWriteScope).assertEqual('alwaysAssistant');
       expect(parsedSettings.personas?.[0].memoryFullInjectionTypes?.[0]).assertEqual('tone');
       expect(parsedSettings.personas?.[0].memoryOrganizeEveryNTurns).assertEqual(3);
@@ -1299,6 +1370,7 @@ export default function localUnitTest() {
         assistants_v1: JSON.stringify([{
           id: 'a1',
           name: '故事助手',
+          reasoning: 'medium',
           enableMemory: true,
           autoOrganizeMemory: true,
           memoryOrganizeEveryNTurns: 2,
@@ -1329,6 +1401,7 @@ export default function localUnitTest() {
       expect(parsedBackup.personas?.[0].allowConversationSystemPrompt).assertTrue();
       expect(parsedBackup.personas?.[0].appendCurrentTimeToUserMessage).assertTrue();
       expect(parsedBackup.personas?.[0].params?.contextLimit).assertEqual(undefined);
+      expect(parsedBackup.personas?.[0].params?.reasoningEffort).assertEqual('medium');
       expect(parsedBackup.personas?.[0].builtinTools?.includes('ask_user_input')).assertTrue();
       expect(parsedBackup.personas?.[0].builtinTools?.includes('calculate')).assertTrue();
       expect(parsedBackup.userProfile?.[0].key).assertEqual('gender');

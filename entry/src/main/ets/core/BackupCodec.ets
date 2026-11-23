@@ -21,6 +21,7 @@ import {
   Persona,
   Provider,
   QuickPhrase,
+  ReasoningEffort,
   ScheduledTask,
   SearchServiceConfig,
   SkillRecord,
@@ -187,6 +188,17 @@ interface AndroidProviderJson {
   apiKeys?: AndroidApiKeyJson[];
 }
 
+interface AndroidReasoningJson {
+  level: string;
+  budgetTokens?: number | null;
+}
+
+interface AndroidLegacyMemoryJson {
+  id: number;
+  assistantId: string;
+  content: string;
+}
+
 interface AndroidAssistantJson {
   id?: string;
   name?: string;
@@ -201,7 +213,7 @@ interface AndroidAssistantJson {
   limitContextMessages?: boolean;
   streamOutput?: boolean;
   maxTokens?: number | null;
-  reasoning?: string | null;
+  reasoning?: AndroidReasoningJson | string | null;
   systemPrompt?: string;
   prompt?: string;
   allowConversationSystemPrompt?: boolean;
@@ -249,6 +261,7 @@ interface AndroidEnvVarJson {
 interface AndroidSearchJson {
   id?: string;
   kind?: string;
+  type?: string;
   name?: string;
   endpoint?: string;
   url?: string;
@@ -370,6 +383,7 @@ function stripConversationAttachments(chats: Conversation[], keepAttachments: bo
         sources: m.sources,
         createdAt: m.createdAt,
         usage: m.usage,
+        reasoningDurationMs: m.reasoningDurationMs,
         toolCalls: m.toolCalls,
         generatedImages: keepAttachments ? m.generatedImages : undefined,
         quote: m.quote,
@@ -664,7 +678,10 @@ export function buildAndroidSettingsJson(
       item['limitContextMessages'] = (a.params?.contextLimit ?? 0) > 0;
       item['streamOutput'] = a.streamOutput !== false;
       item['maxTokens'] = a.params?.maxTokens ?? null;
-      item['reasoning'] = a.params?.reasoningEffort || null;
+      const reasoning: AndroidReasoningJson | null = a.params?.reasoningEffort
+        ? { level: a.params.reasoningEffort, budgetTokens: a.params.reasoningBudget ?? null }
+        : null;
+      item['reasoning'] = reasoning;
       item['systemPrompt'] = a.prompt || '';
       item['allowConversationSystemPrompt'] = a.allowConversationSystemPrompt === true;
       item['allowConversationPromptInjection'] = a.allowConversationPromptInjection === true;
@@ -725,9 +742,9 @@ export function buildAndroidSettingsJson(
       const key = s.apiKeys.length > 0 && s.apiKeys[0].secretRef ? (secrets[s.apiKeys[0].secretRef] || '') : '';
       const obj: Record<string, Object> = {};
       obj['id'] = s.id;
-      obj['kind'] = s.kind;
+      obj['type'] = s.kind === 'bing' ? 'bing_local' : s.kind === 'fourget' ? '4get' : s.kind;
       obj['name'] = s.name;
-      obj['endpoint'] = s.endpoint;
+      obj['url'] = s.endpoint;
       obj['apiKey'] = key;
       obj['enabled'] = s.enabled;
       obj['maxResults'] = s.maxResults;
@@ -741,8 +758,17 @@ export function buildAndroidSettingsJson(
       out['memory_injection_max_items_v1'] = ws.memorySettings.maxInjectCount;
       out['memory_legacy_mode_v1'] = ws.memorySettings.useLegacyMemory === true;
       out['memory_model_thinking_enabled_v1'] = ws.memorySettings.enableThinking === true;
-      if (Array.isArray(ws.memorySettings.legacyMemories) && ws.memorySettings.legacyMemories.length > 0) {
-        out['assistant_memories_v1'] = JSON.stringify(ws.memorySettings.legacyMemories);
+      if (ws.memorySettings.legacyMemories?.length) {
+        // Harmony shares legacy memories across assistants. Android stores them per assistant.
+        const legacyMemories: AndroidLegacyMemoryJson[] = [];
+        for (const assistant of ws.personas) {
+          for (const content of ws.memorySettings.legacyMemories) {
+            if (content.trim()) {
+              legacyMemories.push({ id: legacyMemories.length + 1, assistantId: assistant.id, content });
+            }
+          }
+        }
+        out['assistant_memories_v1'] = JSON.stringify(legacyMemories);
       }
       const tpl = ws.memorySettings.templates;
       if (tpl) {
@@ -944,6 +970,19 @@ function parseTimestampMs(raw?: string | number): number {
 function parseMemoryTimestamp(raw?: string | number): number {
   if (typeof raw === 'number' && raw >= 100000000000000) return Math.floor(raw / 1000);
   return parseTimestampMs(raw);
+}
+
+function parseAndroidReasoningEffort(level?: string): ReasoningEffort | undefined {
+  switch (level) {
+    case 'off':
+    case 'low':
+    case 'medium':
+    case 'high':
+    case 'max':
+      return level;
+    default:
+      return undefined;
+  }
 }
 
 export function parseAndroidChatsJson(rawJson: string): Conversation[] {
@@ -1161,6 +1200,8 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
     for (let i = 0; i < rawAssts.length; i++) {
       const a = rawAssts[i];
       if (!a || !a.id || !a.name) continue;
+      const reasoningLevel = typeof a.reasoning === 'string' ? a.reasoning : a.reasoning?.level;
+      const reasoningBudget = typeof a.reasoning === 'object' ? a.reasoning?.budgetTokens : undefined;
       personas.push({
         id: a.id,
         name: a.name,
@@ -1197,6 +1238,8 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
           temperature: typeof a.temperature === 'number' ? a.temperature : undefined,
           topP: typeof a.topP === 'number' ? a.topP : undefined,
           maxTokens: typeof a.maxTokens === 'number' ? a.maxTokens : undefined,
+          reasoningEffort: parseAndroidReasoningEffort(reasoningLevel),
+          reasoningBudget: typeof reasoningBudget === 'number' ? reasoningBudget : undefined,
           contextLimit: (a.limitContextMessages !== false && typeof a.contextMessageSize === 'number')
             ? a.contextMessageSize
             : undefined
@@ -1295,9 +1338,10 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
           });
         }
       }
+      const kind = (s.type || s.kind || 'tavily').toLowerCase();
       searchServices.push({
         id: s.id,
-        kind: (s.kind || 'tavily').toLowerCase(),
+        kind: kind === 'bing_local' ? 'bing' : kind === '4get' ? 'fourget' : kind,
         name: s.name || s.id,
         endpoint: s.endpoint || s.url || '',
         apiKeys: keys,
@@ -1360,20 +1404,21 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
   const legacyModeRaw = settings['memory_legacy_mode_v1'];
   const thinkingRaw = settings['memory_model_thinking_enabled_v1'];
   const rawLegacyMems = parseJsonValue<Object[]>(settings['assistant_memories_v1']);
-  const legacyList: string[] = [];
+  const legacyMemories = new Set<string>();
   if (Array.isArray(rawLegacyMems)) {
     for (let i = 0; i < rawLegacyMems.length; i++) {
       const it: Object = rawLegacyMems[i];
       if (typeof it === 'string' && it.trim().length > 0) {
-        legacyList.push(it.trim());
+        legacyMemories.add(it.trim());
       } else if (it && typeof it === 'object') {
         const content = (it as Record<string, Object>)['content'];
         if (typeof content === 'string' && content.trim().length > 0) {
-          legacyList.push(content.trim());
+          legacyMemories.add(content.trim());
         }
       }
     }
   }
+  const legacyList = Array.from(legacyMemories);
   const readStr = (k: string): string | undefined => {
     const v = settings[k];
     return typeof v === 'string' && v.trim().length > 0 ? v : undefined;

@@ -66,7 +66,7 @@ export async function fetchWebPage(url: string, maxChars: number = 8000, offset:
     const response = await req.request(cleanUrl, {
       method: http.RequestMethod.GET,
       header: {
-        'User-Agent': 'Mozilla/5.0 (HarmonyOS; LexiKelivo/1.0)',
+        'User-Agent': 'Mozilla/5.0 (HarmonyOS; kelivo/1.0)',
         'Accept': 'text/html,application/xhtml+xml,text/plain,application/json,*/*'
       },
       expectDataType: http.HttpDataType.STRING,
