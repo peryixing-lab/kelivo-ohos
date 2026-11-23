@@ -192,8 +192,8 @@ export struct SettingsPanel {
         section: '模型与服务',
         title: '网络代理',
         symbolRes: $r('sys.symbol.compass'),
-        route: 'providers_proxy',
-        keywords: 'network proxy http socks5 网络 代理'
+        route: 'networkProxy',
+        keywords: 'network proxy http https socks5 网络 代理'
       },
       {
         id: 'webdav',

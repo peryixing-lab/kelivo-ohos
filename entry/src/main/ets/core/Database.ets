@@ -17,7 +17,11 @@ import {
   defaultSearchServices,
   defaultSystemSettings,
   initialWorkspace,
-  normalizeBackupConfig
+  normalizeBackupConfig,
+  normalizeInstructionCards,
+  normalizeProxyConfig,
+  normalizeQuickPhrases,
+  normalizeWorldBooks
 } from './Models';
 import { saveAttachmentToSandbox } from './AttachmentStore';
 import {
@@ -58,10 +62,13 @@ function hydrateWorkspaceDefaults(ws: Workspace): Workspace {
   ws.userProfile = normalizeUserProfileFields(ws.userProfile);
   if (!ws.memoryTraces) ws.memoryTraces = [];
   ws.memorySettings = normalizeMemorySettings(ws.memorySettings);
-  if (!ws.worldBooks) ws.worldBooks = [];
-  if (!ws.instructionCards || !ws.instructionCards.length) ws.instructionCards = defaultInstructionCards();
+  ws.globalProxy = normalizeProxyConfig(ws.globalProxy, true);
+  ws.worldBooks = normalizeWorldBooks(ws.worldBooks);
+  const normalizedCards = normalizeInstructionCards(ws.instructionCards);
+  ws.instructionCards = normalizedCards.length > 0 ? normalizedCards : defaultInstructionCards();
   if (!ws.activeInstructionIds) ws.activeInstructionIds = [];
-  if (!ws.quickPhrases || !ws.quickPhrases.length) ws.quickPhrases = defaultQuickPhrases();
+  const normalizedPhrases = normalizeQuickPhrases(ws.quickPhrases);
+  ws.quickPhrases = normalizedPhrases.length > 0 ? normalizedPhrases : defaultQuickPhrases();
   if (!ws.skills) ws.skills = [];
   if (!ws.workspaces) ws.workspaces = [];
   if (!ws.envVars) ws.envVars = [];
@@ -381,6 +388,7 @@ export class KelivoDatabase {
       search: ws.search,
       searchServices: ws.searchServices,
       activeSearchId: ws.activeSearchId,
+      globalProxy: ws.globalProxy,
       mcpEndpoint: ws.mcpEndpoint,
       mcpServers: ws.mcpServers,
       davDirectory: ws.davDirectory,

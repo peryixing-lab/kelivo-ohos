@@ -35,12 +35,19 @@ export interface ApiKeyEntry {
   disabledUntil: number;
 }
 
+export type ProxyType = 'http' | 'https' | 'socks5';
+
+export const DEFAULT_PROXY_BYPASS_RULES: string =
+  'localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1';
+
 export interface ProxyConfig {
   enabled: boolean;
+  type?: ProxyType;
   host: string;
   port: number;
   username?: string;
   passwordRef?: string;
+  bypass?: string;
 }
 
 export interface HeaderEntry {
@@ -127,6 +134,8 @@ export interface QuickPhrase {
   title: string;
   content: string;
   scope?: 'global' | 'assistant';
+  isGlobal?: boolean;
+  assistantId?: string;
 }
 
 export interface RegexRule {
@@ -434,6 +443,9 @@ export interface WorldBookEntry {
   depth: number;
   enabled: boolean;
   alwaysActive: boolean;
+  keywords?: string[];
+  injectDepth?: number;
+  constantActive?: boolean;
 }
 
 export interface WorldBook {
@@ -450,6 +462,8 @@ export interface InstructionCard {
   description: string;
   content: string;
   builtin: boolean;
+  group?: string;
+  prompt?: string;
 }
 
 export interface SkillRecord {
@@ -675,6 +689,7 @@ export interface Workspace {
   search?: SearchConfig;
   searchServices?: SearchServiceConfig[];
   activeSearchId?: string;
+  globalProxy?: ProxyConfig;
   mcpEndpoint?: string;
   mcpServers?: McpServerConfig[];
   davDirectory?: string;
@@ -1058,6 +1073,51 @@ export function defaultSystemSettings(): SystemSettings {
   };
 }
 
+export function normalizeProxyType(raw?: string): ProxyType {
+  const lower = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (lower === 'https') return 'https';
+  if (lower === 'socks5') return 'socks5';
+  return 'http';
+}
+
+export function defaultGlobalProxy(): ProxyConfig {
+  return {
+    enabled: false,
+    type: 'http',
+    host: '',
+    port: 8080,
+    username: '',
+    bypass: DEFAULT_PROXY_BYPASS_RULES
+  };
+}
+
+export function normalizeProxyConfig(raw?: ProxyConfig, withDefaultBypass: boolean = false): ProxyConfig {
+  if (!raw) {
+    return defaultGlobalProxy();
+  }
+  const rawPort = typeof raw.port === 'number' && Number.isFinite(raw.port)
+    ? Math.floor(raw.port)
+    : Number(raw.port);
+  const port = Number.isFinite(rawPort) && rawPort > 0 && rawPort <= 65535 ? rawPort : 8080;
+  let bypass: string | undefined = undefined;
+  if (typeof raw.bypass === 'string') {
+    bypass = raw.bypass.trim();
+  } else if (withDefaultBypass) {
+    bypass = DEFAULT_PROXY_BYPASS_RULES;
+  }
+  return {
+    enabled: raw.enabled === true,
+    type: normalizeProxyType(raw.type),
+    host: typeof raw.host === 'string' ? raw.host.trim() : '',
+    port,
+    username: typeof raw.username === 'string' ? raw.username.trim() : '',
+    passwordRef: typeof raw.passwordRef === 'string' && raw.passwordRef.trim().length > 0
+      ? raw.passwordRef.trim()
+      : undefined,
+    bypass
+  };
+}
+
 export function defaultInstructionCards(): InstructionCard[] {
   return [
     {
@@ -1065,23 +1125,69 @@ export function defaultInstructionCards(): InstructionCard[] {
       title: '苏格拉底学习模式',
       description: '不直接给出最终答案，而是分步引导思考并提问检验理解。',
       content: '【学习模式指令】请扮演循循善诱的导师：先判断我当前的理解程度，每次只推进一个关键概念，通过提问引导我自己推导结论，在我主动要求或确实卡住时再揭示完整答案。',
-      builtin: true
+      builtin: true,
+      group: ''
     },
     {
       id: 'concise-mode',
       title: '极简直答',
       description: '省去客套和重复背景，直接给出结论、代码或步骤。',
       content: '【输出约束】请省略寒暄与铺垫，直接给出核心结论、可执行步骤或代码，必要时用项目符号列出关键要点。',
-      builtin: true
+      builtin: true,
+      group: ''
     },
     {
       id: 'critical-review',
       title: '批判性审阅',
       description: '主动挑出逻辑漏洞、边界条件、隐藏风险和替代方案。',
       content: '【审阅要求】不要盲目附和。请重点检查方案中的假设前提、边界异常、性能瓶颈、安全隐患以及更稳健的替代思路。',
-      builtin: true
+      builtin: true,
+      group: ''
     }
   ];
+}
+
+export function normalizeInstructionCard(raw: InstructionCard, fallbackIdx: number = 0): InstructionCard | undefined {
+  if (!raw) {
+    return undefined;
+  }
+  const id = typeof raw.id === 'string' && raw.id.trim().length > 0
+    ? raw.id.trim()
+    : `inst_${fallbackIdx}`;
+  const rawTitle = typeof raw.title === 'string' ? raw.title.trim() : '';
+  const content = typeof raw.content === 'string'
+    ? raw.content
+    : (typeof raw.prompt === 'string' ? raw.prompt : '');
+  const description = typeof raw.description === 'string' ? raw.description : '';
+  const group = typeof raw.group === 'string' ? raw.group.trim() : '';
+  return {
+    id,
+    title: rawTitle.length > 0 ? rawTitle : '学习模式',
+    description,
+    content,
+    builtin: raw.builtin === true,
+    group
+  };
+}
+
+export function normalizeInstructionCards(raw?: InstructionCard[]): InstructionCard[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: InstructionCard[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const normalized = normalizeInstructionCard(raw[i], i);
+    if (!normalized) {
+      continue;
+    }
+    if (seen.has(normalized.id)) {
+      normalized.id = `${normalized.id}_${i}`;
+    }
+    seen.add(normalized.id);
+    out.push(normalized);
+  }
+  return out;
 }
 
 export function defaultQuickPhrases(): QuickPhrase[] {
@@ -1090,6 +1196,117 @@ export function defaultQuickPhrases(): QuickPhrase[] {
     { id: 'qp-summarize', title: '总结要点', content: '请将以上内容提炼为 5 条以内的核心要点：', scope: 'global' },
     { id: 'qp-review', title: '检查问题', content: '请逐项审查上面的内容，指出潜在错误和改进建议：', scope: 'global' }
   ];
+}
+
+export function normalizeQuickPhrases(raw?: QuickPhrase[]): QuickPhrase[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: QuickPhrase[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < raw.length; i++) {
+    const q = raw[i];
+    if (!q) {
+      continue;
+    }
+    const content = typeof q.content === 'string' ? q.content : '';
+    const title = typeof q.title === 'string' && q.title.trim().length > 0
+      ? q.title.trim()
+      : content.trim().slice(0, 20);
+    if (title.length === 0 && content.trim().length === 0) {
+      continue;
+    }
+    let id = typeof q.id === 'string' && q.id.trim().length > 0 ? q.id.trim() : `qp_${i}`;
+    if (seen.has(id)) {
+      id = `${id}_${i}`;
+    }
+    seen.add(id);
+    const scope: 'global' | 'assistant' =
+      (q.scope === 'assistant' || q.isGlobal === false) ? 'assistant' : 'global';
+    out.push({
+      id,
+      title: title.length > 0 ? title : '快捷短语',
+      content,
+      scope,
+      assistantId: typeof q.assistantId === 'string' && q.assistantId.trim().length > 0
+        ? q.assistantId.trim()
+        : undefined
+    });
+  }
+  return out;
+}
+
+function normalizeWorldBookPosition(raw?: string): WorldBookPosition {
+  const val = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (val === 'before_system' || val === 'before_system_prompt') {
+    return 'before_system';
+  }
+  if (val === 'before_last_user' || val === 'bottom_of_chat') {
+    return 'before_last_user';
+  }
+  if (val === 'at_depth') {
+    return 'at_depth';
+  }
+  return 'after_system';
+}
+
+function normalizeWorldBookRole(raw?: string): 'system' | 'user' | 'assistant' {
+  const val = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  if (val === 'user') return 'user';
+  if (val === 'assistant') return 'assistant';
+  return 'system';
+}
+
+export function normalizeWorldBooks(raw?: WorldBook[]): WorldBook[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: WorldBook[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const b = raw[i];
+    if (!b) {
+      continue;
+    }
+    const entries: WorldBookEntry[] = [];
+    const srcEntries = Array.isArray(b.entries) ? b.entries : [];
+    for (let j = 0; j < srcEntries.length; j++) {
+      const e = srcEntries[j];
+      if (!e) {
+        continue;
+      }
+      const keySrc = Array.isArray(e.keys) ? e.keys : (Array.isArray(e.keywords) ? e.keywords : []);
+      const keys: string[] = [];
+      for (let k = 0; k < keySrc.length; k++) {
+        const kw = typeof keySrc[k] === 'string' ? keySrc[k].trim() : String(keySrc[k] ?? '').trim();
+        if (kw.length > 0) {
+          keys.push(kw);
+        }
+      }
+      const rawDepth = typeof e.depth === 'number' && Number.isFinite(e.depth)
+        ? e.depth
+        : (typeof e.injectDepth === 'number' && Number.isFinite(e.injectDepth) ? e.injectDepth : 1);
+      entries.push({
+        id: typeof e.id === 'string' && e.id.trim().length > 0 ? e.id.trim() : `wbe_${i}_${j}`,
+        name: typeof e.name === 'string' ? e.name : `条目 ${j + 1}`,
+        keys,
+        useRegex: e.useRegex === true,
+        content: typeof e.content === 'string' ? e.content : '',
+        position: normalizeWorldBookPosition(e.position ? String(e.position) : undefined),
+        role: normalizeWorldBookRole(e.role ? String(e.role) : undefined),
+        depth: Math.max(0, Math.floor(rawDepth)),
+        enabled: e.enabled !== false,
+        alwaysActive: e.alwaysActive === true || e.constantActive === true
+      });
+    }
+    out.push({
+      id: typeof b.id === 'string' && b.id.trim().length > 0 ? b.id.trim() : `wb_${i}`,
+      name: typeof b.name === 'string' && b.name.trim().length > 0 ? b.name.trim() : `世界书 ${i + 1}`,
+      description: typeof b.description === 'string' ? b.description : '',
+      enabled: b.enabled !== false,
+      entries
+    });
+  }
+  return out;
 }
 
 export function defaultSearchServices(): SearchServiceConfig[] {
@@ -1183,6 +1400,7 @@ export function initialWorkspace(): Workspace {
     conversations: [],
     searchServices: defaultSearchServices(),
     activeSearchId: 'search-duckduckgo',
+    globalProxy: defaultGlobalProxy(),
     mcpServers: [],
     activeProvider: 'openai',
     activeConversation: '',
@@ -1387,10 +1605,12 @@ export function cloneProvider(p: Provider): Provider {
     groupName: p.groupName || '',
     proxy: p.proxy ? {
       enabled: p.proxy.enabled,
+      type: normalizeProxyType(p.proxy.type),
       host: p.proxy.host,
       port: p.proxy.port,
       username: p.proxy.username,
-      passwordRef: p.proxy.passwordRef
+      passwordRef: p.proxy.passwordRef,
+      bypass: p.proxy.bypass
     } : undefined,
     customHeaders: p.customHeaders ? p.customHeaders.slice() : [],
     customBodyJson: p.customBodyJson,

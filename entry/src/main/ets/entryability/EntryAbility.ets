@@ -1,7 +1,8 @@
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
-import { publishIncomingShareWant } from '../core/SystemBridge';
+import { backgroundGenerationManager } from '../core/BackgroundGeneration';
+import { publishIncomingOpenChatWant, publishIncomingShareWant } from '../core/SystemBridge';
 import { AppWindowController } from '../core/WindowController';
 
 const DOMAIN = 0x0000;
@@ -11,21 +12,27 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+    backgroundGenerationManager.attachContext(this.context);
+    AppStorage.setOrCreate('appInBackground', false);
     publishIncomingShareWant(want);
+    publishIncomingOpenChatWant(want);
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onNewWant');
     publishIncomingShareWant(want);
+    publishIncomingOpenChatWant(want);
   }
 
   onDestroy(): void {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
+    backgroundGenerationManager.stopAll();
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     // Main window is created, set main page for this ability
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
+    backgroundGenerationManager.attachContext(this.context);
 
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
@@ -63,10 +70,16 @@ export default class EntryAbility extends UIAbility {
   onForeground(): void {
     // Ability has brought to foreground
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onForeground');
+    backgroundGenerationManager.onForeground();
   }
 
   onBackground(): void {
     // Ability has back to background
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onBackground');
+    backgroundGenerationManager.onBackground();
+  }
+
+  onBackPressed(): boolean {
+    return true;
   }
 }

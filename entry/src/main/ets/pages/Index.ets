@@ -25,6 +25,7 @@ import {
   OAuthProviderKind,
   Persona,
   Provider,
+  ProxyConfig,
   QuickPhrase,
   QuoteRef,
   ReasoningEffort,
@@ -49,6 +50,7 @@ import {
   defaultAppearance,
   defaultChatItemDisplay,
   defaultGenerationParams,
+  defaultGlobalProxy,
   defaultInstructionCards,
   defaultQuickPhrases,
   defaultSearchServices,
@@ -59,10 +61,14 @@ import {
   isProviderConfigured,
   normalizeAppearanceConfig,
   normalizeBackupConfig,
+  normalizeInstructionCards,
+  normalizeProxyConfig,
+  normalizeQuickPhrases,
+  normalizeWorldBooks,
   resolveActiveModel
 } from '../core/Models';
 import { ChatCall, ChatCallOptions, ReplyReasoningTimer, RichFragment, makeAdvancedChatCall } from '../core/Protocol';
-import { ChatStream, completeOnce, generateImages } from '../core/ChatClient';
+import { ChatStream, completeOnce, generateImages, setGlobalHttpProxy } from '../core/ChatClient';
 import { WorkspaceStore, exportChats, forgetKey, importChats, newId, readKey, storeKey } from '../core/Storage';
 import { ImportedProvider } from '../core/ProviderLink';
 import {
@@ -143,6 +149,7 @@ import { ChatToolsSheet, ReasoningLevelSheet, SearchQuickSheet } from '../compon
 import { OAuthLoginSheet } from '../components/OAuthLoginSheet';
 import { WorkspacePanel } from '../components/WorkspacePanel';
 import { SkillsPanel } from '../components/SkillsPanel';
+import { NetworkProxyPanel } from '../components/NetworkProxyPanel';
 import { BrowserPanel } from '../components/BrowserPanel';
 import { ScheduledTasksPanel } from '../components/ScheduledTasksPanel';
 import { buildWorkspaceTools, executeWorkspaceTool } from '../core/WorkspaceTools';
@@ -156,6 +163,8 @@ import { computeFloatingBottomInsetVp, hexWithAlpha } from '../core/ImmersiveUti
 import { syncWindowBackgroundColor, syncWindowSystemBars } from '../core/WindowController';
 import { ImmersiveMaterialStyle } from '../core/ImmersiveMaterialStyle';
 import { SystemMotion } from '../core/SystemMotion';
+import { backgroundGenerationManager, GenerationPhase } from '../core/BackgroundGeneration';
+import { ChatGenerationJob, GenerationSessionRegistry } from '../core/GenerationSession';
 
 interface ReplyActivityData {
   messageId: string;
@@ -206,6 +215,9 @@ struct Index {
   @State attachedList: Attachment[] = [];
   @State quoteDraft?: QuoteRef = undefined;
   @State draftPersona: string = 'default';
+  @State draftOverrideProviderId: string = '';
+  @State draftOverrideModel: string = '';
+  @State modelConfigTick: number = 0;
   @State working: boolean = false;
   @State picking: boolean = false;
   @State liveText: string = '';
@@ -270,6 +282,7 @@ struct Index {
   @State promptTabInit: number = 0;
   @State diagTabInit: number = 0;
   @State providerOpenProxy: boolean = false;
+  @State globalProxyPasswordPlain: string = '';
   @State personaEditTargetId: string = '';
   @State preferencesSubView: string = '';
   @State storageSizeLabel: string = '0 B';
@@ -288,6 +301,9 @@ struct Index {
   @State expandedLongMsgIds: string[] = [];
   @State organizingMemoryChatId: string = '';
   @State organizingMemoryAssistantId: string = '';
+  @State generatingChatIds: string[] = [];
+  @State pendingPromptChatId: string = '';
+  @State pendingPromptLabel: string = '';
   @StorageProp('windowTopInsetVp') winTopInset: number = 0;
   @StorageProp('windowBottomInsetVp') winBottomInset: number = 0;
   @StorageProp('windowKeyboardHeightVp') @Watch('onKeyboardHeightChanged') winKeyboardHeight: number = 0;
@@ -297,17 +313,16 @@ struct Index {
   @StorageProp('windowIsFloating') winIsFloating: boolean = false;
   @StorageProp('reduceMotionEnabled') reduceMotion: boolean = false;
   @StorageProp('systemIsDark') @Watch('onSystemDarkChanged') sysDarkFromAbility: boolean = false;
+  @StorageLink('appInBackground') @Watch('onAppBackgroundChanged') appInBackground: boolean = false;
+  @StorageLink('pendingOpenChatId') @Watch('consumePendingOpenChat') pendingOpenChatId: string = '';
 
   private store?: WorkspaceStore;
-  private stream?: ChatStream;
-  private searcher?: WebSearch;
+  private cachedHostContext?: common.UIAbilityContext;
+  private genRegistry: GenerationSessionRegistry = new GenerationSessionRegistry();
   private mcpManager: McpManager = new McpManager();
   private browserManager: BrowserAgentManager = new BrowserAgentManager();
   private scheduler: ScheduledTaskRunner = new ScheduledTaskRunner();
   private speechInput: SpeechInputController = new SpeechInputController();
-  private approvalResolver?: (choice: 'allow_once' | 'allow_all' | 'deny') => void;
-  private askUserResolver?: (val: string) => void;
-  private stopped: boolean = false;
   private scrollView: Scroller = new Scroller();
   private memoryQueue: MemoryQueueJob[] = [];
   private memoryQueueRunning: boolean = false;
@@ -386,6 +401,11 @@ struct Index {
   onPageShow(): void {
     this.startHoldingHandMonitor();
     this.consumePendingShareText();
+    this.consumePendingOpenChat();
+    this.syncActiveGenerationView();
+    if (this.working && this.activeRoute === 'chat' && this.followBottom) {
+      this.scrollDown();
+    }
   }
   onPageHide(): void {
     this.stopHoldingHandMonitor();
@@ -393,7 +413,8 @@ struct Index {
   aboutToDisappear(): void {
     this.stopHoldingHandMonitor();
     this.hideChatScrollNavImmediate();
-    this.stopReply();
+    this.stopAllGenerations(false);
+    backgroundGenerationManager.stopAll();
     this.scheduler.stop();
     this.speaker.stop();
     this.speechInput.stopSystemDictation().catch(() => {});
@@ -531,6 +552,100 @@ struct Index {
     }
   }
 
+  private consumePendingOpenChat(): void {
+    if (!this.ready) {
+      return;
+    }
+    const targetChatId = this.pendingOpenChatId;
+    if (targetChatId && targetChatId.trim().length > 0) {
+      const cleanId = targetChatId.trim();
+      AppStorage.setOrCreate('pendingOpenChatId', '');
+      if (this.workspace.conversations.some((c: Conversation): boolean => c.id === cleanId)) {
+        this.activate(cleanId);
+      }
+    }
+  }
+
+  private onAppBackgroundChanged(): void {
+    if (this.appInBackground) {
+      applyKeepScreenOn(this.host(), false).catch(() => {});
+      return;
+    }
+    this.refreshKeepScreenOn();
+    this.syncActiveGenerationView();
+    if (this.activeRoute === 'chat' && this.working && this.followBottom) {
+      this.scrollDown();
+    }
+  }
+
+  private isChatGenerating(chatId: string): boolean {
+    return this.genRegistry.isGenerating(chatId);
+  }
+
+  private hasOtherGeneratingChat(): boolean {
+    const activeId = this.workspace.activeConversation;
+    for (let i = 0; i < this.generatingChatIds.length; i++) {
+      if (this.generatingChatIds[i] !== activeId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private syncGeneratingMetadata(): void {
+    this.generatingChatIds = this.genRegistry.activeChatIds();
+    const other = this.genRegistry.findOtherPendingPrompt(this.workspace.activeConversation);
+    this.pendingPromptChatId = other ? other.chatId : '';
+    this.pendingPromptLabel = other ? other.label : '';
+  }
+
+  private syncActiveGenerationView(): void {
+    this.syncGeneratingMetadata();
+    const proj = this.genRegistry.projectForChat(this.workspace.activeConversation);
+    this.working = proj.working;
+    this.liveMessageId = proj.liveMessageId;
+    this.liveText = proj.liveText;
+    this.liveReasoning = proj.liveReasoning;
+    this.liveThinking = proj.liveThinking;
+    this.liveReasoningMs = proj.liveReasoningMs;
+    this.liveToolCalls = proj.liveToolCalls;
+    this.fetchingSources = proj.fetchingSources;
+    this.regeneratingMsgId = proj.regeneratingMsgId;
+    this.pendingApprovalTool = proj.pendingApprovalTool;
+    this.pendingApprovalArgs = proj.pendingApprovalArgs;
+    this.askQuestionText = proj.askQuestionText;
+    this.askQuestionOptions = proj.askQuestionOptions;
+    this.askQuestionPlaceholder = proj.askQuestionPlaceholder;
+    this.askQuestionAnswer = proj.askQuestionAnswer;
+    this.lastSendError = proj.lastSendError;
+    this.lastSendErrorChatId = proj.lastSendErrorChatId;
+  }
+
+  private refreshKeepScreenOn(): void {
+    const shouldKeep = !this.appInBackground && this.genRegistry.hasAny() && this.workspace.systemSettings?.keepScreenOn !== false;
+    applyKeepScreenOn(this.host(), shouldKeep).catch(() => {});
+  }
+
+  private activeLiveJob(): ChatGenerationJob | undefined {
+    return this.genRegistry.get(this.workspace.activeConversation);
+  }
+
+  private activeLiveBrandId(): BrandIconId {
+    const job = this.activeLiveJob();
+    if (job) {
+      return resolveBrandIconId(`${job.modelId} ${job.providerName}`, job.providerFamily);
+    }
+    return this.activeBrandId();
+  }
+
+  private activeLiveModelLabel(): string {
+    const job = this.activeLiveJob();
+    if (job) {
+      return job.modelId || job.providerName;
+    }
+    return this.activeModelId() || this.provider().name;
+  }
+
   private syncImmersiveStorage(): void {
     const tokens = this.themeTokens();
     AppStorage.setOrCreate('immersiveLightEnabled', this.immersiveLightOn());
@@ -544,6 +659,12 @@ struct Index {
   private syncActiveRouteFromStack(): void {
     const names = this.navPathStack.getAllPathName();
     this.activeRoute = names.length > 0 ? names[names.length - 1] : 'chat';
+    if (this.activeRoute === 'chat') {
+      this.syncActiveGenerationView();
+      if (this.working && this.followBottom) {
+        this.scrollDown();
+      }
+    }
   }
 
   private navigateTo(route: string): void {
@@ -640,12 +761,44 @@ struct Index {
     return false;
   }
 
-  host(): common.UIAbilityContext { return this.getUIContext().getHostContext() as common.UIAbilityContext; }
+  host(): common.UIAbilityContext {
+    if (this.cachedHostContext) {
+      return this.cachedHostContext;
+    }
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    if (ctx) {
+      this.cachedHostContext = ctx;
+    }
+    return ctx;
+  }
+
+  private async syncGlobalProxyRuntime(): Promise<void> {
+    const gp = normalizeProxyConfig(this.workspace.globalProxy, true);
+    this.workspace.globalProxy = gp;
+    let pass = '';
+    if (gp.passwordRef) {
+      try {
+        pass = await readKey(gp.passwordRef);
+      } catch (_) {
+        pass = '';
+      }
+    }
+    this.globalProxyPasswordPlain = pass;
+    setGlobalHttpProxy(gp, pass);
+  }
+
+  private promptToolsNavTitle(): string {
+    if (this.promptTabInit === 1) return '指令注入';
+    if (this.promptTabInit === 2) return '快捷短语';
+    return '世界书 · 指令卡 · 快捷短语';
+  }
 
   async loadWorkspace(): Promise<void> {
     this.loadError = '';
     try {
       const ctx = this.host();
+      this.cachedHostContext = ctx;
+      backgroundGenerationManager.attachContext(ctx);
       this.filesDirPath = ctx.filesDir;
       this.dbDirPath = ctx.databaseDir || ctx.filesDir;
       const cfgDark = ctx.config?.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
@@ -655,12 +808,12 @@ struct Index {
       }
       this.store = new WorkspaceStore(ctx);
       this.workspace = await this.store.load();
-      if (!this.workspace.instructionCards || this.workspace.instructionCards.length === 0) {
-        this.workspace.instructionCards = defaultInstructionCards();
-      }
-      if (!this.workspace.quickPhrases || this.workspace.quickPhrases.length === 0) {
-        this.workspace.quickPhrases = defaultQuickPhrases();
-      }
+      this.workspace.globalProxy = normalizeProxyConfig(this.workspace.globalProxy, true);
+      this.workspace.worldBooks = normalizeWorldBooks(this.workspace.worldBooks);
+      const normCards = normalizeInstructionCards(this.workspace.instructionCards);
+      this.workspace.instructionCards = normCards.length > 0 ? normCards : defaultInstructionCards();
+      const normPhrases = normalizeQuickPhrases(this.workspace.quickPhrases);
+      this.workspace.quickPhrases = normPhrases.length > 0 ? normPhrases : defaultQuickPhrases();
       if (!this.workspace.appearance) {
         this.workspace.appearance = defaultAppearance();
       } else {
@@ -713,13 +866,16 @@ struct Index {
       syncWindowSystemBars(this.effectiveDark());
       syncWindowBackgroundColor(this.themeTokens().canvas);
       this.syncImmersiveStorage();
+      await this.syncGlobalProxyRuntime();
       this.refreshStorageSize().catch(() => {});
       const active = this.activeChat();
       if (active?.draftText) this.draft = active.draftText;
       this.draftPersona = active?.personaId || (this.workspace.personas[0]?.id || 'default');
       this.ready = true;
+      this.syncActiveGenerationView();
       this.scrollDown(true);
       this.consumePendingShareText();
+      this.consumePendingOpenChat();
       this.scheduler.start({
         getWorkspace: (): Workspace => this.workspace,
         getContext: (): common.UIAbilityContext | undefined => this.host(),
@@ -805,14 +961,36 @@ struct Index {
     return this.workspace.conversations.find((c: Conversation): boolean => c.id === this.workspace.activeConversation);
   }
 
+  private resolvedChatForModel(): Conversation | undefined {
+    const c = this.activeChat();
+    if (c) {
+      return c;
+    }
+    if (this.workspace.modelDefaults?.perChatModel === true && this.draftOverrideProviderId.length > 0) {
+      return {
+        id: '',
+        title: '',
+        updated: 0,
+        messages: [],
+        personaId: this.selectedPersonaId(),
+        overrideProviderId: this.draftOverrideProviderId,
+        overrideModel: this.draftOverrideModel
+      };
+    }
+    return undefined;
+  }
+
   provider(): Provider {
-    const res = resolveActiveModel(this.workspace, this.activeChat(), this.persona());
-    return res.provider;
+    const tick = this.modelConfigTick;
+    const res = resolveActiveModel(this.workspace, this.resolvedChatForModel(), this.persona());
+    return tick >= 0 ? res.provider : res.provider;
   }
 
   activeModelId(): string {
-    const res = resolveActiveModel(this.workspace, this.activeChat(), this.persona());
-    return res.modelId || res.provider.model;
+    const tick = this.modelConfigTick;
+    const res = resolveActiveModel(this.workspace, this.resolvedChatForModel(), this.persona());
+    const mid = res.modelId || res.provider.model;
+    return tick >= 0 ? mid : mid;
   }
 
   selectedPersonaId(): string {
@@ -827,12 +1005,16 @@ struct Index {
   }
 
   persona(): Persona {
+    const tick = this.modelConfigTick;
     const id = this.selectedPersonaId();
-    return this.workspace.personas.find((p: Persona): boolean => p.id === id) || this.workspace.personas[0];
+    const found = this.workspace.personas.find((p: Persona): boolean => p.id === id) || this.workspace.personas[0];
+    return tick >= 0 ? found : found;
   }
 
   effectiveParams(): GenerationParams {
-    return this.persona().params || this.workspace.generationParams || defaultGenerationParams();
+    const tick = this.modelConfigTick;
+    const params = this.persona().params || this.workspace.generationParams || defaultGenerationParams();
+    return tick >= 0 ? params : params;
   }
 
   chatRows(): Conversation[] {
@@ -882,23 +1064,37 @@ struct Index {
     const prov = this.workspace.providers.find((p: Provider): boolean => p.id === providerId);
     if (prov && modelId) {
       prov.model = modelId;
+      this.workspace.providers = this.workspace.providers.slice();
     }
     const perChat = this.workspace.modelDefaults?.perChatModel === true;
     const c = this.activeChat();
-    if (c && perChat) {
-      c.overrideProviderId = providerId;
-      c.overrideModel = modelId;
+    if (perChat) {
+      if (c) {
+        c.overrideProviderId = providerId;
+        c.overrideModel = modelId;
+        this.workspace.conversations = this.workspace.conversations.slice();
+        this.draftOverrideProviderId = '';
+        this.draftOverrideModel = '';
+      } else {
+        this.draftOverrideProviderId = providerId;
+        this.draftOverrideModel = modelId;
+      }
     } else {
+      this.draftOverrideProviderId = '';
+      this.draftOverrideModel = '';
       if (c) {
         c.overrideProviderId = undefined;
         c.overrideModel = undefined;
+        this.workspace.conversations = this.workspace.conversations.slice();
       }
-      if (!perChat && this.persona()) {
+      if (this.persona()) {
         const curPersona = this.persona();
         curPersona.providerId = providerId;
         curPersona.modelId = modelId;
+        this.workspace.personas = this.workspace.personas.slice();
       }
     }
+    this.modelConfigTick += 1;
     this.showModelQuickSheet = false;
     this.persistAction();
   }
@@ -948,6 +1144,10 @@ struct Index {
   private resetChatContextWindow(): void {
     const c = this.activeChat();
     if (!c) return;
+    if (this.isChatGenerating(c.id)) {
+      this.toast('当前对话正在生成中，请稍候');
+      return;
+    }
     c.contextStartIndex = c.messages.length;
     c.updated = Date.now();
     this.workspace.conversations = this.workspace.conversations.slice();
@@ -1039,6 +1239,9 @@ struct Index {
 
   private selectAssistant(personaId: string, closeDrawer: boolean = true): void {
     this.draftPersona = personaId;
+    this.draftOverrideProviderId = '';
+    this.draftOverrideModel = '';
+    this.modelConfigTick += 1;
     this.drawerGlobalSearch = false;
     this.drawerAssistantsExpanded = false;
     const candidates = this.workspace.conversations
@@ -1058,8 +1261,12 @@ struct Index {
   }
 
   activate(chatId: string, createEphemeral: boolean = false): void {
-    if (this.working || this.picking) return;
+    if (this.picking) return;
     const prevId = this.workspace.activeConversation;
+    const prevJob = this.genRegistry.get(prevId);
+    if (prevJob) {
+      prevJob.askQuestionAnswer = this.askQuestionAnswer;
+    }
     this.drafts.set(prevId, { text: this.draft, attachments: this.attachedList.slice() });
     const prevChat = this.activeChat();
     if (prevChat && !prevChat.ephemeral) {
@@ -1067,6 +1274,9 @@ struct Index {
     }
     const stored = this.drafts.get(chatId);
     this.workspace.activeConversation = chatId;
+    this.draftOverrideProviderId = '';
+    this.draftOverrideModel = '';
+    this.modelConfigTick += 1;
     const nextChat = this.activeChat();
     if (nextChat && this.workspace.personas.some((p: Persona): boolean => p.id === nextChat.personaId)) {
       this.draftPersona = nextChat.personaId;
@@ -1081,9 +1291,8 @@ struct Index {
     this.inChatQuery = '';
     this.multiSelectMode = false;
     this.selectedMsgIds = [];
-    this.lastSendError = '';
-    this.lastSendErrorChatId = '';
     this.notice = '';
+    this.syncActiveGenerationView();
     this.hideChatScrollNavImmediate();
     this.navigateTo('chat');
     this.followBottom = true;
@@ -1102,6 +1311,12 @@ struct Index {
     if (chat.overrideProviderId === undefined) chat.overrideProviderId = prev?.overrideProviderId;
     if (chat.overrideModel === undefined) chat.overrideModel = prev?.overrideModel;
     if (chat.overridePrompt === undefined) chat.overridePrompt = prev?.overridePrompt;
+    if (chat.enabledMcpIds === undefined) chat.enabledMcpIds = prev?.enabledMcpIds;
+    if (chat.enabledSkillIds === undefined) chat.enabledSkillIds = prev?.enabledSkillIds;
+    if (chat.workspaceId === undefined) chat.workspaceId = prev?.workspaceId;
+    if (chat.toolPermissionMode === undefined) chat.toolPermissionMode = prev?.toolPermissionMode;
+    if (chat.draftText === undefined) chat.draftText = prev?.draftText;
+    if (chat.imageGenMode === undefined) chat.imageGenMode = prev?.imageGenMode;
     if (chat.suggestions === undefined) chat.suggestions = prev?.suggestions;
     this.workspace.conversations = [chat, ...this.workspace.conversations.filter((c: Conversation): boolean => c.id !== chat.id)];
   }
@@ -1161,6 +1376,7 @@ struct Index {
     }
     if (oldRef && oldRef !== ref) await forgetKey(oldRef).catch(() => {});
     this.notice = '';
+    this.modelConfigTick += 1;
     return this.workspace.providers.slice();
   }
 
@@ -1207,6 +1423,7 @@ struct Index {
       }
       await this.persist();
       this.notice = '';
+      this.modelConfigTick += 1;
       this.toast(`已导入 ${importedList.length} 个供应商`);
       return this.workspace.providers.slice();
     } catch (e) {
@@ -1225,6 +1442,7 @@ struct Index {
     if (target?.secretRef) await forgetKey(target.secretRef).catch(() => {});
     this.workspace.providers = this.workspace.providers.filter((p: Provider): boolean => p.id !== id);
     if (this.workspace.activeProvider === id) this.workspace.activeProvider = this.workspace.providers[0].id;
+    this.modelConfigTick += 1;
     this.persistAction();
     return this.workspace.providers.slice();
   }
@@ -1239,6 +1457,7 @@ struct Index {
     }
     try {
       await this.persist();
+      this.modelConfigTick += 1;
     } catch (e) {
       this.workspace.personas = previous;
       throw e as Error;
@@ -1253,6 +1472,7 @@ struct Index {
     if (this.draftPersona === id) {
       this.draftPersona = next[0].id;
     }
+    this.modelConfigTick += 1;
     this.persistAction();
   }
 
@@ -1354,7 +1574,9 @@ struct Index {
     if (p.params) {
       p.params.reasoningEffort = effort;
       if (budget !== undefined) p.params.reasoningBudget = budget;
+      this.workspace.personas = this.workspace.personas.slice();
     }
+    this.modelConfigTick += 1;
     this.persistAction();
   }
 
@@ -1472,20 +1694,24 @@ struct Index {
     return out;
   }
 
-  private activeWorkspaceForChat(): LocalWorkspace | undefined {
+  private workspaceForChat(chat: Conversation | undefined, persona: Persona): LocalWorkspace | undefined {
     const list = this.workspace.workspaces || [];
     if (list.length === 0) return undefined;
-    const chatWsId = this.activeChat()?.workspaceId;
+    const chatWsId = chat?.workspaceId;
     if (chatWsId) {
       const hit = list.find((w: LocalWorkspace): boolean => w.id === chatWsId);
       if (hit) return hit;
     }
-    const pWsId = this.persona().workspaceId;
+    const pWsId = persona.workspaceId;
     if (pWsId) {
       const hit = list.find((w: LocalWorkspace): boolean => w.id === pWsId);
       if (hit) return hit;
     }
     return list[0];
+  }
+
+  private activeWorkspaceForChat(): LocalWorkspace | undefined {
+    return this.workspaceForChat(this.activeChat(), this.persona());
   }
 
   private openUrlInBrowser(url: string): void {
@@ -1500,23 +1726,36 @@ struct Index {
     }
   }
 
-  private requestAskUserInput(req: AskUserPromptRequest): Promise<string> {
-    this.askQuestionText = req.question;
-    this.askQuestionOptions = req.options.slice();
-    this.askQuestionPlaceholder = req.placeholder;
-    this.askQuestionAnswer = '';
+  private requestAskUserInput(job: ChatGenerationJob, req: AskUserPromptRequest): Promise<string> {
+    job.askQuestionText = req.question;
+    job.askQuestionOptions = req.options.slice();
+    job.askQuestionPlaceholder = req.placeholder;
+    job.askQuestionAnswer = '';
+    this.syncActiveGenerationView();
+    if (this.appInBackground && this.workspace.systemSettings?.backgroundNotifyEnabled !== false) {
+      notifyGenerationComplete(this.host(), true, job.title || 'Kelivo', `AI 向您确认：${req.question}`, job.chatId).catch(() => {});
+    }
     return new Promise<string>((resolve) => {
-      this.askUserResolver = resolve;
+      job.askUserResolver = resolve;
     });
   }
 
   private submitAskUserInput(answer: string): void {
-    const res = this.askUserResolver;
-    this.askUserResolver = undefined;
-    this.askQuestionText = '';
-    this.askQuestionOptions = [];
-    this.askQuestionPlaceholder = '';
-    this.askQuestionAnswer = '';
+    const job = this.genRegistry.get(this.workspace.activeConversation);
+    if (!job) {
+      this.askQuestionText = '';
+      this.askQuestionOptions = [];
+      this.askQuestionPlaceholder = '';
+      this.askQuestionAnswer = '';
+      return;
+    }
+    const res = job.askUserResolver;
+    job.askUserResolver = undefined;
+    job.askQuestionText = '';
+    job.askQuestionOptions = [];
+    job.askQuestionPlaceholder = '';
+    job.askQuestionAnswer = '';
+    this.syncActiveGenerationView();
     if (res) res(answer);
   }
 
@@ -1614,6 +1853,10 @@ struct Index {
     const persona = this.persona();
     if (!chat || chat.ephemeral || persona.memoryEnabled === false) {
       this.toast('请打开已启用长期记忆的普通对话');
+      return;
+    }
+    if (this.isChatGenerating(chat.id)) {
+      this.toast('当前对话正在生成中，请稍候');
       return;
     }
     const memSettings = normalizeMemorySettings(this.workspace.memorySettings);
@@ -1868,20 +2111,20 @@ struct Index {
     this.searchOn = true;
   }
 
-  stopReply(): void {
-    this.stopped = true;
-    this.stream?.stop();
-    this.searcher?.stop();
-    if (this.approvalResolver) {
-      const res = this.approvalResolver;
-      this.approvalResolver = undefined;
-      this.pendingApprovalTool = '';
-      this.pendingApprovalArgs = '';
-      res('deny');
+  stopReply(chatId?: string): void {
+    const targetId = chatId ?? this.workspace.activeConversation;
+    if (!targetId) {
+      return;
     }
-    if (this.askUserResolver) {
-      this.submitAskUserInput('');
+    if (this.genRegistry.stopChat(targetId)) {
+      this.syncActiveGenerationView();
     }
+  }
+
+  private stopAllGenerations(markDeleted: boolean = false): void {
+    this.genRegistry.stopAll(markDeleted);
+    this.syncActiveGenerationView();
+    this.refreshKeepScreenOn();
   }
 
   private activeSearchService(): SearchServiceConfig | undefined {
@@ -1890,28 +2133,50 @@ struct Index {
   }
 
   private resolveToolApproval(choice: 'allow_once' | 'allow_all' | 'deny'): void {
+    const job = this.genRegistry.get(this.workspace.activeConversation);
+    if (!job) {
+      this.pendingApprovalTool = '';
+      this.pendingApprovalArgs = '';
+      return;
+    }
     if (choice === 'allow_all') {
       this.fullAccessMode = true;
-      const c = this.activeChat();
-      if (c) { c.toolPermissionMode = 'full'; this.persistAction(); }
+      const c = this.workspace.conversations.find((item: Conversation): boolean => item.id === job.chatId);
+      if (c) {
+        c.toolPermissionMode = 'full';
+        this.persistAction();
+      }
     }
-    const res = this.approvalResolver;
-    this.approvalResolver = undefined;
-    this.pendingApprovalTool = '';
-    this.pendingApprovalArgs = '';
+    const res = job.approvalResolver;
+    job.approvalResolver = undefined;
+    job.pendingApprovalTool = '';
+    job.pendingApprovalArgs = '';
+    this.syncActiveGenerationView();
     res?.(choice);
   }
 
-  private requestToolApproval(tool: RegisteredTool, argsJson: string): Promise<'allow_once' | 'allow_all' | 'deny'> {
-    this.pendingApprovalTool = tool.declaration.name;
-    this.pendingApprovalArgs = argsJson;
+  private requestToolApproval(
+    job: ChatGenerationJob, tool: RegisteredTool, argsJson: string
+  ): Promise<'allow_once' | 'allow_all' | 'deny'> {
+    job.pendingApprovalTool = tool.declaration.name;
+    job.pendingApprovalArgs = argsJson;
+    this.syncActiveGenerationView();
+    if (this.appInBackground && this.workspace.systemSettings?.backgroundNotifyEnabled !== false) {
+      notifyGenerationComplete(
+        this.host(),
+        true,
+        job.title || 'Kelivo',
+        `工具「${tool.declaration.name}」等待您的授权`,
+        job.chatId
+      ).catch(() => {});
+    }
     return new Promise<'allow_once' | 'allow_all' | 'deny'>((resolve) => {
-      this.approvalResolver = resolve;
+      job.approvalResolver = resolve;
     });
   }
 
   private async executeRegisteredTool(
-    tool: RegisteredTool, argsJson: string, chat: Conversation, persona: Persona
+    tool: RegisteredTool, argsJson: string, chat: Conversation, persona: Persona, job: ChatGenerationJob
   ): Promise<ToolExecutionOutput> {
     let parsed: Record<string, Object> = {};
     try {
@@ -1927,7 +2192,7 @@ struct Index {
       const svc = this.activeSearchService();
       if (!svc) return { text: '未配置搜索服务', isError: true };
       const searcher = new WebSearch();
-      this.searcher = searcher;
+      job.searcher = searcher;
       const fallbackKey = this.workspace.search?.secretRef ? await readKey(this.workspace.search.secretRef) : '';
       const hits = await searcher.findWithService(svc, fallbackKey, query);
       if (!hits.length) return { text: '未找到相关网页结果' };
@@ -1960,7 +2225,7 @@ struct Index {
       return executeWorkspaceTool(
         tool.declaration.name,
         argsJson,
-        this.activeWorkspaceForChat(),
+        this.workspaceForChat(chat, persona),
         this.workspace.envVars || []
       );
     }
@@ -1968,7 +2233,7 @@ struct Index {
       return executeSkillTool(argsJson, this.workspace.skills || defaultBuiltinSkills());
     }
     if (tool.source === 'browser') {
-      if (this.wide && this.sidePanelMode === '') {
+      if (this.wide && this.sidePanelMode === '' && this.workspace.activeConversation === chat.id && this.activeRoute === 'chat') {
         this.setSidePanelMode('browser');
       }
       return this.browserManager.executeAction(argsJson, this.workspace.workspaces || []);
@@ -1985,9 +2250,10 @@ struct Index {
             await this.speaker.play(text, () => {});
           }
         },
-        askUserInput: (req: AskUserPromptRequest): Promise<string> => this.requestAskUserInput(req),
+        askUserInput: (req: AskUserPromptRequest): Promise<string> => this.requestAskUserInput(job, req),
         getConversations: (): Conversation[] => this.workspace.conversations,
-        getActiveConversation: (): Conversation | undefined => this.activeChat()
+        getActiveConversation: (): Conversation | undefined =>
+          this.workspace.conversations.find((item: Conversation): boolean => item.id === chat.id) || chat
       };
       return executeDeviceTool(tool.declaration.name, argsJson, bridge);
     }
@@ -2135,6 +2401,7 @@ struct Index {
     }
 
     if (!c) {
+      const hasDraftOverride = this.workspace.modelDefaults?.perChatModel === true && this.draftOverrideProviderId.length > 0;
       c = {
         id: newId(),
         title: (this.draft.trim() || this.attachedList[0]?.name || '新对话').slice(0, 32),
@@ -2142,45 +2409,118 @@ struct Index {
         messages: [],
         personaId: this.persona().id,
         ephemeral: this.ephemeralMode,
-        imageGenMode: this.imageGenMode
+        imageGenMode: this.imageGenMode,
+        overrideProviderId: hasDraftOverride ? this.draftOverrideProviderId : undefined,
+        overrideModel: hasDraftOverride ? (this.draftOverrideModel || undefined) : undefined
       };
     }
 
     const target = c;
+    if (this.genRegistry.isGenerating(target.id)) {
+      return;
+    }
+
+    const wsAtStart = this.workspace;
     const isFirstTurn = !retry && history.length === 1;
     const persona = this.persona();
     const sysPrompt = (target.overridePrompt || persona.prompt || '').trim();
     const params = this.effectiveParams();
+    const useSearchOn = this.searchOn;
+    const useImageGen = this.imageGenMode;
+    const useFullAccess = this.fullAccessMode;
+    const useBrowserPanel = this.sidePanelMode === 'browser';
 
-    this.liveMessageId = targetReplaceMsg?.id || newId();
-    this.liveThinking = false;
-    this.liveReasoningMs = 0;
-    if (this.expandedReasoning === this.liveMessageId) this.expandedReasoning = '';
-    this.working = true;
-    this.regeneratingMsgId = targetReplaceMsg ? targetReplaceMsg.id : '';
-    this.stopped = false;
-    this.liveText = '';
-    this.liveReasoning = '';
-    this.liveToolCalls = [];
+    if (!retry) {
+      this.workspace.activeConversation = target.id;
+      this.putChat({
+        id: target.id,
+        title: target.title,
+        updated: Date.now(),
+        personaId: target.personaId,
+        ephemeral: target.ephemeral,
+        imageGenMode: target.imageGenMode,
+        overrideProviderId: target.overrideProviderId,
+        overrideModel: target.overrideModel,
+        messages: history.slice(),
+        draftText: '',
+        suggestions: []
+      });
+      this.draftOverrideProviderId = '';
+      this.draftOverrideModel = '';
+      this.drafts.delete(target.id);
+      this.draft = '';
+      this.attachedList = [];
+      if (this.quoteDraft !== undefined) {
+        SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
+          this.quoteDraft = undefined;
+        });
+      }
+      if (!target.ephemeral) {
+        this.persistAction();
+      }
+    }
+
+    const job = new ChatGenerationJob(
+      target.id,
+      target.title,
+      targetReplaceMsg?.id || newId(),
+      targetReplaceMsg ? targetReplaceMsg.id : '',
+      modelId,
+      p.name,
+      p.family,
+      persona.id
+    );
+    this.genRegistry.start(job);
     this.followBottom = this.appearanceCfg().autoFollowBottom !== false;
-    this.lastSendError = '';
-    this.lastSendErrorChatId = '';
     this.notice = '';
+    if (this.expandedReasoning === job.liveMessageId) {
+      this.expandedReasoning = '';
+    }
+    this.syncActiveGenerationView();
+    this.refreshKeepScreenOn();
+    backgroundGenerationManager.beginTask(target.id, target.title, this.host());
     triggerHapticFeedback(this.workspace.systemSettings?.hapticsEnabled !== false, 16);
-    applyKeepScreenOn(this.host(), this.workspace.systemSettings?.keepScreenOn !== false).catch(() => {});
+
+    const isViewingThisChat = (): boolean => this.workspace.activeConversation === target.id;
+    const latestChatTitle = (): string =>
+      this.workspace.conversations.find((item: Conversation): boolean => item.id === target.id)?.title || target.title;
+
     let answer = '';
     let thoughts = '';
     let genImages: Attachment[] = [];
     let toolCallsUsed: ToolCallRecord[] = [];
     const finalUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, durationMs: 0 };
     let hasUsage = false;
+    let isImageTask = useImageGen;
     const reasoningTimer = new ReplyReasoningTimer();
+
+    const resolveCurrentPhase = (): GenerationPhase => {
+      if (isImageTask) return 'image';
+      if (job.fetchingSources) return 'searching';
+      if (toolCallsUsed.some((tc: ToolCallRecord): boolean => tc.status === 'running' || tc.status === 'pending')) {
+        return 'tool';
+      }
+      if (reasoningTimer.active) return 'thinking';
+      return 'streaming';
+    };
+
     const syncReasoningPhase = (): void => {
-      this.liveReasoningMs = reasoningTimer.elapsedMs;
-      if (this.liveThinking === reasoningTimer.active) return;
-      this.liveThinking = reasoningTimer.active;
-      if (this.liveThinking) this.expandedReasoning = this.liveMessageId;
-      else if (this.expandedReasoning === this.liveMessageId) this.expandedReasoning = '';
+      job.liveReasoningMs = reasoningTimer.elapsedMs;
+      const activeChanged = job.liveThinking !== reasoningTimer.active;
+      job.liveThinking = reasoningTimer.active;
+      if (!isViewingThisChat()) {
+        return;
+      }
+      this.liveReasoningMs = job.liveReasoningMs;
+      if (!activeChanged && this.liveThinking === job.liveThinking) {
+        return;
+      }
+      this.liveThinking = job.liveThinking;
+      if (this.liveThinking) {
+        this.expandedReasoning = job.liveMessageId;
+      } else if (this.expandedReasoning === job.liveMessageId) {
+        this.expandedReasoning = '';
+      }
     };
     const observeFragment = (part: RichFragment): void => {
       reasoningTimer.update(part, Date.now());
@@ -2190,15 +2530,27 @@ struct Index {
       reasoningTimer.finish(Date.now());
       syncReasoningPhase();
     };
-    let timer = -1;
     const scheduleLiveUpdate = (): void => {
-      if (timer >= 0) return;
-      timer = setTimeout(() => {
-        timer = -1;
-        this.liveText = answer;
-        this.liveReasoning = thoughts;
-        this.liveToolCalls = toolCallsUsed.slice();
-        this.scrollDown();
+      if (job.flushTimer >= 0) return;
+      job.flushTimer = setTimeout(() => {
+        job.flushTimer = -1;
+        job.liveText = answer;
+        job.liveReasoning = thoughts;
+        job.liveToolCalls = toolCallsUsed.slice();
+        backgroundGenerationManager.updateTask(
+          target.id,
+          latestChatTitle(),
+          resolveCurrentPhase(),
+          answer.length + thoughts.length
+        );
+        if (isViewingThisChat()) {
+          this.liveText = job.liveText;
+          this.liveReasoning = job.liveReasoning;
+          this.liveToolCalls = job.liveToolCalls.slice();
+          if (this.activeRoute === 'chat' && !this.appInBackground) {
+            this.scrollDown();
+          }
+        }
       }, 80);
     };
     let completed = false;
@@ -2209,46 +2561,46 @@ struct Index {
       const question = history[history.length - 1];
       const activeSearch = this.activeSearchService();
       const searchMode = activeSearch?.mode || 'pre_search';
-      if (this.searchOn && searchMode === 'pre_search' && question.text && !question.sources?.length) {
-        this.fetchingSources = true;
+      if (useSearchOn && searchMode === 'pre_search' && question.text && !question.sources?.length) {
+        job.fetchingSources = true;
+        if (isViewingThisChat()) this.fetchingSources = true;
+        backgroundGenerationManager.updateTask(target.id, latestChatTitle(), 'searching', 0);
         const legacySearch = this.workspace.search;
         const fallbackKey = legacySearch?.kind === 'tavily' ? await readKey(legacySearch.secretRef) : '';
-        if (this.stopped) return;
-        this.searcher = new WebSearch();
+        if (job.stopped) return;
+        const searcher = new WebSearch();
+        job.searcher = searcher;
         const hits = activeSearch
-          ? await this.searcher.findWithService(activeSearch, fallbackKey, question.text)
-          : (legacySearch ? await this.searcher.find(legacySearch, fallbackKey, question.text) : []);
-        if (this.stopped) return;
-        history[history.length - 1] = {
+          ? await searcher.findWithService(activeSearch, fallbackKey, question.text)
+          : (legacySearch ? await searcher.find(legacySearch, fallbackKey, question.text) : []);
+        if (job.stopped) return;
+        const updatedQuestion: ChatMessage = {
           id: question.id, role: question.role, text: question.text, model: question.model,
           attachment: question.attachment, attachments: question.attachments,
           quote: question.quote, createdAt: question.createdAt, sources: hits
         };
-        this.fetchingSources = false;
+        history[history.length - 1] = updatedQuestion;
+        const existingConv = this.workspace.conversations.find((item: Conversation): boolean => item.id === target.id);
+        if (existingConv && !job.deleted && wsAtStart === this.workspace) {
+          existingConv.messages = existingConv.messages.map((m: ChatMessage): ChatMessage =>
+            m.id === updatedQuestion.id ? updatedQuestion : m
+          );
+          this.workspace.conversations = this.workspace.conversations.slice();
+        }
+        job.fetchingSources = false;
+        if (isViewingThisChat()) this.fetchingSources = false;
       }
 
       const auth = await this.resolveProviderKeyAndProxy(p);
       authKeyId = auth.keyEntryId;
-      if (this.stopped) return;
-
-      if (!retry) {
-        this.workspace.activeConversation = target.id;
-        this.putChat({
-          id: target.id, title: target.title, updated: Date.now(), personaId: target.personaId,
-          messages: history, draftText: '', suggestions: []
-        });
-        if (!target.ephemeral) await this.persist();
-        this.drafts.delete(target.id);
-        this.draft = '';
-        this.attachedList = [];
-        SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
-          this.quoteDraft = undefined;
-        });
-      }
+      if (job.stopped) return;
 
       const modelSpec = findProviderModelSpec(p, modelId);
-      if (this.imageGenMode || modelSpec.imageGen) {
+      isImageTask = useImageGen || modelSpec.imageGen;
+      if (isImageTask) {
+        backgroundGenerationManager.updateTask(target.id, latestChatTitle(), 'image', 0);
         const imgs = await generateImages(p, auth.key, question.text || '生成图片', modelId, auth.proxyPass, target.id);
+        if (job.stopped) return;
         genImages = imgs;
         answer = '已生成 ' + imgs.length + ' 张图片：';
         completed = true;
@@ -2282,6 +2634,7 @@ struct Index {
             attachment: nextAtt, attachments: nextAtts, quote: item.quote, sources: item.sources
           });
         }
+        if (job.stopped) return;
 
         const memSettings = normalizeMemorySettings(this.workspace.memorySettings);
         const memLang = resolveMemoryPromptLang(memSettings, this.appearanceCfg().language);
@@ -2321,6 +2674,7 @@ struct Index {
         const mcpToolsRaw = mcpServers.some((s: McpServerConfig): boolean => s.enabled)
           ? await this.mcpManager.discoverEnabledServers(mcpServers)
           : [];
+        if (job.stopped) return;
         const mcpDescriptors: McpDiscoveredDescriptor[] = mcpToolsRaw.map((t: McpTool): McpDiscoveredDescriptor => {
           return {
             serverId: t.serverId || '',
@@ -2337,8 +2691,8 @@ struct Index {
           enabledDeviceIds.includes(t.declaration.name)
         );
         const hasSkills = (persona.skillIds?.length || 0) > 0 || (target.enabledSkillIds?.length || 0) > 0;
-        const browserToolsEnabled = this.sidePanelMode === 'browser' || enabledDeviceIds.includes('browser_action');
-        const hasBoundWorkspace = Boolean(target.workspaceId || persona.workspaceId) && Boolean(this.activeWorkspaceForChat());
+        const browserToolsEnabled = useBrowserPanel || enabledDeviceIds.includes('browser_action');
+        const hasBoundWorkspace = Boolean(target.workspaceId || persona.workspaceId) && Boolean(this.workspaceForChat(target, persona));
         const extraTools: RegisteredTool[] = [
           ...buildMemoryTools(persona.memoryEnabled !== false, persona.allowPastConversationRecall === true,
             !target.ephemeral, persona.memoryWriteScope || 'alwaysGlobal', memSettings.injectGlobal, memLang),
@@ -2349,8 +2703,8 @@ struct Index {
         ];
         const registeredTools = modelSpec.tools ? assembleToolRegistry({
           searchService: activeSearch,
-          searchEnabled: this.searchOn,
-          builtinFetchEnabled: sysCfg.builtinFetchEnabled && this.searchOn,
+          searchEnabled: useSearchOn,
+          builtinFetchEnabled: sysCfg.builtinFetchEnabled && useSearchOn,
           mcpTools: mcpDescriptors,
           mcpServers,
           extraTools,
@@ -2360,7 +2714,7 @@ struct Index {
         const useStreamMode = persona.streamOutput !== false;
 
         if (registeredTools.length > 0) {
-          const permMode: ToolPermissionMode = this.fullAccessMode ? 'full' : (target.toolPermissionMode || sysCfg.defaultToolPermission);
+          const permMode: ToolPermissionMode = useFullAccess ? 'full' : (target.toolPermissionMode || sysCfg.defaultToolPermission);
           const loopOut = await runAgentToolLoop({
             provider: p,
             apiKey: auth.key,
@@ -2380,8 +2734,9 @@ struct Index {
             proxy: p.proxy,
             proxyPassword: auth.proxyPass,
             runStream: async (call: ChatCall, onFrag: (f: RichFragment) => void) => {
-              this.stream = new ChatStream();
-              await this.stream.runRich(call, (part: RichFragment) => {
+              const s = new ChatStream();
+              job.stream = s;
+              await s.runRich(call, (part: RichFragment) => {
                 observeFragment(part);
                 onFrag(part);
               }, {
@@ -2395,12 +2750,18 @@ struct Index {
               });
               endReasoning();
             },
-            executeTool: (tool: RegisteredTool, argsJson: string) => this.executeRegisteredTool(tool, argsJson, target, persona),
-            requestApproval: (tool: RegisteredTool, argsJson: string) => this.requestToolApproval(tool, argsJson),
+            executeTool: (tool: RegisteredTool, argsJson: string) => this.executeRegisteredTool(tool, argsJson, target, persona, job),
+            requestApproval: (tool: RegisteredTool, argsJson: string) => this.requestToolApproval(job, tool, argsJson),
             onUpdate: (lText: string, lReason: string, recs: ToolCallRecord[]) => {
               answer = lText;
               thoughts = lReason;
               toolCallsUsed = recs;
+              if (recs.some((r: ToolCallRecord): boolean => r.status === 'pending')) {
+                job.liveToolCalls = recs.slice();
+                if (isViewingThisChat()) {
+                  this.liveToolCalls = job.liveToolCalls.slice();
+                }
+              }
               scheduleLiveUpdate();
             },
             onContextLog: (payloadJson: string) => {
@@ -2410,7 +2771,7 @@ struct Index {
                 payloadJson, tokenEstimate: Math.ceil(payloadJson.length / 4)
               }).catch(() => {});
             },
-            isStopped: () => this.stopped
+            isStopped: () => job.stopped
           });
           answer = loopOut.text;
           thoughts = loopOut.reasoning;
@@ -2449,10 +2810,13 @@ struct Index {
             tokenEstimate: Math.ceil(call.body.length / 4)
           }).catch(() => {});
 
-          if (this.stopped) return;
-          this.scrollDown();
-          this.stream = new ChatStream();
-          await this.stream.runRich(call, (part: RichFragment) => {
+          if (job.stopped) return;
+          if (isViewingThisChat() && this.activeRoute === 'chat' && !this.appInBackground) {
+            this.scrollDown();
+          }
+          const s = new ChatStream();
+          job.stream = s;
+          await s.runRich(call, (part: RichFragment) => {
             observeFragment(part);
             answer += part.text;
             thoughts += part.reasoning;
@@ -2485,125 +2849,150 @@ struct Index {
         p.apiKeys = markKeySuccess(p.apiKeys, authKeyId);
       }
     } catch (e) {
-      const errMsg = this.stopped ? '已停止生成' : ((e as Error).message || '请求失败，请检查网络和模型设置');
-      if (this.stopped) {
-        this.notice = errMsg;
+      const errMsg = job.stopped ? '已停止生成' : ((e as Error).message || '请求失败，请检查网络和模型设置');
+      if (job.stopped) {
+        if (isViewingThisChat() && !job.deleted) {
+          this.notice = errMsg;
+        }
       } else {
-        this.lastSendError = errMsg;
-        this.lastSendErrorChatId = target.id;
+        this.genRegistry.setError(target.id, errMsg);
+        if (isViewingThisChat()) {
+          this.lastSendError = errMsg;
+          this.lastSendErrorChatId = target.id;
+        }
+        if (this.appInBackground && this.workspace.systemSettings?.backgroundNotifyEnabled !== false && !job.deleted) {
+          await notifyGenerationComplete(this.host(), true, latestChatTitle(), '生成未完成：' + errMsg, target.id).catch(() => {});
+        }
       }
-      if (authKeyId && p.apiKeys?.length && !this.stopped) {
+      if (authKeyId && p.apiKeys?.length && !job.stopped) {
         p.apiKeys = markKeyError(p.apiKeys, authKeyId, 429);
       }
     } finally {
-      if (timer >= 0) clearTimeout(timer);
+      job.clearTimer();
       endReasoning();
-      applyKeepScreenOn(this.host(), false).catch(() => {});
       const durationMs = Date.now() - startTs;
       finalUsage.durationMs = durationMs;
       if (answer.length > 0 && persona.regexRules?.length) {
         answer = applyRegexRules(answer, persona.regexRules, 'output');
       }
 
-      if ((answer || genImages.length || toolCallsUsed.length) && (completed || !targetReplaceMsg)) {
-        const recordedUsage: TokenUsage | undefined = hasUsage ? finalUsage : undefined;
-        let nextMsg: ChatMessage;
-        if (targetReplaceMsg) {
-          nextMsg = appendMessageVersion(targetReplaceMsg, {
-            id: newId(),
-            text: answer,
-            reasoning: thoughts,
-            reasoningDurationMs: reasoningTimer.elapsedMs || undefined,
-            model: modelId,
-            createdAt: Date.now(),
-            usage: recordedUsage,
-            toolCalls: toolCallsUsed.length ? toolCallsUsed : undefined,
-            generatedImages: genImages.length ? genImages : undefined
-          });
-        } else {
-          nextMsg = {
-            id: this.liveMessageId,
-            role: 'assistant',
-            text: answer,
-            model: modelId,
-            reasoning: thoughts,
-            reasoningDurationMs: reasoningTimer.elapsedMs || undefined,
-            createdAt: Date.now(),
-            usage: recordedUsage,
-            toolCalls: toolCallsUsed.length ? toolCallsUsed : undefined,
-            generatedImages: genImages.length ? genImages : undefined
-          };
-        }
-        const finalMessages = [...history, nextMsg, ...tailMessages];
-        const prevConvState = this.workspace.conversations.find((item: Conversation): boolean => item.id === target.id);
-        const curThrough = prevConvState?.memoryOrganizedThrough;
-        const rewindThrough = (retry && tailMessages.length === 0 && curThrough &&
-          (curThrough === targetReplaceMsg?.id || !finalMessages.some((m: ChatMessage): boolean => m.id === curThrough)))
-          ? (history.length >= 2 ? history[history.length - 2].id : '')
-          : undefined;
-        this.putChat({
-          id: target.id, title: target.title, updated: Date.now(),
-          personaId: target.personaId, messages: finalMessages,
-          memoryOrganizedThrough: rewindThrough
-        });
-        if (!target.ephemeral) {
-          try { await this.persist(); } catch (_) { this.notice = '回复保存在当前页面，写入设备失败'; }
-        }
-        if (hasUsage) {
-          const day = new Date().toISOString().slice(0, 10);
-          this.store?.recordUsage(day, modelId, target.personaId,
-            finalUsage.promptTokens, finalUsage.completionTokens, finalUsage.cachedTokens).catch(() => {});
-        }
-        if (completed) {
-          triggerHapticFeedback(this.workspace.systemSettings?.hapticsEnabled !== false, 12);
-          notifyGenerationComplete(
-            this.host(),
-            this.workspace.systemSettings?.backgroundNotifyEnabled === true,
-            target.title,
-            answer
-          ).catch(() => {});
-        }
-        if (completed && isFirstTurn && !target.ephemeral) {
-          this.autoGenerateTitle(target.id, history[history.length - 1].text, answer);
-        }
-        if (completed) {
-          this.fetchSuggestions(target.id, history[history.length - 1].text, answer);
-          if (!target.ephemeral && answer.trim().length > 0 && tailMessages.length === 0) {
-            const latestPersona = this.workspace.personas.find((item: Persona): boolean => item.id === persona.id) || persona;
-            this.queueMemoryOrganization(target, latestPersona, { prov: p, model: modelId });
+      const prevConvState = (!job.deleted && wsAtStart === this.workspace)
+        ? this.workspace.conversations.find((item: Conversation): boolean => item.id === target.id)
+        : undefined;
+
+      if (prevConvState) {
+        const latestTitle = prevConvState.title || target.title;
+        const latestPersonaId = prevConvState.personaId || target.personaId;
+        if ((answer || genImages.length || toolCallsUsed.length) && (completed || !targetReplaceMsg)) {
+          const recordedUsage: TokenUsage | undefined = hasUsage ? finalUsage : undefined;
+          let nextMsg: ChatMessage;
+          if (targetReplaceMsg) {
+            nextMsg = appendMessageVersion(targetReplaceMsg, {
+              id: newId(),
+              text: answer,
+              reasoning: thoughts,
+              reasoningDurationMs: reasoningTimer.elapsedMs || undefined,
+              model: modelId,
+              createdAt: Date.now(),
+              usage: recordedUsage,
+              toolCalls: toolCallsUsed.length ? toolCallsUsed : undefined,
+              generatedImages: genImages.length ? genImages : undefined
+            });
+          } else {
+            nextMsg = {
+              id: job.liveMessageId,
+              role: 'assistant',
+              text: answer,
+              model: modelId,
+              reasoning: thoughts,
+              reasoningDurationMs: reasoningTimer.elapsedMs || undefined,
+              createdAt: Date.now(),
+              usage: recordedUsage,
+              toolCalls: toolCallsUsed.length ? toolCallsUsed : undefined,
+              generatedImages: genImages.length ? genImages : undefined
+            };
           }
-          const sysAfter = this.workspace.systemSettings;
-          if (sysAfter?.autoCompactEnabled && !target.ephemeral) {
-            const threshold = Math.max(8, sysAfter.autoCompactThreshold || 36);
-            const activeSliceCount = finalMessages.length - (target.contextStartIndex || 0);
-            if (activeSliceCount >= threshold) {
-              this.compressInPlace(sysAfter.compressionTemplate).catch(() => {});
+          const finalMessages = [...history, nextMsg, ...tailMessages];
+          const curThrough = prevConvState.memoryOrganizedThrough;
+          const rewindThrough = (retry && tailMessages.length === 0 && curThrough &&
+            (curThrough === targetReplaceMsg?.id || !finalMessages.some((m: ChatMessage): boolean => m.id === curThrough)))
+            ? (history.length >= 2 ? history[history.length - 2].id : '')
+            : undefined;
+          this.putChat({
+            id: target.id, title: latestTitle, updated: Date.now(),
+            personaId: latestPersonaId, messages: finalMessages,
+            memoryOrganizedThrough: rewindThrough
+          });
+          if (!target.ephemeral) {
+            try { await this.persist(); } catch (_) {
+              if (isViewingThisChat()) this.notice = '回复保存在当前页面，写入设备失败';
             }
           }
+          if (hasUsage) {
+            const day = new Date().toISOString().slice(0, 10);
+            this.store?.recordUsage(day, modelId, latestPersonaId,
+              finalUsage.promptTokens, finalUsage.completionTokens, finalUsage.cachedTokens).catch(() => {});
+          }
+          if (completed) {
+            if (!this.appInBackground && isViewingThisChat() && this.activeRoute === 'chat') {
+              triggerHapticFeedback(this.workspace.systemSettings?.hapticsEnabled !== false, 12);
+            }
+            const notifyEnabled = this.workspace.systemSettings?.backgroundNotifyEnabled !== false;
+            const shouldNotify = notifyEnabled && (this.appInBackground || this.activeRoute !== 'chat' || !isViewingThisChat());
+            if (shouldNotify) {
+              await notifyGenerationComplete(this.host(), true, latestTitle, answer, target.id).catch(() => {});
+            }
+          }
+          if (completed && isFirstTurn && !target.ephemeral) {
+            this.autoGenerateTitle(target.id, history[history.length - 1].text, answer);
+          }
+          if (completed) {
+            this.fetchSuggestions(target.id, history[history.length - 1].text, answer);
+            if (!target.ephemeral && answer.trim().length > 0 && tailMessages.length === 0) {
+              const latestPersona = this.workspace.personas.find((item: Persona): boolean => item.id === latestPersonaId) || persona;
+              const latestConvForMem = this.workspace.conversations.find((item: Conversation): boolean => item.id === target.id) || prevConvState;
+              this.queueMemoryOrganization(latestConvForMem, latestPersona, { prov: p, model: modelId });
+            }
+          }
+        } else if (targetReplaceMsg) {
+          // Restore previous version if regeneration failed
+          this.putChat({
+            id: target.id, title: latestTitle, updated: Date.now(),
+            personaId: latestPersonaId, messages: [...history, targetReplaceMsg, ...tailMessages]
+          });
         }
-      } else if (targetReplaceMsg) {
-        // Restore previous version if regeneration failed
-        this.putChat({
-          id: target.id, title: target.title, updated: Date.now(),
-          personaId: target.personaId, messages: [...history, targetReplaceMsg, ...tailMessages]
-        });
       }
 
-      this.stream = undefined;
-      this.searcher = undefined;
-      this.fetchingSources = false;
-      this.regeneratingMsgId = '';
-      this.working = false;
-      this.liveText = '';
-      this.liveReasoning = '';
-      this.liveToolCalls = [];
-      this.scrollDown();
+      this.genRegistry.finish(target.id, job);
+      if (completed && !job.deleted && wsAtStart === this.workspace) {
+        const sysAfter = this.workspace.systemSettings;
+        const latestConv = this.workspace.conversations.find((item: Conversation): boolean => item.id === target.id);
+        if (sysAfter?.autoCompactEnabled && !target.ephemeral && latestConv) {
+          const threshold = Math.max(8, sysAfter.autoCompactThreshold || 36);
+          const activeSliceCount = latestConv.messages.length - (latestConv.contextStartIndex || 0);
+          if (activeSliceCount >= threshold) {
+            this.compressInPlace(sysAfter.compressionTemplate, target.id).catch(() => {});
+          }
+        }
+      }
+      this.syncActiveGenerationView();
+      this.refreshKeepScreenOn();
+      backgroundGenerationManager.endTask(target.id);
+      if (isViewingThisChat() && this.activeRoute === 'chat' && !this.appInBackground) {
+        this.scrollDown();
+      }
     }
   }
 
-  private async compressInPlace(template: string): Promise<void> {
-    const c = this.activeChat();
+  private async compressInPlace(template: string, targetChatId?: string): Promise<void> {
+    const c = targetChatId
+      ? this.workspace.conversations.find((item: Conversation): boolean => item.id === targetChatId)
+      : this.activeChat();
     if (!c || !c.messages.length) return;
+    if (this.isChatGenerating(c.id)) {
+      if (!targetChatId) this.toast('当前对话正在生成中，请稍候');
+      return;
+    }
     const roleTarget = this.resolveRoleProvider('compress');
     const auth = await this.resolveProviderKeyAndProxy(roleTarget.prov);
     const modelId = roleTarget.model || this.activeModelId();
@@ -2620,6 +3009,10 @@ struct Index {
   private undoCompression(): void {
     const c = this.activeChat();
     if (!c) return;
+    if (this.isChatGenerating(c.id)) {
+      this.toast('当前对话正在生成中，请稍候');
+      return;
+    }
     c.messages = undoContextCompression(c.messages);
     this.workspace.conversations = this.workspace.conversations.slice();
     if (!c.ephemeral) this.persistAction();
@@ -2657,6 +3050,10 @@ struct Index {
   private deleteSingleMessage(msgId: string, toastMsg: string = ''): void {
     const c = this.activeChat();
     if (!c) return;
+    if (this.isChatGenerating(c.id)) {
+      this.toast('当前对话正在生成中，请稍候');
+      return;
+    }
     c.messages = c.messages.filter((m: ChatMessage): boolean => m.id !== msgId);
     c.updated = Date.now();
     this.workspace.conversations = this.workspace.conversations.slice();
@@ -2667,6 +3064,10 @@ struct Index {
   private deleteActiveMessageVersion(msgId: string): void {
     const c = this.activeChat();
     if (!c) return;
+    if (this.isChatGenerating(c.id)) {
+      this.toast('当前对话正在生成中，请稍候');
+      return;
+    }
     const nextList: ChatMessage[] = [];
     let removedAll = false;
     for (let i = 0; i < c.messages.length; i++) {
@@ -2722,6 +3123,10 @@ struct Index {
   private saveEditedMessage(rerun: boolean): void {
     const c = this.activeChat();
     if (!c || !this.editingMsgId) return;
+    if (this.isChatGenerating(c.id)) {
+      this.toast('当前对话正在生成中，请稍候');
+      return;
+    }
     const targetId = this.editingMsgId;
     const nextText = this.editingMsgText.trim();
     if (!nextText) return;
@@ -2856,9 +3261,13 @@ struct Index {
       systemMaterial: ImmersiveMaterialStyle.alertDialogMaterial(this.immersiveLightOn()),
       primaryButton: { value: '取消', action: () => {} },
       secondaryButton: { value: '删除', action: () => {
+        this.genRegistry.markDeletedAndStop(c.id);
         this.workspace.conversations = this.workspace.conversations.filter((item: Conversation): boolean => item.id !== c.id);
         if (this.workspace.activeConversation === c.id) { this.workspace.activeConversation = ''; this.draft = ''; this.attachedList = []; }
         this.drafts.delete(c.id);
+        this.syncActiveGenerationView();
+        this.refreshKeepScreenOn();
+        backgroundGenerationManager.endTask(c.id);
         this.persistAction();
       } }
     });
@@ -3368,6 +3777,12 @@ struct Index {
                       .maxLines(1)
                       .textOverflow({ overflow: TextOverflow.Ellipsis })
                       .layoutWeight(1)
+                    if (this.generatingChatIds.includes(c.id)) {
+                      LoadingProgress()
+                        .width(14)
+                        .height(14)
+                        .color($r('app.color.accent'))
+                    }
                   }
                   .layoutWeight(1)
                   .padding({ left: 10, right: 4, top: 11, bottom: 11 })
@@ -3404,7 +3819,7 @@ struct Index {
             }
             .width('100%')
           }
-        }, (c: Conversation) => `${c.id}_${c.title}_${c.updated}_${c.messages.length}_${!!c.pinned}_${c.id === this.workspace.activeConversation}_${c.id === this.renameId}`)
+        }, (c: Conversation) => `${c.id}_${c.title}_${c.updated}_${c.messages.length}_${!!c.pinned}_${c.id === this.workspace.activeConversation}_${c.id === this.renameId}_${this.generatingChatIds.includes(c.id)}`)
 
         if (!this.chatRows().length) {
           ListItem() {
@@ -3504,7 +3919,7 @@ struct Index {
     .height('100%')
     .backgroundColor(isOverlay ? $r('app.color.surface') : $r('app.color.panel'))
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .enabled(!this.working && !this.picking)
+    .enabled(!this.picking)
   }
 
   @Builder
@@ -4011,25 +4426,39 @@ struct Index {
 
       Row({ space: 6 }) {
         if (!this.wide) {
-          Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-            Image($r('app.media.icon_list'))
-              .width(20)
-              .height(20)
-              .objectFit(ImageFit.Contain)
-              .fillColor($r('sys.color.icon_primary'))
+          Stack({ alignContent: Alignment.TopEnd }) {
+            Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
+              Image($r('app.media.icon_list'))
+                .width(20)
+                .height(20)
+                .objectFit(ImageFit.Contain)
+                .fillColor($r('sys.color.icon_primary'))
+            }
+            .id('openDrawer')
+            .width(40)
+            .height(40)
+            .padding(0)
+            .accessibilityText('打开侧边栏')
+            .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
+            .onClick(() => {
+              if (!this.picking) {
+                this.setDrawerOpen(true);
+              }
+            })
+            .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
+
+            if (this.hasOtherGeneratingChat()) {
+              Column()
+                .width(8)
+                .height(8)
+                .borderRadius(4)
+                .backgroundColor($r('app.color.accent'))
+                .margin({ top: 3, right: 3 })
+                .hitTestBehavior(HitTestMode.None)
+            }
           }
-          .id('openDrawer')
           .width(40)
           .height(40)
-          .padding(0)
-          .accessibilityText('打开侧边栏')
-          .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
-          .onClick(() => {
-            if (!this.working && !this.picking) {
-              this.setDrawerOpen(true);
-            }
-          })
-          .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
         }
 
         Column({ space: 1 }) {
@@ -4082,7 +4511,7 @@ struct Index {
         .height(40)
         .padding(0)
         .accessibilityText('对话大纲')
-        .enabled(!this.working && !this.picking)
+        .enabled(!this.picking)
         .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
         .onClick(() => { this.showMiniMap = true; })
         .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
@@ -4106,7 +4535,7 @@ struct Index {
           .height(40)
           .padding(0)
           .accessibilityText(this.ephemeralMode ? '退出临时对话' : '临时对话')
-          .enabled(!this.working && !this.picking)
+          .enabled(!this.picking)
           .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn(), this.ephemeralMode))
           .onClick(() => { this.activate('', !this.ephemeralMode); })
           .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn(), this.ephemeralMode))
@@ -4135,7 +4564,7 @@ struct Index {
         .height(40)
         .padding(0)
         .accessibilityText('更多操作')
-        .enabled(!this.working && !this.picking)
+        .enabled(!this.picking)
         .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
         .bindMenu([
           { value: '搜索本对话内容', action: () => {
@@ -4404,6 +4833,35 @@ struct Index {
           .borderRadius(12).backgroundColor($r('app.color.tint')).margin({ bottom: 6 })
       }
 
+      if (this.pendingPromptChatId.length > 0 && this.pendingPromptChatId !== this.workspace.activeConversation) {
+        Row({ space: 8 }) {
+          SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
+            .fontSize(15)
+            .fontColor([$r('app.color.accent')])
+          Text(this.pendingPromptLabel)
+            .fontSize(12)
+            .fontWeight(FontWeight.Medium)
+            .fontColor($r('app.color.ink'))
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          Button('前往处理')
+            .height(26)
+            .fontSize(11)
+            .borderRadius(13)
+            .padding({ left: 10, right: 10 })
+            .backgroundColor($r('app.color.accent'))
+            .fontColor($r('app.color.on_accent'))
+            .onClick(() => { this.activate(this.pendingPromptChatId); })
+        }
+        .width('94%')
+        .constraintSize({ maxWidth: 800 })
+        .padding({ left: 12, right: 10, top: 6, bottom: 6 })
+        .borderRadius(12)
+        .backgroundColor($r('app.color.tint'))
+        .margin({ bottom: 6 })
+      }
+
       if (this.askQuestionText) {
         Column({ space: 8 }) {
           Text('🤖 AI 向您确认：' + this.askQuestionText)
@@ -4421,7 +4879,13 @@ struct Index {
           Row({ space: 6 }) {
             TextInput({ text: this.askQuestionAnswer, placeholder: this.askQuestionPlaceholder || '输入回答...' })
               .layoutWeight(1).height(34).fontSize(12).borderRadius(8).backgroundColor($r('app.color.canvas'))
-              .onChange((v: string) => { this.askQuestionAnswer = v; })
+              .onChange((v: string) => {
+                this.askQuestionAnswer = v;
+                const curJob = this.genRegistry.get(this.workspace.activeConversation);
+                if (curJob) {
+                  curJob.askQuestionAnswer = v;
+                }
+              })
             Button('提交').height(34).fontSize(12).borderRadius(8)
               .backgroundColor($r('app.color.accent')).fontColor($r('app.color.on_accent'))
               .onClick(() => this.submitAskUserInput(this.askQuestionAnswer.trim()))
@@ -4685,14 +5149,14 @@ struct Index {
                           KelivoAvatarBadge({
                             brandId: this.persona().useAssistantAvatar
                               ? ''
-                              : this.activeBrandId(),
+                              : this.activeLiveBrandId(),
                             avatarText: this.persona().useAssistantAvatar ? (this.persona().avatar || '') : '',
-                            fallbackLetter: this.persona().useAssistantName ? this.persona().name : (this.activeModelId() || this.provider().name),
+                            fallbackLetter: this.persona().useAssistantName ? this.persona().name : this.activeLiveModelLabel(),
                             badgeSize: 22
                           })
                         }
                         if (this.chatDisplayCfg().showModelName) {
-                          Text(this.persona().useAssistantName ? this.persona().name : (this.activeModelId() || this.provider().name))
+                          Text(this.persona().useAssistantName ? this.persona().name : this.activeLiveModelLabel())
                             .fontSize(12)
                             .fontWeight(FontWeight.Medium)
                             .fontColor($r('app.color.ink'))
@@ -5360,6 +5824,7 @@ struct Index {
             c.overridePrompt = prompt || undefined;
             c.contextStartIndex = startIdx;
             this.workspace.conversations = this.workspace.conversations.slice();
+            this.modelConfigTick += 1;
             if (!c.ephemeral) this.persistAction();
           }
         },
@@ -5482,12 +5947,25 @@ struct Index {
             workspaceData: this.workspace,
             embeddedInNav: true,
             onWorkspaceRestored: async (nextWs: Workspace) => {
+              this.stopAllGenerations(true);
+              backgroundGenerationManager.stopAll();
               this.workspace = nextWs;
+              this.workspace.globalProxy = normalizeProxyConfig(this.workspace.globalProxy, true);
+              this.workspace.worldBooks = normalizeWorldBooks(this.workspace.worldBooks);
+              const normCards = normalizeInstructionCards(this.workspace.instructionCards);
+              this.workspace.instructionCards = normCards.length > 0 ? normCards : defaultInstructionCards();
+              const normPhrases = normalizeQuickPhrases(this.workspace.quickPhrases);
+              this.workspace.quickPhrases = normPhrases.length > 0 ? normPhrases : defaultQuickPhrases();
+              this.draftOverrideProviderId = '';
+              this.draftOverrideModel = '';
+              this.modelConfigTick += 1;
               this.searchOn = this.workspace.systemSettings?.searchEnabled === true;
               applySystemColorMode(this.host(), this.appearanceCfg().themeMode);
               syncWindowSystemBars(this.effectiveDark());
               syncWindowBackgroundColor(this.themeTokens().canvas);
               this.syncImmersiveStorage();
+              await this.syncGlobalProxyRuntime();
+              this.syncActiveGenerationView();
               await this.persist();
               await this.refreshStorageSize().catch(() => {});
               this.scrollDown(true);
@@ -5634,9 +6112,9 @@ struct Index {
           } else if (route === 'providers') {
             this.providerOpenProxy = false;
             this.navigateTo('providers');
-          } else if (route === 'providers_proxy') {
-            this.providerOpenProxy = true;
-            this.navigateTo('providers');
+          } else if (route === 'networkProxy' || route === 'providers_proxy') {
+            this.providerOpenProxy = false;
+            this.navigateTo('networkProxy');
           } else if (route === 'quickPhrases') {
             this.promptTabInit = 2;
             this.navigateTo('promptTools');
@@ -5678,6 +6156,7 @@ struct Index {
             embeddedInNav: true,
             onSaveDefaults: async (next: ModelDefaults) => {
               this.workspace.modelDefaults = next;
+              this.modelConfigTick += 1;
               await this.persist();
             },
             onToggleChatSuggestions: async (enabled: boolean) => {
@@ -5731,27 +6210,72 @@ struct Index {
       .onShown(() => { this.syncActiveRouteFromStack(); })
       .onHidden(() => { this.syncActiveRouteFromStack(); })
       .onBackPressed(() => this.dismissTopOverlay())
+    } else if (name === 'networkProxy') {
+      NavDestination() {
+        Column() {
+          NetworkProxyPanel({
+            globalProxy: this.workspace.globalProxy || defaultGlobalProxy(),
+            initialPassword: this.globalProxyPasswordPlain,
+            immersiveLightEnabled: this.immersiveLightOn(),
+            embeddedInNav: true,
+            onSaveGlobalProxy: async (next: ProxyConfig, passwordPlain: string) => {
+              const normalized = normalizeProxyConfig(next, true);
+              const existingRef = this.workspace.globalProxy?.passwordRef || normalized.passwordRef || '';
+              if (passwordPlain.length > 0) {
+                const ref = existingRef || newId();
+                await storeKey(ref, passwordPlain);
+                normalized.passwordRef = ref;
+              } else {
+                if (existingRef) {
+                  await forgetKey(existingRef).catch(() => {});
+                }
+                normalized.passwordRef = undefined;
+              }
+              this.workspace.globalProxy = normalized;
+              this.globalProxyPasswordPlain = passwordPlain;
+              setGlobalHttpProxy(normalized, passwordPlain);
+              await this.persist();
+            },
+            onClose: () => { this.navigateBack(); }
+          })
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ left: this.winLeftInset, right: this.winRightInset })
+        .backgroundColor(Color.Transparent)
+      }
+      .hideBackButton(true)
+      .backgroundColor(this.themeTokens().canvas)
+      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+      .title(
+        { builder: () => { this.navSubHeader('网络代理'); }, height: 56 + this.winTopInset },
+        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
+      )
+      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
+      .onShown(() => { this.syncActiveRouteFromStack(); })
+      .onHidden(() => { this.syncActiveRouteFromStack(); })
+      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'promptTools') {
       NavDestination() {
         Column() {
           PromptToolsPanel({
-            worldBooks: this.workspace.worldBooks || [],
-            instructionCards: this.workspace.instructionCards || defaultInstructionCards(),
+            worldBooks: normalizeWorldBooks(this.workspace.worldBooks || []),
+            instructionCards: normalizeInstructionCards(this.workspace.instructionCards || defaultInstructionCards()),
             activeInstructionIds: this.workspace.activeInstructionIds || [],
-            quickPhrases: this.workspace.quickPhrases || defaultQuickPhrases(),
+            quickPhrases: normalizeQuickPhrases(this.workspace.quickPhrases || defaultQuickPhrases()),
             initialTab: this.promptTabInit,
             embeddedInNav: true,
             onSaveWorldBooks: async (books: WorldBook[]) => {
-              this.workspace.worldBooks = books;
+              this.workspace.worldBooks = normalizeWorldBooks(books);
               await this.persist();
             },
             onSaveInstructionCards: async (cards: InstructionCard[], activeIds: string[]) => {
-              this.workspace.instructionCards = cards;
+              this.workspace.instructionCards = normalizeInstructionCards(cards);
               this.workspace.activeInstructionIds = activeIds;
               await this.persist();
             },
             onSaveQuickPhrases: async (phrases: QuickPhrase[]) => {
-              this.workspace.quickPhrases = phrases;
+              this.workspace.quickPhrases = normalizeQuickPhrases(phrases);
               await this.persist();
             },
             onInsertPhrase: (content: string) => {
@@ -5769,7 +6293,7 @@ struct Index {
       .backgroundColor(this.themeTokens().canvas)
       .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
       .title(
-        { builder: () => { this.navSubHeader('世界书 · 指令卡 · 快捷短语'); }, height: 56 + this.winTopInset },
+        { builder: () => { this.navSubHeader(this.promptToolsNavTitle()); }, height: 56 + this.winTopInset },
         ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), false)
       )
       .systemTransition(SystemMotion.navTransition(this.reduceMotion))
@@ -5817,6 +6341,7 @@ struct Index {
         },
         onSaveModelDefaults: async (next: ModelDefaults) => {
           this.workspace.modelDefaults = next;
+          this.modelConfigTick += 1;
           await this.persist();
         },
         onClearTraces: async () => {
@@ -6239,6 +6764,7 @@ struct Index {
                 ? this.workspace.providers.map((p: Provider): Provider => (p.id === prov.id ? prov : p))
                 : [...this.workspace.providers, prov];
               this.workspace.activeProvider = prov.id;
+              this.modelConfigTick += 1;
               await this.persist();
             },
             onClose: () => {

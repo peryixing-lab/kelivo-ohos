@@ -9,7 +9,9 @@ import {
   RequestLogEntry,
   checkEndpoint,
   defaultModelSpec,
-  findProviderModelSpec
+  extractUrlHost,
+  findProviderModelSpec,
+  normalizeProxyConfig
 } from './Models';
 import {
   ChatCall,
@@ -68,18 +70,265 @@ function statusError(status: number, body: string): HttpStatusError {
   return new HttpStatusError(status, '服务商返回 HTTP ' + status + (detail ? ' · ' + detail : ''), body);
 }
 
-export function buildHttpProxy(proxy?: ProxyConfig, password?: string): http.HttpProxy | undefined {
-  if (!proxy || !proxy.enabled || !proxy.host.trim() || proxy.port <= 0) return undefined;
+export interface ResolvedProxySelection {
+  proxy: ProxyConfig;
+  password: string;
+  source: 'provider' | 'global';
+}
+
+export interface ProxyTestResult {
+  ok: boolean;
+  status: number;
+  elapsedMs: number;
+  error: string;
+}
+
+let globalHttpProxyConfig: ProxyConfig | undefined = undefined;
+let globalHttpProxyPassword: string = '';
+
+export function setGlobalHttpProxy(proxy?: ProxyConfig, password: string = ''): void {
+  globalHttpProxyConfig = proxy ? normalizeProxyConfig(proxy, true) : undefined;
+  globalHttpProxyPassword = password || '';
+}
+
+export function getGlobalHttpProxy(): ProxyConfig | undefined {
+  return globalHttpProxyConfig;
+}
+
+function normalizeBypassHost(host: string): string {
+  let h = host.trim().toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']') && h.length > 2) {
+    h = h.slice(1, h.length - 1);
+  }
+  const zoneIdx = h.indexOf('%');
+  if (zoneIdx > 0) {
+    h = h.slice(0, zoneIdx);
+  }
+  if (h.endsWith('.')) {
+    h = h.slice(0, h.length - 1);
+  }
+  return h;
+}
+
+function parseIpv4Uint32(ip: string): number | undefined {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return undefined;
+  let value = 0;
+  for (let i = 0; i < 4; i++) {
+    if (!/^\d{1,3}$/.test(parts[i])) return undefined;
+    const oct = Number(parts[i]);
+    if (!Number.isInteger(oct) || oct < 0 || oct > 255) return undefined;
+    value = ((value * 256) + oct) >>> 0;
+  }
+  return value;
+}
+
+export function shouldBypassProxy(urlOrHost: string, bypassRules?: string): boolean {
+  if (!bypassRules || bypassRules.trim().length === 0) return false;
+  const rawHost = urlOrHost.includes('://') || urlOrHost.includes('/')
+    ? extractUrlHost(urlOrHost)
+    : urlOrHost;
+  const h = normalizeBypassHost(rawHost);
+  if (!h) return false;
+
+  const rules = bypassRules.split(/[,;\s]+/);
+  const hIpv4 = parseIpv4Uint32(h);
+  for (let i = 0; i < rules.length; i++) {
+    const r = rules[i].trim().toLowerCase();
+    if (!r) continue;
+    if (r === '*') return true;
+    const slashIdx = r.indexOf('/');
+    if (slashIdx > 0 && hIpv4 !== undefined) {
+      const netStr = r.slice(0, slashIdx);
+      const prefixStr = r.slice(slashIdx + 1);
+      const netIp = parseIpv4Uint32(netStr);
+      const prefix = /^\d+$/.test(prefixStr) ? Number(prefixStr) : -1;
+      if (netIp !== undefined && prefix >= 0 && prefix <= 32) {
+        const mask = prefix === 0 ? 0 : ((0xFFFFFFFF << (32 - prefix)) >>> 0);
+        if (((hIpv4 & mask) >>> 0) === ((netIp & mask) >>> 0)) {
+          return true;
+        }
+        continue;
+      }
+    }
+    if (r.startsWith('*.') && r.length > 2) {
+      const suffix = normalizeBypassHost(r.slice(2));
+      if (suffix && (h === suffix || h.endsWith('.' + suffix))) {
+        return true;
+      }
+      continue;
+    }
+    if (r.startsWith('.') && r.length > 1) {
+      const suffix = normalizeBypassHost(r.slice(1));
+      if (suffix && (h === suffix || h.endsWith('.' + suffix))) {
+        return true;
+      }
+      continue;
+    }
+    if (normalizeBypassHost(r) === h) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function parseProxyExclusionList(bypassRules?: string): string[] {
+  if (!bypassRules || bypassRules.trim().length === 0) return [];
+  const out: string[] = [];
+  const rules = bypassRules.split(/[,;\s]+/);
+  for (let i = 0; i < rules.length; i++) {
+    const r = rules[i].trim();
+    if (!r || r === '*') continue;
+    if (r.includes('/') || r.startsWith('*.')) continue;
+    out.push(r.startsWith('.') ? r.slice(1) : r);
+  }
+  return out;
+}
+
+export function resolveEffectiveProxy(
+  proxy?: ProxyConfig,
+  password?: string,
+  targetUrl?: string
+): ResolvedProxySelection | undefined {
+  if (proxy && proxy.enabled && proxy.host && proxy.host.trim().length > 0 && proxy.port > 0) {
+    if (targetUrl && proxy.bypass && shouldBypassProxy(targetUrl, proxy.bypass)) {
+      return undefined;
+    }
+    return {
+      proxy: normalizeProxyConfig(proxy),
+      password: password || '',
+      source: 'provider'
+    };
+  }
+  if (globalHttpProxyConfig && globalHttpProxyConfig.enabled &&
+    globalHttpProxyConfig.host.trim().length > 0 && globalHttpProxyConfig.port > 0) {
+    if (targetUrl && shouldBypassProxy(targetUrl, globalHttpProxyConfig.bypass)) {
+      return undefined;
+    }
+    return {
+      proxy: globalHttpProxyConfig,
+      password: globalHttpProxyPassword,
+      source: 'global'
+    };
+  }
+  return undefined;
+}
+
+function buildDirectHttpProxyConfig(proxy: ProxyConfig, password?: string): http.HttpProxy {
   const cfg: http.HttpProxy = {
     host: proxy.host.trim(),
     port: proxy.port,
-    exclusionList: []
+    exclusionList: parseProxyExclusionList(proxy.bypass)
   };
-  if (proxy.username && proxy.username.trim()) {
+  if (proxy.username && proxy.username.trim().length > 0) {
     cfg.username = proxy.username.trim();
-    if (password) cfg.password = password;
+    cfg.password = password || '';
   }
   return cfg;
+}
+
+export function buildHttpProxy(proxy?: ProxyConfig, password?: string, targetUrl?: string): http.HttpProxy | undefined {
+  const resolved = resolveEffectiveProxy(proxy, password, targetUrl);
+  if (!resolved || resolved.proxy.type === 'socks5') return undefined;
+  return buildDirectHttpProxyConfig(resolved.proxy, resolved.password);
+}
+
+export function applyProxyToHttpOptions(
+  opts: http.HttpRequestOptions,
+  targetUrl?: string,
+  proxy?: ProxyConfig,
+  password?: string
+): void {
+  const resolved = resolveEffectiveProxy(proxy, password, targetUrl);
+  if (!resolved) return;
+  if (resolved.proxy.type === 'socks5') {
+    const sCfg: http.Socks5Proxy = {
+      host: resolved.proxy.host.trim(),
+      port: resolved.proxy.port,
+      exclusionList: parseProxyExclusionList(resolved.proxy.bypass)
+    };
+    if (resolved.proxy.username && resolved.proxy.username.trim().length > 0) {
+      sCfg.username = resolved.proxy.username.trim();
+      sCfg.password = resolved.password || '';
+    }
+    opts.usingSocks5Proxy = sCfg;
+    return;
+  }
+  opts.usingProxy = buildDirectHttpProxyConfig(resolved.proxy, resolved.password);
+}
+
+export async function testProxyConnection(
+  proxy: ProxyConfig,
+  password: string,
+  testUrl: string
+): Promise<ProxyTestResult> {
+  const host = (proxy.host || '').trim();
+  const port = Math.floor(proxy.port || 0);
+  const url = (testUrl || '').trim();
+  if (!host) {
+    return { ok: false, status: 0, elapsedMs: 0, error: '请填写代理服务器地址' };
+  }
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+    return { ok: false, status: 0, elapsedMs: 0, error: '请输入有效端口 (1-65535)' };
+  }
+  if (!/^https?:\/\/\S+$/i.test(url)) {
+    return { ok: false, status: 0, elapsedMs: 0, error: '请输入以 http:// 或 https:// 开头的测试地址' };
+  }
+  const req = http.createHttp();
+  const start = Date.now();
+  try {
+    const forcedProxy: ProxyConfig = normalizeProxyConfig(proxy, false);
+    forcedProxy.enabled = true;
+    const opts: http.HttpRequestOptions = {
+      method: http.RequestMethod.GET,
+      expectDataType: http.HttpDataType.STRING,
+      connectTimeout: 8000,
+      readTimeout: 10000,
+      maxRedirects: 5,
+      usingCache: false
+    };
+    if (forcedProxy.type === 'socks5') {
+      const sCfg: http.Socks5Proxy = {
+        host,
+        port,
+        exclusionList: []
+      };
+      if (forcedProxy.username && forcedProxy.username.length > 0) {
+        sCfg.username = forcedProxy.username;
+        sCfg.password = password || '';
+      }
+      opts.usingSocks5Proxy = sCfg;
+    } else {
+      const hCfg: http.HttpProxy = {
+        host,
+        port,
+        exclusionList: []
+      };
+      if (forcedProxy.username && forcedProxy.username.length > 0) {
+        hCfg.username = forcedProxy.username;
+        hCfg.password = password || '';
+      }
+      opts.usingProxy = hCfg;
+    }
+    const resp = await req.request(url, opts);
+    const elapsedMs = Math.max(1, Date.now() - start);
+    const ok = resp.responseCode >= 200 && resp.responseCode < 400;
+    return {
+      ok,
+      status: resp.responseCode,
+      elapsedMs,
+      error: ok ? '' : ('HTTP ' + resp.responseCode)
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      status: 0,
+      elapsedMs: Math.max(1, Date.now() - start),
+      error: (e as Error).message || String(e)
+    };
+  } finally {
+    req.destroy();
+  }
 }
 
 export function redactUrlSecrets(url: string): string {
@@ -101,7 +350,6 @@ export async function fetchModels(provider: Provider, key: string, proxyPassword
   const names: string[] = [];
   let next = base;
   const seen = new Set<string>();
-  const proxyCfg = buildHttpProxy(provider.proxy, proxyPassword);
   while (next && !seen.has(next)) {
     seen.add(next);
     const req = http.createHttp();
@@ -115,7 +363,7 @@ export async function fetchModels(provider: Provider, key: string, proxyPassword
         maxRedirects: 5,
         usingCache: false
       };
-      if (proxyCfg) opts.usingProxy = proxyCfg;
+      applyProxyToHttpOptions(opts, next, provider.proxy, proxyPassword);
       const response = await req.request(next, opts);
       const raw = response.result as string;
       if (response.responseCode < 200 || response.responseCode >= 300) throw statusError(response.responseCode, raw);
@@ -149,8 +397,7 @@ export async function fetchOllamaCapabilities(baseUrl: string, modelId: string, 
       readTimeout: 10000,
       usingCache: false
     };
-    const pCfg = buildHttpProxy(proxy);
-    if (pCfg) opts.usingProxy = pCfg;
+    applyProxyToHttpOptions(opts, root + '/api/show', proxy);
     const resp = await req.request(root + '/api/show', opts);
     if (resp.responseCode >= 200 && resp.responseCode < 300) {
       const parsed = JSON.parse(resp.result as string) as OllamaShowResp;
@@ -186,8 +433,7 @@ export async function fetchProviderBalance(provider: Provider, key: string, prox
       readTimeout: 15000,
       usingCache: false
     };
-    const pCfg = buildHttpProxy(provider.proxy, proxyPassword);
-    if (pCfg) opts.usingProxy = pCfg;
+    applyProxyToHttpOptions(opts, url, provider.proxy, proxyPassword);
     const resp = await req.request(url, opts);
     const raw = resp.result as string;
     if (resp.responseCode < 200 || resp.responseCode >= 300) throw statusError(resp.responseCode, raw);
@@ -403,8 +649,7 @@ export class ChatStream {
           usingCache: false,
           maxRedirects: 5
         };
-        const proxyCfg = buildHttpProxy(options?.proxy, options?.proxyPassword);
-        if (proxyCfg) reqOpts.usingProxy = proxyCfg;
+        applyProxyToHttpOptions(reqOpts, call.address, options?.proxy, options?.proxyPassword);
         req.requestInStream(call.address, reqOpts)
           .then((code: number) => { status = code; complete(); })
           .catch((e: Error) => fail(e));
@@ -502,8 +747,7 @@ export async function generateImages(
       readTimeout: 90000,
       usingCache: false
     };
-    const proxyCfg = buildHttpProxy(provider.proxy, proxyPassword);
-    if (proxyCfg) opts.usingProxy = proxyCfg;
+    applyProxyToHttpOptions(opts, call.address, provider.proxy, proxyPassword);
     const resp = await req.request(call.address, opts);
     const raw = resp.result as string;
     if (resp.responseCode < 200 || resp.responseCode >= 300) throw statusError(resp.responseCode, raw);

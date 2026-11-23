@@ -9,6 +9,7 @@ import {
   MemoryEntry,
   MemorySettings,
   Persona,
+  QuickPhrase,
   RegexRule,
   ScheduledTask,
   SearchServiceConfig,
@@ -22,16 +23,25 @@ import {
   initialWorkspace,
   isProviderConfigured,
   normalizeAppearanceConfig,
+  normalizeInstructionCards,
+  normalizeQuickPhrases,
+  normalizeWorldBooks,
   preset,
   resolveActiveModel
 } from '../main/ets/core/Models';
 import {
   activateWorldBooks,
   applyRegexRules,
+  assembleInstructionCards,
   buildAssembledPrompt,
   expandPromptTemplates,
   parseWorldBookImportJson
 } from '../main/ets/core/PromptEngine';
+import {
+  resolveEffectiveProxy,
+  setGlobalHttpProxy,
+  shouldBypassProxy
+} from '../main/ets/core/ChatClient';
 import {
   SmartAddDecision,
   applySmartAddDecisions,
@@ -128,6 +138,8 @@ import {
   redactEnvSecrets,
   resolveSafeWorkspacePath
 } from '../main/ets/core/WorkspaceDiff';
+import { GenerationTaskTracker } from '../main/ets/core/BackgroundGeneration';
+import { ChatGenerationJob, GenerationSessionRegistry } from '../main/ets/core/GenerationSession';
 import {
   buildSkillsPromptSummary,
   defaultBuiltinSkills,
@@ -1707,6 +1719,299 @@ export default function localUnitTest() {
         25
       );
       expect(compactXml).assertContain('total="40" shown="25"');
+    });
+
+    it('background_generation_task_tracker_lifecycle_and_progress', 0, () => {
+      const tracker = new GenerationTaskTracker();
+      expect(tracker.activeCount()).assertEqual(0);
+      expect(tracker.buildLiveProgressSummary(1000).activeCount).assertEqual(0);
+
+      tracker.register('chat-a', '周报整理', 1000);
+      expect(tracker.activeCount()).assertEqual(1);
+      expect(tracker.has('chat-a')).assertTrue();
+
+      tracker.update('chat-a', '周报整理', 'searching', 0, 2000);
+      const sSearch = tracker.buildLiveProgressSummary(2000);
+      expect(sSearch.title).assertEqual('正在后台生成 · 周报整理');
+      expect(sSearch.detail).assertEqual('正在联网检索…');
+      expect(sSearch.progressValue >= 1 && sSearch.progressValue <= 95).assertTrue();
+
+      tracker.update('chat-a', '周报整理', 'thinking', 120, 4000);
+      const sThink = tracker.buildLiveProgressSummary(4000);
+      expect(sThink.detail).assertEqual('正在深度思考 · 已生成 120 字');
+      expect(sThink.progressValue >= sSearch.progressValue).assertTrue();
+
+      tracker.update('chat-a', '周报整理', 'tool', 120, 5000);
+      expect(tracker.buildLiveProgressSummary(5000).detail).assertEqual('正在执行工具…');
+
+      tracker.update('chat-a', '周报整理', 'image', 120, 6000);
+      expect(tracker.buildLiveProgressSummary(6000).detail).assertEqual('正在生成图片…');
+
+      tracker.update('chat-a', '周报整理', 'streaming', 640, 8000);
+      const sStream = tracker.buildLiveProgressSummary(8000);
+      expect(sStream.detail).assertEqual('已生成 640 字');
+      expect(sStream.progressValue >= 1 && sStream.progressValue <= 95).assertTrue();
+
+      // Multi-task aggregation
+      tracker.register('chat-b', '代码分析', 9000);
+      tracker.update('chat-b', '代码分析', 'streaming', 360, 10000);
+      const sMulti = tracker.buildLiveProgressSummary(10000);
+      expect(sMulti.activeCount).assertEqual(2);
+      expect(sMulti.title).assertEqual('2 个对话正在后台生成');
+      expect(sMulti.detail).assertEqual('已累计生成 1000 字');
+      expect(sMulti.progressValue >= 1 && sMulti.progressValue <= 95).assertTrue();
+
+      // Progress remains bounded <= 95 even under high elapsed time, large char count, and many ticks
+      tracker.update('chat-b', '代码分析', 'streaming', 500000, 9999999);
+      const sMax = tracker.buildLiveProgressSummary(9999999);
+      expect(sMax.progressValue >= 85 && sMax.progressValue <= 95).assertTrue();
+      let sCapped = sMax;
+      for (let i = 0; i < 20; i++) {
+        sCapped = tracker.buildLiveProgressSummary(9999999 + i * 1000);
+      }
+      expect(sCapped.progressValue).assertEqual(95);
+
+      tracker.unregister('chat-a');
+      expect(tracker.activeCount()).assertEqual(1);
+      expect(tracker.has('chat-a')).assertFalse();
+      expect(tracker.has('chat-b')).assertTrue();
+
+      tracker.unregister('chat-b');
+      expect(tracker.activeCount()).assertEqual(0);
+    });
+
+    it('generation_session_registry_isolates_concurrent_chats_and_prompts', 0, () => {
+      const reg = new GenerationSessionRegistry();
+      const jobA = new ChatGenerationJob('chat-a', '助手A对话', 'msg-a', '', 'gpt-5', 'OpenAI', 'openai', 'default');
+      jobA.liveText = '正在输出A';
+      jobA.liveReasoning = '思考A';
+      jobA.liveThinking = true;
+      jobA.liveReasoningMs = 1500;
+
+      const jobB = new ChatGenerationJob('chat-b', '助手B对话', 'msg-b', 'msg-old-b', 'claude-4', 'Anthropic', 'anthropic', 'coder');
+      jobB.liveText = '正在输出B';
+      jobB.fetchingSources = true;
+
+      reg.start(jobA);
+      reg.start(jobB);
+      expect(reg.hasAny()).assertTrue();
+      expect(reg.isGenerating('chat-a')).assertTrue();
+      expect(reg.isGenerating('chat-b')).assertTrue();
+      expect(reg.hasOtherGenerating('chat-a')).assertTrue();
+      expect(reg.hasOtherGenerating('')).assertTrue();
+      expect(reg.activeChatIds().length).assertEqual(2);
+
+      // View projections remain isolated when switching chats
+      const projA = reg.projectForChat('chat-a');
+      expect(projA.working).assertTrue();
+      expect(projA.liveMessageId).assertEqual('msg-a');
+      expect(projA.liveText).assertEqual('正在输出A');
+      expect(projA.liveThinking).assertTrue();
+      expect(projA.regeneratingMsgId).assertEqual('');
+
+      const projB = reg.projectForChat('chat-b');
+      expect(projB.working).assertTrue();
+      expect(projB.liveMessageId).assertEqual('msg-b');
+      expect(projB.liveText).assertEqual('正在输出B');
+      expect(projB.fetchingSources).assertTrue();
+      expect(projB.regeneratingMsgId).assertEqual('msg-old-b');
+
+      const projEmpty = reg.projectForChat('');
+      expect(projEmpty.working).assertFalse();
+      expect(projEmpty.liveText).assertEqual('');
+
+      // Pending prompt detection across chats
+      let approvalChoice = '';
+      jobA.pendingApprovalTool = 'workspace_write';
+      jobA.pendingApprovalArgs = '{"path":"a.txt"}';
+      jobA.approvalResolver = (choice: 'allow_once' | 'allow_all' | 'deny'): void => {
+        approvalChoice = choice;
+      };
+      expect(reg.findOtherPendingPrompt('chat-a') === undefined).assertTrue();
+      const promptForB = reg.findOtherPendingPrompt('chat-b');
+      expect(promptForB !== undefined).assertTrue();
+      expect(promptForB!.chatId).assertEqual('chat-a');
+      expect(promptForB!.label).assertContain('等待工具授权');
+
+      // Stop only chat-a while chat-b continues
+      expect(reg.stopChat('chat-a')).assertTrue();
+      expect(jobA.stopped).assertTrue();
+      expect(approvalChoice).assertEqual('deny');
+      expect(jobB.stopped).assertFalse();
+      reg.finish('chat-a', jobA);
+      expect(reg.isGenerating('chat-a')).assertFalse();
+      expect(reg.isGenerating('chat-b')).assertTrue();
+      expect(reg.hasOtherGenerating('chat-b')).assertFalse();
+
+      // Per-chat error retention across switches, cleared on new start
+      reg.setError('chat-c', '网络超时');
+      expect(reg.projectForChat('chat-b').lastSendError).assertEqual('');
+      expect(reg.projectForChat('chat-c').lastSendError).assertEqual('网络超时');
+      expect(reg.projectForChat('chat-c').lastSendErrorChatId).assertEqual('chat-c');
+
+      const jobC = new ChatGenerationJob('chat-c', '对话C', 'msg-c', '', 'gpt-5', 'OpenAI', 'openai', 'default');
+      reg.start(jobC);
+      expect(reg.getError('chat-c')).assertEqual('');
+
+      // Deleting an active chat marks deleted, stops job, and clears error
+      let askResolved = 'unset';
+      jobB.askQuestionText = '是否继续？';
+      jobB.askUserResolver = (val: string): void => {
+        askResolved = val;
+      };
+      reg.markDeletedAndStop('chat-b');
+      expect(jobB.deleted).assertTrue();
+      expect(jobB.stopped).assertTrue();
+      expect(askResolved).assertEqual('');
+
+      reg.stopChat('chat-c');
+      reg.finish('chat-b', jobB);
+      reg.finish('chat-c', jobC);
+      expect(reg.hasAny()).assertFalse();
+    });
+
+    it('instruction_injection_android_backup_normalization_and_assembly', 0, () => {
+      // Simulate Kelivo Android/Flutter backup payload: { id, title, prompt, group } without description/content
+      const androidCardsRaw = '[{"id":"c1","title":"角色设定卡","prompt":"严格按角色设定回复。","group":"RP"},{"id":"c2","title":"","prompt":"保持输出简洁。"}]';
+      const androidPayload: Record<string, Object> = {};
+      androidPayload['instruction_injections_v1'] = androidCardsRaw;
+      const androidSettings = JSON.stringify(androidPayload);
+
+      const parsed = parseAndroidSettingsJson(androidSettings);
+      expect(parsed.instructionCards !== undefined).assertTrue();
+      expect(parsed.instructionCards!.length).assertEqual(2);
+      expect(parsed.instructionCards![0].content).assertEqual('严格按角色设定回复。');
+      expect(parsed.instructionCards![0].description).assertEqual('');
+      expect(parsed.instructionCards![0].group).assertEqual('RP');
+      expect(parsed.instructionCards![0].description.length).assertEqual(0);
+      expect(parsed.instructionCards![1].title).assertEqual('学习模式');
+      expect(parsed.instructionCards![1].content).assertEqual('保持输出简洁。');
+
+      // Direct call to normalizeInstructionCards with legacy partial record shape
+      const rawLegacy = JSON.parse('[{"id":"x1","title":"旧卡","prompt":"正文提示","group":"分组A"}]') as InstructionCard[];
+      const normed = normalizeInstructionCards(rawLegacy);
+      expect(normed.length).assertEqual(1);
+      expect(normed[0].description).assertEqual('');
+      expect(normed[0].content).assertEqual('正文提示');
+      expect(normed[0].group).assertEqual('分组A');
+
+      // Prompt assembly works on both normalized cards and raw partial cards without throwing
+      const assembled = assembleInstructionCards(normed, ['x1']);
+      expect(assembled).assertEqual('[旧卡]\n正文提示');
+      const assembledRaw = assembleInstructionCards(rawLegacy, ['x1']);
+      expect(assembledRaw).assertEqual('[旧卡]\n正文提示');
+
+      // Export back to Android settings preserves both Android (prompt/group) and Harmony (content/description) keys
+      const ws = initialWorkspace();
+      ws.instructionCards = parsed.instructionCards;
+      const exported = JSON.parse(buildAndroidSettingsJson(ws, defaultBackupScope(), {})) as Record<string, Object>;
+      const exportedCards = JSON.parse(exported['instruction_injections_v1'] as string) as Record<string, Object>[];
+      expect(exportedCards.length).assertEqual(2);
+      expect(exportedCards[0]['prompt']).assertEqual('严格按角色设定回复。');
+      expect(exportedCards[0]['group']).assertEqual('RP');
+      expect(exportedCards[0]['content']).assertEqual('严格按角色设定回复。');
+
+      // QuickPhrase & WorldBook Android shapes normalize safely
+      const qpNorm = normalizeQuickPhrases(
+        JSON.parse('[{"id":"q1","title":"润色","content":"请润色：","isGlobal":true}]') as QuickPhrase[]
+      );
+      expect(qpNorm[0].scope).assertEqual('global');
+      const wbNorm = normalizeWorldBooks(
+        JSON.parse('[{"id":"wb1","name":"测试书","enabled":true,"entries":[{"id":"e1","name":"词条","position":"BEFORE_SYSTEM_PROMPT","role":"USER","content":"世界背景","keywords":["触发"],"injectDepth":2,"constantActive":true}]}]') as WorldBook[]
+      );
+      expect(wbNorm.length).assertEqual(1);
+      expect(wbNorm[0].entries[0].position).assertEqual('before_system');
+      expect(wbNorm[0].entries[0].role).assertEqual('user');
+      expect(wbNorm[0].entries[0].keys[0]).assertEqual('触发');
+      expect(wbNorm[0].entries[0].depth).assertEqual(2);
+      expect(wbNorm[0].entries[0].alwaysActive).assertTrue();
+    });
+
+    it('network_proxy_priority_bypass_and_backup_roundtrip', 0, () => {
+      const bypass = 'localhost,127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,*.local,::1';
+      expect(shouldBypassProxy('http://localhost:11434/v1/chat/completions', bypass)).assertTrue();
+      expect(shouldBypassProxy('http://127.0.0.1:8080/models', bypass)).assertTrue();
+      expect(shouldBypassProxy('http://192.168.31.10:11434/v1', bypass)).assertTrue();
+      expect(shouldBypassProxy('http://172.20.1.5:8000/v1', bypass)).assertTrue();
+      expect(shouldBypassProxy('http://macbook.local:11434/v1', bypass)).assertTrue();
+      expect(shouldBypassProxy('https://api.openai.com/v1/chat/completions', bypass)).assertFalse();
+
+      // Configure global proxy and test precedence against provider proxy
+      setGlobalHttpProxy({
+        enabled: true,
+        type: 'socks5',
+        host: '127.0.0.1',
+        port: 7890,
+        username: 'u1',
+        bypass
+      }, 'p1');
+
+      // Bypassed local URL skips global proxy
+      const localRes = resolveEffectiveProxy(undefined, '', 'http://192.168.1.50:11434/v1/models');
+      expect(localRes === undefined).assertTrue();
+
+      // External URL uses global proxy when provider proxy is unset/disabled
+      const globalRes = resolveEffectiveProxy(
+        { enabled: false, host: '127.0.0.1', port: 9999 },
+        '',
+        'https://api.openai.com/v1/chat/completions'
+      );
+      expect(globalRes !== undefined).assertTrue();
+      expect(globalRes!.source).assertEqual('global');
+      expect(globalRes!.proxy.type).assertEqual('socks5');
+      expect(globalRes!.proxy.port).assertEqual(7890);
+
+      // Enabled provider proxy overrides global proxy
+      const provRes = resolveEffectiveProxy(
+        { enabled: true, type: 'http', host: '10.0.0.2', port: 8888, username: 'pu' },
+        'ppass',
+        'https://api.openai.com/v1/chat/completions'
+      );
+      expect(provRes !== undefined).assertTrue();
+      expect(provRes!.source).assertEqual('provider');
+      expect(provRes!.proxy.host).assertEqual('10.0.0.2');
+      expect(provRes!.proxy.port).assertEqual(8888);
+      expect(provRes!.password).assertEqual('ppass');
+
+      // Backup round-trip for globalProxy via Android & scoped restore
+      const ws = initialWorkspace();
+      ws.globalProxy = {
+        enabled: true,
+        type: 'socks5',
+        host: 'proxy.example.com',
+        port: 1080,
+        username: 'alice',
+        passwordRef: 'gp_sec_1',
+        bypass: 'localhost,192.168.0.0/16'
+      };
+      const secMap: Record<string, string> = {};
+      secMap['gp_sec_1'] = 's3cr3t';
+      const exportedRaw = buildAndroidSettingsJson(ws, defaultBackupScope(), secMap);
+      const exportedMap = JSON.parse(exportedRaw) as Record<string, Object>;
+      expect(exportedMap['global_proxy_enabled_v1']).assertEqual(true);
+      expect(exportedMap['global_proxy_type_v1']).assertEqual('socks5');
+      expect(exportedMap['global_proxy_host_v1']).assertEqual('proxy.example.com');
+      expect(exportedMap['global_proxy_port_v1']).assertEqual('1080');
+      expect(exportedMap['global_proxy_password_v1']).assertEqual('s3cr3t');
+
+      const imported = parseAndroidSettingsJson(exportedRaw);
+      expect(imported.globalProxy !== undefined).assertTrue();
+      expect(imported.globalProxy!.enabled).assertTrue();
+      expect(imported.globalProxy!.type).assertEqual('socks5');
+      expect(imported.globalProxy!.host).assertEqual('proxy.example.com');
+      expect(imported.globalProxy!.port).assertEqual(1080);
+      expect(imported.globalProxy!.bypass).assertEqual('localhost,192.168.0.0/16');
+
+      let seq = 0;
+      const restored = applyScopedRestore(initialWorkspace(), imported, defaultBackupScope(), 'overwrite', () => 'r_' + (++seq));
+      expect(restored.workspace.globalProxy?.enabled).assertTrue();
+      expect(restored.workspace.globalProxy?.type).assertEqual('socks5');
+      const restoredPassRef = restored.workspace.globalProxy?.passwordRef || '';
+      expect(restoredPassRef.length > 0).assertTrue();
+      expect(restored.secretsToStore[restoredPassRef]).assertEqual('s3cr3t');
+
+      // Clear module-level global proxy state
+      setGlobalHttpProxy(undefined, '');
     });
   });
 }

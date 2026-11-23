@@ -33,7 +33,9 @@ export struct PromptToolsPanel {
   @State showImportBox: boolean = false;
   @State importJsonText: string = '';
   @State newBookName: string = '';
+  @State editingCardId: string = '';
   @State newCardTitle: string = '';
+  @State newCardGroup: string = '';
   @State newCardDesc: string = '';
   @State newCardContent: string = '';
   @State newPhraseTitle: string = '';
@@ -174,8 +176,51 @@ export struct PromptToolsPanel {
     return '系统后';
   }
 
+  private safeCardTitle(card: InstructionCard): string {
+    return typeof card.title === 'string' && card.title.trim().length > 0 ? card.title.trim() : '未命名指令';
+  }
+
+  private safeCardDesc(card: InstructionCard): string {
+    return typeof card.description === 'string' ? card.description.trim() : '';
+  }
+
+  private safeCardGroup(card: InstructionCard): string {
+    return typeof card.group === 'string' ? card.group.trim() : '';
+  }
+
+  private safeCardContent(card: InstructionCard): string {
+    if (typeof card.content === 'string' && card.content.length > 0) {
+      return card.content;
+    }
+    if (typeof card.prompt === 'string') {
+      return card.prompt;
+    }
+    return '';
+  }
+
+  private isCardActive(id: string): boolean {
+    return Array.isArray(this.activeInstructionIds) && this.activeInstructionIds.indexOf(id) >= 0;
+  }
+
+  private startEditCard(card: InstructionCard): void {
+    this.editingCardId = card.id;
+    this.newCardTitle = this.safeCardTitle(card);
+    this.newCardGroup = this.safeCardGroup(card);
+    this.newCardDesc = this.safeCardDesc(card);
+    this.newCardContent = this.safeCardContent(card);
+    this.statusTip = `正在编辑：${this.newCardTitle}`;
+  }
+
+  private cancelEditCard(): void {
+    this.editingCardId = '';
+    this.newCardTitle = '';
+    this.newCardGroup = '';
+    this.newCardDesc = '';
+    this.newCardContent = '';
+  }
+
   private async toggleInstructionCard(id: string): Promise<void> {
-    const next = this.activeInstructionIds.slice();
+    const next = Array.isArray(this.activeInstructionIds) ? this.activeInstructionIds.slice() : [];
     const idx = next.indexOf(id);
     if (idx >= 0) {
       next.splice(idx, 1);
@@ -185,23 +230,55 @@ export struct PromptToolsPanel {
     await this.onSaveInstructionCards(this.instructionCards, next);
   }
 
-  private async addCustomCard(): Promise<void> {
-    if (this.newCardTitle.trim().length === 0 || this.newCardContent.trim().length === 0) {
+  private async saveCardForm(): Promise<void> {
+    const title = this.newCardTitle.trim();
+    const content = this.newCardContent.trim();
+    if (title.length === 0 || content.length === 0) {
       this.statusTip = '请填写卡片标题和注入内容';
+      return;
+    }
+    const group = this.newCardGroup.trim();
+    const desc = this.newCardDesc.trim();
+    if (this.editingCardId.length > 0) {
+      const nextCards: InstructionCard[] = [];
+      for (let i = 0; i < this.instructionCards.length; i++) {
+        const cur = this.instructionCards[i];
+        if (cur.id === this.editingCardId) {
+          nextCards.push({
+            id: cur.id,
+            title,
+            description: desc,
+            content,
+            builtin: cur.builtin === true,
+            group
+          });
+        } else {
+          nextCards.push(cur);
+        }
+      }
+      this.editingCardId = '';
+      this.newCardTitle = '';
+      this.newCardGroup = '';
+      this.newCardDesc = '';
+      this.newCardContent = '';
+      await this.onSaveInstructionCards(nextCards, this.activeInstructionIds);
+      this.statusTip = `已更新指令卡片: ${title}`;
       return;
     }
     const card: InstructionCard = {
       id: 'inst_' + newId(),
-      title: this.newCardTitle.trim(),
-      description: this.newCardDesc.trim(),
-      content: this.newCardContent.trim(),
-      builtin: false
+      title,
+      description: desc,
+      content,
+      builtin: false,
+      group
     };
     const nextCards = this.instructionCards.slice();
     nextCards.push(card);
-    const nextActive = this.activeInstructionIds.slice();
+    const nextActive = Array.isArray(this.activeInstructionIds) ? this.activeInstructionIds.slice() : [];
     nextActive.push(card.id);
     this.newCardTitle = '';
+    this.newCardGroup = '';
     this.newCardDesc = '';
     this.newCardContent = '';
     await this.onSaveInstructionCards(nextCards, nextActive);
@@ -517,57 +594,100 @@ export struct PromptToolsPanel {
         .fontSize(12)
         .fontColor($r('app.color.muted'))
 
-      ForEach(this.instructionCards, (card: InstructionCard) => {
+      ForEach(this.instructionCards || [], (card: InstructionCard) => {
         Column({ space: 6 }) {
           Row({ space: 8 }) {
-            Column({ space: 2 }) {
-              Text(`${card.title}${card.builtin ? ' · 内置' : ''}`)
-                .fontSize(14)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.ink'))
-              if (card.description.length > 0) {
-                Text(card.description)
+            Column({ space: 3 }) {
+              Row({ space: 6 }) {
+                Text(`${this.safeCardTitle(card)}${card.builtin ? ' · 内置' : ''}`)
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.ink'))
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+                if (this.safeCardGroup(card).length > 0) {
+                  Text(this.safeCardGroup(card))
+                    .fontSize(10)
+                    .fontColor($r('app.color.accent'))
+                    .backgroundColor($r('app.color.tint'))
+                    .borderRadius(6)
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                }
+              }
+              .width('100%')
+
+              if (this.safeCardDesc(card).length > 0) {
+                Text(this.safeCardDesc(card))
                   .fontSize(11)
                   .fontColor($r('app.color.muted'))
+                  .maxLines(2)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
               }
             }
             .layoutWeight(1)
             .alignItems(HorizontalAlign.Start)
 
-            Toggle({ type: ToggleType.Switch, isOn: this.activeInstructionIds.indexOf(card.id) >= 0 })
-              .onChange(async () => {
-                await this.toggleInstructionCard(card.id);
+            Toggle({ type: ToggleType.Switch, isOn: this.isCardActive(card.id) })
+              .onChange(async (isOn: boolean) => {
+                if (isOn !== this.isCardActive(card.id)) {
+                  await this.toggleInstructionCard(card.id);
+                }
               })
               .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+
+            Button('编辑')
+              .type(ButtonType.Normal)
+              .height(28)
+              .fontSize(11)
+              .borderRadius(6)
+              .fontColor($r('app.color.accent'))
+              .backgroundColor($r('app.color.tint'))
+              .onClick(() => {
+                this.startEditCard(card);
+              })
 
             if (!card.builtin) {
               Button('删')
                 .type(ButtonType.Normal)
                 .height(28)
                 .fontSize(11)
+                .borderRadius(6)
                 .fontColor($r('app.color.warning'))
                 .backgroundColor($r('app.color.canvas'))
                 .onClick(async () => {
                   const nextCards = this.instructionCards.filter((c) => c.id !== card.id);
-                  const nextActive = this.activeInstructionIds.filter((id) => id !== card.id);
+                  const nextActive = (this.activeInstructionIds || []).filter((id) => id !== card.id);
+                  if (this.editingCardId === card.id) {
+                    this.cancelEditCard();
+                  }
                   await this.onSaveInstructionCards(nextCards, nextActive);
                 })
             }
           }
           .width('100%')
 
-          Text(card.content)
-            .fontSize(12)
-            .fontColor($r('app.color.muted'))
+          if (this.safeCardContent(card).trim().length > 0) {
+            Text(this.safeCardContent(card).trim())
+              .fontSize(12)
+              .fontColor($r('app.color.muted'))
+              .maxLines(3)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+          }
         }
         .padding(10)
         .backgroundColor($r('app.color.surface'))
         .borderRadius(10)
         .width('100%')
-      }, (card: InstructionCard) => card.id)
+        .onClick(() => {
+          this.startEditCard(card);
+        })
+      }, (card: InstructionCard, idx: number) =>
+        `${card.id || 'ic_' + idx}_${this.safeCardTitle(card)}_${this.safeCardGroup(card)}_${this.safeCardDesc(card).length}_${this.safeCardContent(card).slice(0, 24)}_${this.safeCardContent(card).length}_${this.isCardActive(card.id) ? 1 : 0}`)
 
       Column({ space: 6 }) {
-        Text('新建自定义指令卡片')
+        Text(this.editingCardId.length > 0 ? '编辑指令卡片' : '新建自定义指令卡片')
           .fontSize(13)
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.ink'))
@@ -578,6 +698,13 @@ export struct PromptToolsPanel {
           .onChange((v: string) => {
             this.newCardTitle = v;
           })
+        TextInput({ text: this.newCardGroup, placeholder: '分组（可选）' })
+          .height(36)
+          .borderRadius(8)
+          .backgroundColor($r('app.color.canvas'))
+          .onChange((v: string) => {
+            this.newCardGroup = v;
+          })
         TextInput({ text: this.newCardDesc, placeholder: '简短说明（可选）' })
           .height(36)
           .borderRadius(8)
@@ -586,22 +713,39 @@ export struct PromptToolsPanel {
             this.newCardDesc = v;
           })
         TextArea({ text: this.newCardContent, placeholder: '注入指令正文...' })
-          .height(72)
+          .height(96)
           .borderRadius(8)
           .backgroundColor($r('app.color.canvas'))
           .onChange((v: string) => {
             this.newCardContent = v;
           })
-        Button('添加并激活')
-          .type(ButtonType.Normal)
-          .height(36)
-          .fontSize(12)
-          .borderRadius(8)
-          .fontColor($r('app.color.on_accent'))
-          .backgroundColor($r('app.color.accent'))
-          .onClick(async () => {
-            await this.addCustomCard();
-          })
+        Row({ space: 8 }) {
+          Button(this.editingCardId.length > 0 ? '保存修改' : '添加并激活')
+            .type(ButtonType.Normal)
+            .height(36)
+            .fontSize(12)
+            .borderRadius(8)
+            .layoutWeight(1)
+            .fontColor($r('app.color.on_accent'))
+            .backgroundColor($r('app.color.accent'))
+            .onClick(async () => {
+              await this.saveCardForm();
+            })
+          if (this.editingCardId.length > 0) {
+            Button('取消编辑')
+              .type(ButtonType.Normal)
+              .height(36)
+              .fontSize(12)
+              .borderRadius(8)
+              .fontColor($r('app.color.ink'))
+              .backgroundColor($r('app.color.canvas'))
+              .onClick(() => {
+                this.cancelEditCard();
+                this.statusTip = '';
+              })
+          }
+        }
+        .width('100%')
       }
       .padding(10)
       .backgroundColor($r('app.color.surface'))

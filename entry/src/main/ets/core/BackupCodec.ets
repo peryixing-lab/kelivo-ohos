@@ -20,6 +20,7 @@ import {
   ModelSpec,
   Persona,
   Provider,
+  ProxyConfig,
   QuickPhrase,
   ReasoningEffort,
   ScheduledTask,
@@ -35,7 +36,12 @@ import {
   defaultBackupScope,
   defaultModelSpec,
   normalizeAppearanceConfig,
-  normalizeBackupScope
+  normalizeBackupScope,
+  normalizeInstructionCards,
+  normalizeProxyConfig,
+  normalizeProxyType,
+  normalizeQuickPhrases,
+  normalizeWorldBooks
 } from './Models';
 import {
   memoryTypeName,
@@ -57,6 +63,7 @@ export interface ParsedBackupData {
   mcpEndpoint?: string;
   searchServices?: SearchServiceConfig[];
   activeSearchId?: string;
+  globalProxy?: ProxyConfig;
   memories?: MemoryEntry[];
   userProfile?: UserProfileField[];
   memorySettings?: MemorySettings;
@@ -180,6 +187,7 @@ interface AndroidProviderJson {
   vertexAI?: boolean | null;
   models?: Object[];
   proxyEnabled?: boolean;
+  proxyType?: string;
   proxyHost?: string;
   proxyPort?: string;
   proxyUsername?: string;
@@ -361,6 +369,9 @@ export function collectSecretRefsForScope(ws: Workspace, rawScope?: BackupScopeC
       addRef(refs, ws.envVars[i].secretRef);
     }
   }
+  if (scope.settings && ws.globalProxy) {
+    addRef(refs, ws.globalProxy.passwordRef);
+  }
   return Array.from(refs);
 }
 
@@ -435,6 +446,7 @@ export function buildHarmonyBackupJson(
     search: scope.search ? ws.search : undefined,
     searchServices: scope.search ? ws.searchServices : undefined,
     activeSearchId: scope.search ? ws.activeSearchId : undefined,
+    globalProxy: scope.settings ? ws.globalProxy : undefined,
     mcpEndpoint: scope.mcp ? ws.mcpEndpoint : undefined,
     mcpServers: scope.mcp ? ws.mcpServers : undefined,
     memories: scope.memory ? ws.memories : undefined,
@@ -496,12 +508,13 @@ export function parseHarmonyBackupJson(raw: string): ParsedBackupData {
       mcpEndpoint: scope.mcp ? ws.mcpEndpoint : undefined,
       searchServices: scope.search ? (ws.searchServices || []) : undefined,
       activeSearchId: scope.search ? ws.activeSearchId : undefined,
+      globalProxy: scope.settings && ws.globalProxy ? normalizeProxyConfig(ws.globalProxy, true) : undefined,
       memories: scope.memory ? (ws.memories || []) : undefined,
       userProfile: scope.memory ? (ws.userProfile || []) : undefined,
       memorySettings: scope.memory ? ws.memorySettings : undefined,
-      worldBooks: scope.worldBooks ? (ws.worldBooks || []) : undefined,
-      quickPhrases: scope.quickPhrases ? (ws.quickPhrases || []) : undefined,
-      instructionCards: scope.instructions ? (ws.instructionCards || []) : undefined,
+      worldBooks: scope.worldBooks && ws.worldBooks ? normalizeWorldBooks(ws.worldBooks) : undefined,
+      quickPhrases: scope.quickPhrases && ws.quickPhrases ? normalizeQuickPhrases(ws.quickPhrases) : undefined,
+      instructionCards: scope.instructions && ws.instructionCards ? normalizeInstructionCards(ws.instructionCards) : undefined,
       activeInstructionIds: scope.instructions ? ws.activeInstructionIds : undefined,
       skills: scope.skills ? (ws.skills || []) : undefined,
       workspaces: scope.workspaces ? (ws.workspaces || []) : undefined,
@@ -641,6 +654,7 @@ export function buildAndroidSettingsJson(
       pObj['vertexAI'] = pType === 'google' ? (p.family === 'vertex') : null;
       pObj['models'] = modelIds;
       pObj['proxyEnabled'] = p.proxy?.enabled === true;
+      pObj['proxyType'] = normalizeProxyType(p.proxy?.type);
       pObj['proxyHost'] = p.proxy?.host || '';
       pObj['proxyPort'] = String(p.proxy?.port || 8080);
       pObj['proxyUsername'] = p.proxy?.username || '';
@@ -732,7 +746,21 @@ export function buildAndroidSettingsJson(
     out['quick_phrases_v1'] = JSON.stringify(ws.quickPhrases);
   }
   if (scope.instructions && ws.instructionCards) {
-    out['instruction_injections_v1'] = JSON.stringify(ws.instructionCards);
+    const cards: Object[] = [];
+    for (let i = 0; i < ws.instructionCards.length; i++) {
+      const c = ws.instructionCards[i];
+      const text = typeof c.content === 'string' && c.content.length > 0 ? c.content : (c.prompt || '');
+      const obj: Record<string, Object> = {};
+      obj['id'] = c.id;
+      obj['title'] = c.title;
+      obj['prompt'] = text;
+      obj['group'] = c.group || '';
+      obj['description'] = c.description || '';
+      obj['content'] = text;
+      obj['builtin'] = c.builtin === true;
+      cards.push(obj);
+    }
+    out['instruction_injections_v1'] = JSON.stringify(cards);
   }
 
   if (scope.search && ws.searchServices) {
@@ -855,6 +883,18 @@ export function buildAndroidSettingsJson(
     if (ws.appearance) {
       out['theme_mode_v1'] = ws.appearance.themeMode;
       out['theme_palette_v1'] = ws.appearance.paletteId;
+    }
+    if (ws.globalProxy) {
+      const gp = normalizeProxyConfig(ws.globalProxy, true);
+      out['global_proxy_enabled_v1'] = gp.enabled === true;
+      out['global_proxy_type_v1'] = normalizeProxyType(gp.type);
+      out['global_proxy_host_v1'] = gp.host || '';
+      out['global_proxy_port_v1'] = String(gp.port || 8080);
+      out['global_proxy_username_v1'] = gp.username || '';
+      out['global_proxy_password_v1'] = gp.passwordRef ? (secrets[gp.passwordRef] || '') : '';
+      if (gp.bypass !== undefined) {
+        out['global_proxy_bypass_v1'] = gp.bypass;
+      }
     }
   }
 
@@ -1169,6 +1209,7 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
         }
       }
       const proxyPassRef = stageSecret(ap.proxyPassword);
+      const hasProxyConfig = ap.proxyEnabled === true || (typeof ap.proxyHost === 'string' && ap.proxyHost.trim().length > 0);
       providers.push({
         id: ap.id || k,
         name: ap.name,
@@ -1180,8 +1221,9 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
         models: modelSpecs,
         apiKeys: pool,
         keyStrategy: 'round_robin',
-        proxy: ap.proxyEnabled ? {
-          enabled: true,
+        proxy: hasProxyConfig ? {
+          enabled: ap.proxyEnabled === true,
+          type: normalizeProxyType(ap.proxyType),
           host: ap.proxyHost || '',
           port: Number(ap.proxyPort) || 8080,
           username: ap.proxyUsername || '',
@@ -1281,9 +1323,14 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
   }
 
   // 4. WorldBooks, QuickPhrases, InstructionCards
-  const worldBooks = parseJsonValue<WorldBook[]>(settings['world_books_v1']);
-  const quickPhrases = parseJsonValue<QuickPhrase[]>(settings['quick_phrases_v1']);
-  const instructionCards = parseJsonValue<InstructionCard[]>(settings['instruction_injections_v1']);
+  const rawWorldBooks = parseJsonValue<WorldBook[]>(settings['world_books_v1']);
+  const worldBooks = Array.isArray(rawWorldBooks) ? normalizeWorldBooks(rawWorldBooks) : undefined;
+  const rawQuickPhrases = parseJsonValue<QuickPhrase[]>(settings['quick_phrases_v1']);
+  const quickPhrases = Array.isArray(rawQuickPhrases) ? normalizeQuickPhrases(rawQuickPhrases) : undefined;
+  const rawInstructionCards = parseJsonValue<InstructionCard[]>(settings['instruction_injections_v1']);
+  const instructionCards = Array.isArray(rawInstructionCards)
+    ? normalizeInstructionCards(rawInstructionCards)
+    : undefined;
 
   // 5. Env Vars
   let envVars: EnvVar[] | undefined = undefined;
@@ -1522,11 +1569,42 @@ export function parseAndroidSettingsJson(rawJson: string): ParsedBackupData {
     appearance.themeMode = themeMode;
   }
 
+  let globalProxy: ProxyConfig | undefined = undefined;
+  const hasGlobalProxyKeys =
+    settings['global_proxy_enabled_v1'] !== undefined ||
+    settings['global_proxy_host_v1'] !== undefined ||
+    settings['global_proxy_port_v1'] !== undefined ||
+    settings['global_proxy_type_v1'] !== undefined ||
+    settings['global_proxy_bypass_v1'] !== undefined;
+  if (hasGlobalProxyKeys) {
+    const rawEn = settings['global_proxy_enabled_v1'];
+    const rawHost = settings['global_proxy_host_v1'];
+    const rawPort = settings['global_proxy_port_v1'];
+    const rawType = settings['global_proxy_type_v1'];
+    const rawUser = settings['global_proxy_username_v1'];
+    const rawPass = settings['global_proxy_password_v1'];
+    const rawBypass = settings['global_proxy_bypass_v1'];
+    const passRef = typeof rawPass === 'string' ? stageSecret(rawPass) : '';
+    const parsedPort = typeof rawPort === 'number'
+      ? rawPort
+      : Number(typeof rawPort === 'string' ? rawPort.trim() : '8080');
+    globalProxy = normalizeProxyConfig({
+      enabled: rawEn === true || rawEn === 'true',
+      type: normalizeProxyType(typeof rawType === 'string' ? rawType : undefined),
+      host: typeof rawHost === 'string' ? rawHost : '',
+      port: Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8080,
+      username: typeof rawUser === 'string' ? rawUser : '',
+      passwordRef: passRef || undefined,
+      bypass: typeof rawBypass === 'string' ? rawBypass : undefined
+    }, true);
+  }
+
   return {
     sourceName: 'Kelivo (Android)',
     providers,
     personas,
     mcpServers,
+    globalProxy,
     worldBooks: Array.isArray(worldBooks) ? worldBooks : undefined,
     quickPhrases: Array.isArray(quickPhrases) ? quickPhrases : undefined,
     instructionCards: Array.isArray(instructionCards) ? instructionCards : undefined,
@@ -1580,6 +1658,7 @@ export function applyScopedRestore(
     search: current.search,
     searchServices: current.searchServices ? current.searchServices.slice() : [],
     activeSearchId: current.activeSearchId,
+    globalProxy: current.globalProxy,
     mcpEndpoint: current.mcpEndpoint,
     mcpServers: current.mcpServers ? current.mcpServers.slice() : [],
     davDirectory: current.davDirectory,
@@ -1709,10 +1788,12 @@ export function applyScopedRestore(
       groupName: p.groupName,
       proxy: p.proxy ? {
         enabled: p.proxy.enabled,
+        type: normalizeProxyType(p.proxy.type),
         host: p.proxy.host,
         port: p.proxy.port,
         username: p.proxy.username,
-        passwordRef: remapRef(p.proxy.passwordRef, isHarmonySource) || undefined
+        passwordRef: remapRef(p.proxy.passwordRef, isHarmonySource) || undefined,
+        bypass: p.proxy.bypass
       } : undefined,
       customHeaders: p.customHeaders ? p.customHeaders.slice() : undefined,
       customBodyJson: p.customBodyJson,
@@ -1868,10 +1949,11 @@ export function applyScopedRestore(
 
   // 7. WorldBooks
   if (allowCategory(scope.worldBooks, Array.isArray(incoming.worldBooks), srcScope?.worldBooks)) {
-    const incWb = incoming.worldBooks || [];
+    const incWb = normalizeWorldBooks(incoming.worldBooks || []);
     if (mode === 'overwrite') {
       next.worldBooks = incWb.slice();
     } else {
+      next.worldBooks = normalizeWorldBooks(next.worldBooks);
       const seen = new Set<string>((next.worldBooks || []).map((w: WorldBook): string => w.id));
       for (let i = 0; i < incWb.length; i++) {
         if (!seen.has(incWb[i].id)) {
@@ -1969,10 +2051,11 @@ export function applyScopedRestore(
 
   // 9. Quick Phrases
   if (allowCategory(scope.quickPhrases, Array.isArray(incoming.quickPhrases), srcScope?.quickPhrases)) {
-    const incQp = incoming.quickPhrases || [];
+    const incQp = normalizeQuickPhrases(incoming.quickPhrases || []);
     if (mode === 'overwrite') {
       next.quickPhrases = incQp.slice();
     } else {
+      next.quickPhrases = normalizeQuickPhrases(next.quickPhrases);
       const seen = new Set<string>((next.quickPhrases || []).map((q: QuickPhrase): string => q.id));
       for (let i = 0; i < incQp.length; i++) {
         if (!seen.has(incQp[i].id)) {
@@ -1985,11 +2068,12 @@ export function applyScopedRestore(
 
   // 10. Instruction Cards
   if (allowCategory(scope.instructions, Array.isArray(incoming.instructionCards), srcScope?.instructions)) {
-    const incCards = incoming.instructionCards || [];
+    const incCards = normalizeInstructionCards(incoming.instructionCards || []);
     if (mode === 'overwrite') {
       next.instructionCards = incCards.slice();
       if (incoming.activeInstructionIds) next.activeInstructionIds = incoming.activeInstructionIds.slice();
     } else {
+      next.instructionCards = normalizeInstructionCards(next.instructionCards);
       const seen = new Set<string>((next.instructionCards || []).map((c: InstructionCard): string => c.id));
       for (let i = 0; i < incCards.length; i++) {
         if (!seen.has(incCards[i].id)) {
@@ -2134,6 +2218,11 @@ export function applyScopedRestore(
     }
     if (incoming.userName && (mode === 'overwrite' || !next.userName || next.userName === '用户')) {
       next.userName = incoming.userName;
+    }
+    if (incoming.globalProxy && (mode === 'overwrite' || !next.globalProxy?.host)) {
+      const normGp = normalizeProxyConfig(incoming.globalProxy, true);
+      normGp.passwordRef = remapRef(normGp.passwordRef, isHarmonySource) || undefined;
+      next.globalProxy = normGp;
     }
   }
 

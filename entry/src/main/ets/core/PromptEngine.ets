@@ -294,8 +294,14 @@ export function assembleInstructionCards(cards: InstructionCard[], activeIds: st
   const parts: string[] = [];
   for (let i = 0; i < cards.length; i++) {
     const c = cards[i];
-    if (activeIds.indexOf(c.id) >= 0 && c.content.trim().length > 0) {
-      parts.push(`[${c.title}]\n${c.content.trim()}`);
+    if (!c) continue;
+    const rawBody = typeof c.content === 'string'
+      ? c.content
+      : (typeof c.prompt === 'string' ? c.prompt : '');
+    const body = rawBody.trim();
+    if (activeIds.indexOf(c.id) >= 0 && body.length > 0) {
+      const title = typeof c.title === 'string' ? c.title.trim() : '';
+      parts.push(title.length > 0 ? `[${title}]\n${body}` : body);
     }
   }
   return parts.join('\n\n');

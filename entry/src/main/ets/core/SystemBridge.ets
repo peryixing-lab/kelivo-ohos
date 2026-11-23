@@ -1,4 +1,4 @@
-import { common, ConfigurationConstant, Want } from '@kit.AbilityKit';
+import { common, ConfigurationConstant, Want, wantAgent, WantAgent } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import { notificationManager } from '@kit.NotificationKit';
 import { vibrator } from '@kit.SensorServiceKit';
@@ -75,7 +75,8 @@ export async function notifyGenerationComplete(
   ctx: common.UIAbilityContext | undefined,
   enabled: boolean,
   title: string,
-  previewText: string
+  previewText: string,
+  chatId?: string
 ): Promise<void> {
   if (!enabled || !ctx) {
     return;
@@ -92,9 +93,34 @@ export async function notifyGenerationComplete(
       normal: basic
     };
     nextNotifyId += 1;
+    let agent: WantAgent | undefined = undefined;
+    try {
+      const wantParams: Record<string, Object> = {};
+      const cleanChatId = chatId ? chatId.trim() : '';
+      if (cleanChatId.length > 0) {
+        wantParams['openChatId'] = cleanChatId;
+      }
+      const info: wantAgent.WantAgentInfo = {
+        wants: [
+          {
+            bundleName: ctx.abilityInfo.bundleName,
+            abilityName: ctx.abilityInfo.name,
+            parameters: cleanChatId.length > 0 ? wantParams : undefined
+          }
+        ],
+        actionType: wantAgent.OperationType.START_ABILITY,
+        requestCode: nextNotifyId,
+        actionFlags: [wantAgent.WantAgentFlags.UPDATE_PRESENT_FLAG]
+      };
+      agent = await wantAgent.getWantAgent(info);
+    } catch (_) {
+      agent = undefined;
+    }
     const req: notificationManager.NotificationRequest = {
       id: nextNotifyId,
-      content
+      content,
+      wantAgent: agent,
+      tapDismissed: true
     };
     await notificationManager.publish(req);
   } catch (_) {
@@ -131,6 +157,21 @@ export function publishIncomingShareWant(want: Want | undefined): void {
   const txt = extractIncomingShareText(want);
   if (txt.length > 0) {
     AppStorage.setOrCreate('pendingShareText', txt);
+  }
+}
+
+export function extractIncomingOpenChatId(want: Want | undefined): string {
+  if (!want || !want.parameters) {
+    return '';
+  }
+  const raw = want.parameters['openChatId'];
+  return typeof raw === 'string' && raw.trim().length > 0 ? raw.trim() : '';
+}
+
+export function publishIncomingOpenChatWant(want: Want | undefined): void {
+  const chatId = extractIncomingOpenChatId(want);
+  if (chatId.length > 0) {
+    AppStorage.setOrCreate('pendingOpenChatId', chatId);
   }
 }
 

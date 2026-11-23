@@ -131,7 +131,7 @@ export class ScheduledTaskRunner {
       };
       await this.host.onTaskResult(updatedTask, conv);
       const notifyOn = ws.systemSettings?.backgroundNotifyEnabled !== false;
-      await notifyGenerationComplete(this.host.getContext(), notifyOn, `定时任务：${task.name}`, reply);
+      await notifyGenerationComplete(this.host.getContext(), notifyOn, `定时任务：${task.name}`, reply, chatId);
     } catch (e) {
       const updatedTask: ScheduledTask = {
         id: task.id,
