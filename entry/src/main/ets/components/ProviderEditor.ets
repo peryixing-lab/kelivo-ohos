@@ -11,11 +11,14 @@ import {
   HeaderEntry,
   KeyRotationStrategy,
   ModelDefaults,
+  ModelModality,
+  ModelOutputModality,
   ModelSpec,
   OAuthProviderKind,
   Provider,
   ProxyConfig,
   checkEndpoint,
+  cloneModelSpec,
   defaultModelSpec,
   extractUrlHost,
   isProviderConfigured,
@@ -29,7 +32,8 @@ import { KelivoAvatarBadge, KelivoNavTitleBar, KelivoSectionHeader, KelivoStatus
 export struct ProviderEditor {
   @Prop @Watch('onProvidersPropChange') providers: Provider[] = [];
   @Prop @Watch('onProvidersPropChange') activeId: string = '';
-  initialViewMode: 'list' | 'detail' = 'list';
+  pageMode: 'list' | 'detail' = 'list';
+  initialProviderId: string = '';
   initialTab: number = 0;
   @Prop modelDefaults: ModelDefaults = {
     chatProviderId: '', chatModelId: '', titleProviderId: '', titleModelId: '',
@@ -40,10 +44,19 @@ export struct ProviderEditor {
   onImportProviders: (items: ImportedProvider[]) => Promise<Provider[]> = async () => [];
   onDeleteProvider: (id: string) => Promise<Provider[]> = async () => [];
   onStartOAuth: (kind: OAuthProviderKind) => void = () => {};
+  onOpenDetail: (providerId: string, tab: number) => void = () => {};
+  onOpenModelEditor: (
+    provider: Provider,
+    spec: ModelSpec,
+    isNew: boolean,
+    onSaved: (spec: ModelSpec) => void
+  ) => void = () => {};
   onDismissOverlay: () => boolean = () => false;
+  onRouteShown: () => void = () => {};
+  onRouteHidden: () => void = () => {};
   onClose: () => void = () => {};
 
-  @State viewMode: 'list' | 'detail' = 'list';
+  @State modelsRev: number = 0;
   @State localProviders: Provider[] = [];
   @State localActiveId: string = '';
   @State listQuery: string = '';
@@ -98,6 +111,7 @@ export struct ProviderEditor {
   @State clearSecret: boolean = false;
   private original: Provider = preset('', '', 'openai', '', '');
   private existingProxyPassRef: string = '';
+  private detailScroller: Scroller = new Scroller();
 
   private onProvidersPropChange(): void {
     this.localProviders = this.providers.slice();
@@ -107,10 +121,21 @@ export struct ProviderEditor {
   aboutToAppear(): void {
     this.localProviders = this.providers.slice();
     this.localActiveId = this.activeId;
-    this.viewMode = this.initialViewMode;
     this.activeTab = this.initialTab;
-    const first = this.localProviders.find((p: Provider): boolean => p.id === this.localActiveId) || this.localProviders[0];
-    if (first) this.selectProvider(first);
+    if (this.pageMode === 'detail') {
+      if (this.initialProviderId.length > 0) {
+        const target = this.localProviders.find((p: Provider): boolean => p.id === this.initialProviderId) ||
+          this.localProviders.find((p: Provider): boolean => p.id === this.localActiveId) ||
+          this.localProviders[0];
+        if (target) {
+          this.selectProvider(target);
+        } else {
+          this.selectProvider(preset(newId(), '', 'openai', '', ''));
+        }
+      } else {
+        this.selectProvider(preset(newId(), '', 'openai', '', ''));
+      }
+    }
   }
 
   selectProvider(provider: Provider): void {
@@ -129,7 +154,9 @@ export struct ProviderEditor {
     this.keyInput = '';
     this.clearSecret = false;
     this.modelChoices = [];
-    this.savedModels = provider.models ? provider.models.slice() : (provider.model ? [defaultModelSpec(provider.model)] : []);
+    this.savedModels = provider.models
+      ? provider.models.map((m: ModelSpec): ModelSpec => cloneModelSpec(m))
+      : (provider.model ? [defaultModelSpec(provider.model)] : []);
     this.extraKeys = provider.apiKeys ? provider.apiKeys.slice() : [];
     this.keyStrategy = provider.keyStrategy || 'round_robin';
     this.proxyEnabled = provider.proxy?.enabled || false;
@@ -239,7 +266,7 @@ export struct ProviderEditor {
       passwordRef: passRef || undefined
     } : undefined;
 
-    const models = this.savedModels.slice();
+    const models = this.savedModels.map((m: ModelSpec): ModelSpec => cloneModelSpec(m));
     if (this.modelId.trim() && !models.some((m: ModelSpec): boolean => m.id === this.modelId.trim())) {
       models.unshift(defaultModelSpec(this.modelId.trim()));
     }
@@ -321,19 +348,147 @@ export struct ProviderEditor {
     const next = this.savedModels.slice();
     const cur = next[idx];
     if (!cur) return;
-    next[idx] = {
-      id: cur.id,
-      displayName: cur.displayName,
-      groupName: cur.groupName,
-      vision: cap === 'vision' ? !cur.vision : cur.vision,
-      tools: cap === 'tools' ? !cur.tools : cur.tools,
-      reasoning: cap === 'reasoning' ? !cur.reasoning : cur.reasoning,
-      imageGen: cap === 'imageGen' ? !cur.imageGen : cur.imageGen,
-      contextWindow: cur.contextWindow,
-      maxOutputTokens: cur.maxOutputTokens,
-      enabled: cur.enabled
-    };
+    const cloned = cloneModelSpec(cur);
+    if (cap === 'vision') {
+      cloned.vision = !cloned.vision;
+      const baseIn: ModelModality[] = cloned.inputModalities && cloned.inputModalities.length > 0
+        ? cloned.inputModalities.slice()
+        : (cur.vision ? ['text', 'image'] : ['text']);
+      if (cloned.vision) {
+        if (!baseIn.includes('image')) {
+          baseIn.push('image');
+        }
+        cloned.inputModalities = baseIn;
+      } else {
+        const filtered = baseIn.filter((m: ModelModality): boolean => m !== 'image');
+        cloned.inputModalities = filtered.length > 0 ? filtered : ['text'];
+      }
+    } else if (cap === 'tools') {
+      cloned.tools = !cloned.tools;
+    } else if (cap === 'reasoning') {
+      cloned.reasoning = !cloned.reasoning;
+    } else if (cap === 'imageGen') {
+      cloned.imageGen = !cloned.imageGen;
+      const baseOut: ModelOutputModality[] = cloned.outputModalities && cloned.outputModalities.length > 0
+        ? cloned.outputModalities.slice()
+        : (cur.imageGen ? ['text', 'image'] : ['text']);
+      if (cloned.imageGen) {
+        if (!baseOut.includes('image')) {
+          baseOut.push('image');
+        }
+        cloned.outputModalities = baseOut;
+      } else {
+        const filtered = baseOut.filter((m: ModelOutputModality): boolean => m !== 'image');
+        cloned.outputModalities = filtered.length > 0 ? filtered : ['text'];
+      }
+    }
+    next[idx] = cloned;
     this.savedModels = next;
+    this.modelsRev += 1;
+  }
+
+  private editingProviderSnapshot(): Provider {
+    const snap = preset(
+      this.selectedId || this.original.id,
+      this.labelText.trim() || this.original.name,
+      this.family,
+      this.endpoint.trim() || this.original.baseUrl,
+      this.modelId.trim() || this.original.model
+    );
+    snap.chatPath = this.chatPath.trim();
+    snap.secretRef = this.original.secretRef;
+    snap.oauth = this.original.oauth;
+    return snap;
+  }
+
+  private openModelEditor(idx: number): void {
+    const ms = this.savedModels[idx];
+    if (!ms) {
+      return;
+    }
+    const prevId = ms.id;
+    this.onOpenModelEditor(
+      this.editingProviderSnapshot(),
+      cloneModelSpec(ms),
+      false,
+      (saved: ModelSpec) => {
+        this.applyEditedModelAt(idx, prevId, saved);
+      }
+    );
+  }
+
+  private openNewModelEditor(): void {
+    this.onOpenModelEditor(
+      this.editingProviderSnapshot(),
+      defaultModelSpec(''),
+      true,
+      (saved: ModelSpec) => {
+        this.applyEditedModelAt(-1, '', saved);
+      }
+    );
+  }
+
+  private modelSpecSummary(ms: ModelSpec): string {
+    const parts: string[] = [];
+    if (ms.modelType && ms.modelType !== 'chat') {
+      parts.push(ms.modelType === 'embedding' ? '嵌入' : '图像');
+    }
+    if (ms.contextWindow > 0) {
+      parts.push(Math.round(ms.contextWindow / 1000) + 'K 上下文');
+    }
+    if (ms.reasoningDialect && ms.reasoningDialect !== 'auto') {
+      parts.push('方言 ' + ms.reasoningDialect);
+    }
+    if (ms.customHeaders && ms.customHeaders.length > 0) {
+      parts.push(ms.customHeaders.length + ' Headers');
+    }
+    if (ms.customBodyEntries && ms.customBodyEntries.length > 0) {
+      parts.push(ms.customBodyEntries.length + ' Body');
+    }
+    if (
+      ms.builtinCodeInterpreter ||
+      ms.builtinImageGen ||
+      ms.builtinUrlContext ||
+      ms.builtinCodeExec ||
+      ms.builtinYoutube ||
+      ms.builtinWebFetch ||
+      ms.builtinShell
+    ) {
+      parts.push('内置工具');
+    }
+    return parts.join(' · ');
+  }
+
+  private applyEditedModelAt(editIdx: number, prevId: string, spec: ModelSpec): void {
+    const next = this.savedModels.map((m: ModelSpec): ModelSpec => cloneModelSpec(m));
+    const clonedSpec = cloneModelSpec(spec);
+    if (editIdx >= 0 && editIdx < next.length && (!prevId || next[editIdx].id === prevId)) {
+      next[editIdx] = clonedSpec;
+      if (this.modelId === prevId) {
+        this.modelId = clonedSpec.id;
+      }
+    } else {
+      const existingIdx = next.findIndex((m: ModelSpec): boolean =>
+        m.id === clonedSpec.id || (!!prevId && m.id === prevId)
+      );
+      if (existingIdx >= 0) {
+        next[existingIdx] = clonedSpec;
+        if (this.modelId === prevId) {
+          this.modelId = clonedSpec.id;
+        }
+      } else {
+        next.push(clonedSpec);
+      }
+      if (!this.modelId.trim()) {
+        this.modelId = clonedSpec.id;
+      }
+    }
+    this.savedModels = next;
+    this.modelsRev += 1;
+    this.activeTab = 1;
+    if (this.labelText.trim().length > 0 && this.endpoint.trim().length > 0) {
+      this.submitForm(false);
+    }
   }
 
   private async probeOllama(): Promise<void> {
@@ -405,8 +560,8 @@ export struct ProviderEditor {
       this.linkInput = '';
       this.moreOptions = false;
       this.activeTab = 0;
-      if (this.viewMode !== 'list') {
-        this.setViewMode('list');
+      if (this.pageMode === 'detail') {
+        this.onClose();
       }
       this.notice = `已导入 ${imported.length} 个供应商并保存`;
     } catch (e) {
@@ -474,6 +629,13 @@ export struct ProviderEditor {
       const reuse = this.reuseSecret();
       const updated = await this.onApply(form, this.keyInput.trim(), reuse, setActive);
       this.localProviders = updated.slice();
+      const saved = updated.find((v: Provider): boolean => v.id === form.id);
+      if (saved) {
+        this.original = saved;
+        this.clearSecret = false;
+        this.existingProxyPassRef = saved.proxy?.passwordRef || '';
+        this.proxyPass = '';
+      }
       if (setActive) {
         this.localActiveId = form.id;
       }
@@ -528,16 +690,11 @@ export struct ProviderEditor {
     Text(name).fontSize(13).fontWeight(FontWeight.Medium).fontColor($r('app.color.muted'))
   }
 
-  private setViewMode(mode: 'list' | 'detail'): void {
-    SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-      this.viewMode = mode;
-    });
-  }
-
   private setActiveTab(tab: number): void {
-    SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
-      this.activeTab = tab;
-    });
+    this.activeTab = tab;
+    try {
+      this.detailScroller.scrollTo({ xOffset: 0, yOffset: 0 });
+    } catch (_) {}
   }
 
   private canDeleteSelected(): boolean {
@@ -546,7 +703,7 @@ export struct ProviderEditor {
 
   @Builder
   private navTitleBar() {
-    if (this.viewMode === 'detail') {
+    if (this.pageMode === 'detail') {
       KelivoNavTitleBar({
         titleText: this.selectedId ? (this.labelText || '编辑服务商') : '新增服务商',
         subtitleText: this.familyLabel(this.family),
@@ -554,19 +711,19 @@ export struct ProviderEditor {
         rightText: this.busy ? '保存中' : '保存',
         rightPrimary: true,
         secondSymbol: this.canDeleteSelected() ? $r('sys.symbol.trash') : undefined,
-        onBack: () => { this.setViewMode('list'); },
+        onBack: () => { this.onClose(); },
         onSecondAction: () => {
           if (this.canDeleteSelected()) {
             this.onDeleteProvider(this.selectedId).then((updated: Provider[]) => {
               this.localProviders = updated.slice();
-              this.setViewMode('list');
+              this.onClose();
             });
           }
         },
         onRightAction: () => {
           this.submitForm(false).then((ok: boolean) => {
             if (ok) {
-              this.setViewMode('list');
+              this.onClose();
             }
           });
         }
@@ -588,8 +745,7 @@ export struct ProviderEditor {
           this.showImportSheet = true;
         },
         onRightAction: () => {
-          this.selectProvider(preset(newId(), '', 'openai', '', ''));
-          this.setViewMode('detail');
+          this.onOpenDetail('', 0);
         }
       })
     }
@@ -685,8 +841,7 @@ export struct ProviderEditor {
                 .width('100%')
                 .padding({ left: 14, right: 14, top: 12, bottom: 12 })
                 .onClick(() => {
-                  this.selectProvider(p);
-                  this.setViewMode('detail');
+                  this.onOpenDetail(p.id, 0);
                 })
 
                 if (idx < this.filteredProviders().length - 1) {
@@ -724,8 +879,8 @@ export struct ProviderEditor {
               .backgroundColor($r('app.color.tint'))
               .fontColor($r('app.color.accent'))
               .onClick(() => {
-                this.setViewMode('detail');
-                this.activeTab = 2;
+                const targetId = this.localActiveId || (this.localProviders.length > 0 ? this.localProviders[0].id : '');
+                this.onOpenDetail(targetId, 2);
               })
           }
           .width('100%')
@@ -739,29 +894,30 @@ export struct ProviderEditor {
     }
     .width('100%')
     .height('100%')
-    .transition(SystemMotion.subViewTransition(this.reduceMotion))
   }
 
   @Builder
   private detailView() {
     Column() {
-      Row({ space: 6 }) {
-        Button('配置').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
-          .backgroundColor(this.activeTab === 0 ? $r('app.color.accent') : $r('app.color.surface'))
-          .fontColor(this.activeTab === 0 ? $r('app.color.on_accent') : $r('app.color.ink'))
-          .onClick(() => { this.setActiveTab(0); })
-        Button('模型').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
-          .backgroundColor(this.activeTab === 1 ? $r('app.color.accent') : $r('app.color.surface'))
-          .fontColor(this.activeTab === 1 ? $r('app.color.on_accent') : $r('app.color.ink'))
-          .onClick(() => { this.setActiveTab(1); })
-        Button('高级与OAuth').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
-          .backgroundColor(this.activeTab === 2 ? $r('app.color.accent') : $r('app.color.surface'))
-          .fontColor(this.activeTab === 2 ? $r('app.color.on_accent') : $r('app.color.ink'))
-          .onClick(() => { this.setActiveTab(2); })
-      }.padding({ left: 16, right: 16, top: 56 + this.winTopInset + 4, bottom: 8 }).width('100%')
-
-      Scroll() {
+      Scroll(this.detailScroller) {
         Column({ space: 10 }) {
+          Row({ space: 6 }) {
+            Button('配置').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
+              .backgroundColor(this.activeTab === 0 ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.activeTab === 0 ? $r('app.color.on_accent') : $r('app.color.ink'))
+              .onClick(() => { this.setActiveTab(0); })
+            Button('模型').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
+              .backgroundColor(this.activeTab === 1 ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.activeTab === 1 ? $r('app.color.on_accent') : $r('app.color.ink'))
+              .onClick(() => { this.setActiveTab(1); })
+            Button('高级与OAuth').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
+              .backgroundColor(this.activeTab === 2 ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.activeTab === 2 ? $r('app.color.on_accent') : $r('app.color.ink'))
+              .onClick(() => { this.setActiveTab(2); })
+          }
+          .padding({ bottom: 4 })
+          .width('100%')
+
           if (this.activeTab === 0) {
             Row({ space: 12 }) {
               KelivoAvatarBadge({
@@ -923,6 +1079,8 @@ export struct ProviderEditor {
             Row({ space: 8 }) {
               Button('获取模型').id('fetchModels').backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
                 .onClick(() => { this.requestList(); })
+              Button('添加模型').backgroundColor($r('app.color.surface')).fontColor($r('app.color.ink'))
+                .onClick(() => { this.openNewModelEditor(); })
               if (this.endpoint.includes('11434') || this.labelText.toLowerCase().includes('ollama')) {
                 Button('Ollama探测').backgroundColor($r('app.color.panel')).fontColor($r('app.color.ink'))
                   .onClick(() => { this.probeOllama(); })
@@ -933,6 +1091,7 @@ export struct ProviderEditor {
                     this.modelId = this.modelChoices[i];
                     if (!this.savedModels.some((m: ModelSpec): boolean => m.id === this.modelId)) {
                       this.savedModels = [...this.savedModels, defaultModelSpec(this.modelId)];
+                      this.modelsRev += 1;
                     }
                   })
                   .menuSystemMaterial(ImmersiveMaterialStyle.selectMenuMaterial(this.immersiveLightEnabled))
@@ -941,7 +1100,7 @@ export struct ProviderEditor {
             }.width('100%')
 
             if (this.savedModels.length) {
-              this.caption('已收录模型与能力标签（点击切换选中/能力）')
+              this.caption('已收录模型与能力标签（点击选中 · 点编辑可配置完整参数）')
               ForEach(this.savedModels, (ms: ModelSpec, idx: number) => {
                 Column({ space: 6 }) {
                   Row({ space: 6 }) {
@@ -951,10 +1110,39 @@ export struct ProviderEditor {
                       fallbackLetter: ms.id,
                       badgeSize: 22
                     })
-                    Text(ms.id).fontSize(13).fontWeight(this.modelId === ms.id ? FontWeight.Bold : FontWeight.Normal)
-                      .fontColor(this.modelId === ms.id ? $r('app.color.accent') : $r('app.color.ink')).layoutWeight(1)
-                      .onClick(() => { this.modelId = ms.id; })
-                    Button('移除').height(24).fontSize(11).backgroundColor(Color.Transparent).fontColor($r('app.color.warning'))
+                    Column({ space: 2 }) {
+                      Text(ms.displayName || ms.id)
+                        .fontSize(13)
+                        .fontWeight(this.modelId === ms.id ? FontWeight.Bold : FontWeight.Medium)
+                        .fontColor(this.modelId === ms.id ? $r('app.color.accent') : $r('app.color.ink'))
+                        .maxLines(1)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      if (ms.displayName && ms.displayName !== ms.id) {
+                        Text(ms.id)
+                          .fontSize(11)
+                          .fontColor($r('app.color.muted'))
+                          .maxLines(1)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      }
+                      if (this.modelSpecSummary(ms).length > 0) {
+                        Text(this.modelSpecSummary(ms))
+                          .fontSize(10)
+                          .fontColor($r('app.color.muted'))
+                          .maxLines(1)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      }
+                    }
+                    .alignItems(HorizontalAlign.Start)
+                    .layoutWeight(1)
+                    .onClick(() => { this.modelId = ms.id; })
+
+                    Button('编辑')
+                      .height(26)
+                      .fontSize(11)
+                      .backgroundColor($r('app.color.panel'))
+                      .fontColor($r('app.color.accent'))
+                      .onClick(() => { this.openModelEditor(idx); })
+                    Button('移除').height(26).fontSize(11).backgroundColor(Color.Transparent).fontColor($r('app.color.warning'))
                       .onClick(() => { this.toggleSavedModel(ms.id); })
                   }.width('100%')
                   Row({ space: 6 }) {
@@ -976,7 +1164,7 @@ export struct ProviderEditor {
                       .onClick(() => this.toggleModelCap(idx, 'imageGen'))
                   }
                 }.width('100%').padding(10).borderRadius(12).backgroundColor($r('app.color.surface'))
-              }, (ms: ModelSpec, idx: number) => ms.id + '-' + idx + '-' + ms.vision + '-' + ms.tools + '-' + ms.reasoning + '-' + ms.imageGen)
+              }, (ms: ModelSpec, idx: number) => this.modelsRev + '-' + ms.id + '-' + ms.displayName + '-' + idx + '-' + ms.vision + '-' + ms.tools + '-' + ms.reasoning + '-' + ms.imageGen)
             }
           } else {
             this.caption('多 API Key 负载均衡池')
@@ -1053,7 +1241,7 @@ export struct ProviderEditor {
                 .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
             }.width('100%')
             Row() {
-              Text('内置联网搜索（Gemini/Responses）').fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
+              Text('默认启用模型内置搜索（支持主流服务商）').fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
               Toggle({ type: ToggleType.Switch, isOn: this.builtinSearch }).selectedColor($r('app.color.accent'))
                 .onChange((v: boolean) => { this.builtinSearch = v; })
                 .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
@@ -1145,18 +1333,21 @@ export struct ProviderEditor {
             .onClick(() => {
               this.submitForm(true).then((ok: boolean) => {
                 if (ok) {
-                  this.setViewMode('list');
+                  this.onClose();
                 }
               });
             })
-        }.width('100%').constraintSize({ maxWidth: 620 }).padding({ left: 16, right: 16, bottom: Math.max(36, this.winBottomInset + 20) })
-          .alignItems(HorizontalAlign.Start).enabled(!this.busy)
+        }.width('100%').constraintSize({ maxWidth: 620 }).padding({
+          left: 16,
+          right: 16,
+          top: 56 + this.winTopInset + 4,
+          bottom: Math.max(36, this.winBottomInset + 20)
+        }).alignItems(HorizontalAlign.Start).enabled(!this.busy)
       }.layoutWeight(1).width('100%').align(Alignment.Top)
     }
     .width('100%')
     .height('100%')
     .enabled(!this.busy)
-    .transition(SystemMotion.subViewTransition(this.reduceMotion))
   }
 
   @Builder
@@ -1258,7 +1449,7 @@ export struct ProviderEditor {
   build() {
     NavDestination() {
       Column() {
-        if (this.viewMode === 'detail') {
+        if (this.pageMode === 'detail') {
           this.detailView()
         } else {
           this.listView()
@@ -1284,18 +1475,11 @@ export struct ProviderEditor {
     .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
     .title(
       { builder: () => this.navTitleBar(), height: 56 + this.winTopInset },
-      ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightEnabled, this.viewMode === 'list')
+      ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightEnabled, true)
     )
     .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-    .onBackPressed(() => {
-      if (this.onDismissOverlay()) {
-        return true;
-      }
-      if (this.viewMode === 'detail') {
-        this.setViewMode('list');
-        return true;
-      }
-      return false;
-    })
+    .onShown(() => { this.onRouteShown(); })
+    .onHidden(() => { this.onRouteHidden(); })
+    .onBackPressed(() => this.onDismissOverlay())
   }
 }

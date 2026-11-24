@@ -12,17 +12,65 @@ export type AttachmentKind = 'text' | 'image' | 'pdf' | 'docx' | 'audio';
 
 export type OAuthProviderKind = 'chatgpt' | 'grok' | 'kimi' | 'claude';
 
+export type ModelKindType = 'chat' | 'embedding' | 'image';
+
+export type ModelModality = 'text' | 'image' | 'audio' | 'video' | 'pdf';
+
+export type ModelOutputModality = 'text' | 'image' | 'audio';
+
+export type ModelReasoningDialectOverride =
+  'auto' | 'effort' | 'router' | 'budgetFlag' | 'thinkingType' | 'kimi' | 'intern' |
+  'claudeBudget' | 'adaptive' | 'geminiBudget' | 'geminiLevel' | 'fixed';
+
+export type ModelSamplingPolicy = 'always' | 'only_when_reasoning_off' | 'never';
+
+export type ModelReasoningReplayPolicy = 'none' | 'tool_turns' | 'all';
+
+export type ModelReasoningReplayField = 'reasoning_content' | 'reasoning' | 'reasoning_details';
+
+export interface ModelPricingSpec {
+  inputPerMillion?: number;
+  outputPerMillion?: number;
+  cacheReadPerMillion?: number;
+  cacheWritePerMillion?: number;
+  currency?: string;
+}
+
 export interface ModelSpec {
   id: string;
   displayName: string;
   groupName?: string;
+  modelType?: ModelKindType;
+  inputModalities?: ModelModality[];
+  outputModalities?: ModelOutputModality[];
   vision: boolean;
   tools: boolean;
   reasoning: boolean;
   imageGen: boolean;
+  structuredOutput?: boolean;
   contextWindow: number;
   maxOutputTokens: number;
   enabled: boolean;
+  pricing?: ModelPricingSpec;
+  reasoningDialect?: ModelReasoningDialectOverride;
+  reasoningLevels?: ReasoningEffort[];
+  reasoningAllowOff?: boolean;
+  reasoningDefaultLevel?: 'auto' | ReasoningEffort;
+  samplingPolicy?: ModelSamplingPolicy;
+  reasoningReplay?: ModelReasoningReplayPolicy;
+  reasoningReplayField?: ModelReasoningReplayField;
+  customHeaders?: HeaderEntry[];
+  customBodyEntries?: HeaderEntry[];
+  allowRemoteImageUrls?: boolean;
+  builtinSearch?: boolean;
+  claudeDynamicSearch?: boolean;
+  builtinCodeInterpreter?: boolean;
+  builtinImageGen?: boolean;
+  builtinUrlContext?: boolean;
+  builtinCodeExec?: boolean;
+  builtinYoutube?: boolean;
+  builtinWebFetch?: boolean;
+  builtinShell?: boolean;
 }
 
 export interface ApiKeyEntry {
@@ -1494,7 +1542,7 @@ export function messageText(message: ChatMessage): string {
       body += '\n\n[附件: ' + file.name + ']\n' + file.data;
     }
   }
-  if (message.sources?.length) {
+  if (message.role === 'user' && message.sources?.length) {
     body += '\n\n以下为网页检索资料。请根据相关资料回答，引用时标注来源编号。\n' +
       message.sources.map((hit: SearchHit, i: number): string =>
         '[' + (i + 1) + '] ' + hit.title + '\n' + hit.url + '\n' + hit.excerpt).join('\n\n');
@@ -1589,6 +1637,64 @@ export function resolveActiveModel(workspace: Workspace, chat?: Conversation, pe
   return { provider: prov, modelId: targetModel };
 }
 
+function cloneHeaderEntries(entries?: HeaderEntry[]): HeaderEntry[] | undefined {
+  if (!entries) {
+    return undefined;
+  }
+  return entries.map((h: HeaderEntry): HeaderEntry => {
+    return { key: h.key, value: h.value };
+  });
+}
+
+/**
+ * Creates a deep copy of a ModelSpec preserving all basic, reasoning, pricing,
+ * custom request, and built-in tool override fields.
+ */
+export function cloneModelSpec(spec: ModelSpec): ModelSpec {
+  return {
+    id: spec.id,
+    displayName: spec.displayName,
+    groupName: spec.groupName,
+    modelType: spec.modelType,
+    inputModalities: spec.inputModalities ? spec.inputModalities.slice() : undefined,
+    outputModalities: spec.outputModalities ? spec.outputModalities.slice() : undefined,
+    vision: spec.vision,
+    tools: spec.tools,
+    reasoning: spec.reasoning,
+    imageGen: spec.imageGen,
+    structuredOutput: spec.structuredOutput,
+    contextWindow: spec.contextWindow,
+    maxOutputTokens: spec.maxOutputTokens,
+    enabled: spec.enabled,
+    pricing: spec.pricing ? {
+      inputPerMillion: spec.pricing.inputPerMillion,
+      outputPerMillion: spec.pricing.outputPerMillion,
+      cacheReadPerMillion: spec.pricing.cacheReadPerMillion,
+      cacheWritePerMillion: spec.pricing.cacheWritePerMillion,
+      currency: spec.pricing.currency
+    } : undefined,
+    reasoningDialect: spec.reasoningDialect,
+    reasoningLevels: spec.reasoningLevels ? spec.reasoningLevels.slice() : undefined,
+    reasoningAllowOff: spec.reasoningAllowOff,
+    reasoningDefaultLevel: spec.reasoningDefaultLevel,
+    samplingPolicy: spec.samplingPolicy,
+    reasoningReplay: spec.reasoningReplay,
+    reasoningReplayField: spec.reasoningReplayField,
+    customHeaders: cloneHeaderEntries(spec.customHeaders),
+    customBodyEntries: cloneHeaderEntries(spec.customBodyEntries),
+    allowRemoteImageUrls: spec.allowRemoteImageUrls,
+    builtinSearch: spec.builtinSearch,
+    claudeDynamicSearch: spec.claudeDynamicSearch,
+    builtinCodeInterpreter: spec.builtinCodeInterpreter,
+    builtinImageGen: spec.builtinImageGen,
+    builtinUrlContext: spec.builtinUrlContext,
+    builtinCodeExec: spec.builtinCodeExec,
+    builtinYoutube: spec.builtinYoutube,
+    builtinWebFetch: spec.builtinWebFetch,
+    builtinShell: spec.builtinShell
+  };
+}
+
 export function cloneProvider(p: Provider): Provider {
   return {
     id: p.id,
@@ -1598,7 +1704,7 @@ export function cloneProvider(p: Provider): Provider {
     chatPath: p.chatPath || '',
     model: p.model,
     secretRef: p.secretRef,
-    models: p.models ? p.models.slice() : [],
+    models: p.models ? p.models.map((m: ModelSpec): ModelSpec => cloneModelSpec(m)) : [],
     apiKeys: p.apiKeys ? p.apiKeys.slice() : [],
     keyStrategy: p.keyStrategy || 'round_robin',
     groupName: p.groupName || '',

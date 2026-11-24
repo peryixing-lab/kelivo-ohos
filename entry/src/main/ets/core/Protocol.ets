@@ -4,9 +4,11 @@ import {
   ChatMessage,
   GenerationParams,
   HeaderEntry,
+  ModelReasoningReplayField,
   ModelSpec,
   PresetMessage,
   Provider,
+  SearchHit,
   TokenUsage,
   checkEndpoint,
   extractUrlHost,
@@ -15,12 +17,27 @@ import {
   isLocalOrCustomHost,
   messageText
 } from './Models';
-import { applyReasoning, reasoningControl, usesResponsesApi } from './Reasoning';
+import {
+  applyChatCompletionsBuiltInSearch,
+  applyModelExtraChatCompletionsTools,
+  buildModelExtraClaudeTools,
+  buildModelExtraResponsesTools,
+  buildResponsesBuiltInSearchTools,
+  claudeSearchToolType,
+  isBuiltInSearchEnabled,
+  isClaudeDynamicSearchEnabled,
+  mergeDeduplicatedCitations,
+  supportsBuiltInSearch,
+  supportsGeminiMixedBuiltInAndFunctionTools
+} from './BuiltinSearch';
+import { ReasoningControl, applyReasoning, effectiveEffort, reasoningControl, usesResponsesApi } from './Reasoning';
 
 interface WireMessage {
   role: string;
   content: string | WirePart[] | null;
   reasoning_content?: string;
+  reasoning?: string;
+  reasoning_details?: Array<Record<string, Object>>;
   tool_calls?: WireOpenToolCall[];
   tool_call_id?: string;
   name?: string;
@@ -66,6 +83,17 @@ export interface ChatCall { address: string; headers: Record<string, string>; bo
 
 interface ReplyToolFn { name?: string; arguments?: string }
 interface ReplyToolCallItem { index?: number; id?: string; type?: string; function?: ReplyToolFn }
+interface ReplyUrlCitation { url?: string; title?: string }
+interface ReplyClaudeCitation { url?: string; title?: string; cited_text?: string }
+interface ReplyAnnotation { type?: string; url?: string; title?: string; url_citation?: ReplyUrlCitation }
+interface ReplyGroundingWeb { uri?: string; title?: string }
+interface ReplyGroundingChunk { web?: ReplyGroundingWeb; webSite?: ReplyGroundingWeb; webPage?: ReplyGroundingWeb }
+interface ReplyGroundingMetadata { groundingChunks?: ReplyGroundingChunk[] }
+interface ReplyZhipuSearchItem { title?: string; link?: string; url?: string; content?: string }
+interface ReplyWebSearchResultItem { type?: string; url?: string; title?: string }
+interface ReplyWebSearchToolError { type?: string; error_code?: string }
+interface ReplyResponsesContentBlock { type?: string; text?: string; annotations?: ReplyAnnotation[] }
+
 interface ReplyDelta {
   content?: string;
   text?: string;
@@ -75,9 +103,11 @@ interface ReplyDelta {
   partial_json?: string;
   type?: string;
   tool_calls?: ReplyToolCallItem[];
+  annotations?: ReplyAnnotation[];
+  citation?: ReplyClaudeCitation;
 }
 interface ReplyChoice { delta?: ReplyDelta; message?: ReplyDelta; finish_reason?: string }
-interface Candidate { content?: GeminiContent; finishReason?: string }
+interface Candidate { content?: GeminiContent; finishReason?: string; groundingMetadata?: ReplyGroundingMetadata }
 interface RemoteError { message?: string }
 interface ReplyUsage {
   prompt_tokens?: number;
@@ -101,6 +131,8 @@ interface ReplyContentBlock {
   text?: string;
   thinking?: string;
   input?: Record<string, Object>;
+  content?: ReplyWebSearchResultItem[] | ReplyWebSearchToolError;
+  citations?: ReplyClaudeCitation[];
 }
 interface ReplyResponseItem {
   id?: string;
@@ -108,18 +140,25 @@ interface ReplyResponseItem {
   call_id?: string;
   name?: string;
   arguments?: string;
+  content?: ReplyResponsesContentBlock[];
 }
-interface ReplyResponseObj { usage?: ReplyUsage }
+interface ReplyResponseObj { usage?: ReplyUsage; output?: ReplyResponseItem[] }
 interface ReplyMessageStart { usage?: ReplyUsage }
 interface ReplyEvent {
   type?: string;
   choices?: ReplyChoice[];
   delta?: ReplyDelta | string;
-  content?: WirePart[];
+  content?: ReplyContentBlock[];
   content_block?: ReplyContentBlock;
   item?: ReplyResponseItem;
   response?: ReplyResponseObj;
   message?: ReplyMessageStart;
+  annotation?: ReplyAnnotation;
+  annotations?: ReplyAnnotation[];
+  citations?: Array<string | ReplyAnnotation>;
+  groundingMetadata?: ReplyGroundingMetadata;
+  web_search?: ReplyZhipuSearchItem[];
+  output?: ReplyResponseItem[];
   output_index?: number;
   call_id?: string;
   item_id?: string;
@@ -164,6 +203,7 @@ export interface RichFragment extends Fragment {
   toolCalls: ToolCallDelta[];
   usage?: TokenUsage;
   generatedImages: Attachment[];
+  citations?: SearchHit[];
   done: boolean;
 }
 
@@ -203,6 +243,7 @@ export interface ChatCallOptions {
   customBodyJson?: string;
   promptCaching?: boolean;
   builtinSearch?: boolean;
+  claudeDynamicSearch?: boolean;
   builtinUrlContext?: boolean;
   builtinCodeExec?: boolean;
 }
@@ -299,7 +340,7 @@ export function authHeaders(family: ApiFamily, key: string): Record<string, stri
   return headers;
 }
 
-function contentParts(msg: ChatMessage, family: ApiFamily): WirePart[] {
+function contentParts(msg: ChatMessage, family: ApiFamily, allowRemoteImageUrls: boolean = true): WirePart[] {
   const body = messageText(msg);
   const parts: WirePart[] = [];
   const files = getAllAttachments(msg);
@@ -310,7 +351,13 @@ function contentParts(msg: ChatMessage, family: ApiFamily): WirePart[] {
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     if (f.mime.startsWith('image/') && f.data) {
-      if (family === 'openai' || family === 'openai-responses') {
+      const trimmed = f.data.trim();
+      const isRemote = /^https?:\/\//i.test(trimmed);
+      if (isRemote) {
+        if (allowRemoteImageUrls && (family === 'openai' || family === 'openai-responses')) {
+          parts.push({ type: 'image_url', image_url: { url: trimmed } });
+        }
+      } else if (family === 'openai' || family === 'openai-responses') {
         parts.push({ type: 'image_url', image_url: { url: 'data:' + f.mime + ';base64,' + f.data } });
       } else if (family === 'anthropic') {
         parts.push({ type: 'image', source: { type: 'base64', media_type: f.mime, data: f.data } });
@@ -394,6 +441,83 @@ function applyCustomHeaders(headers: Record<string, string>, entries?: HeaderEnt
     const k = entries[i].key.trim();
     if (k) headers[k] = entries[i].value;
   }
+}
+
+function parseCustomBodyValue(raw: string): Object {
+  const trimmed = raw.trim();
+  if (trimmed === 'true') return true;
+  if (trimmed === 'false') return false;
+  if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (Number.isFinite(n)) return n;
+  }
+  if ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+    try {
+      const parsed = JSON.parse(trimmed) as Object;
+      if (parsed !== null && parsed !== undefined) {
+        return parsed;
+      }
+    } catch (_) {}
+  }
+  return raw;
+}
+
+function mergeCustomBodyEntries(target: Record<string, Object>, entries?: HeaderEntry[]): void {
+  if (!entries || !entries.length) {
+    return;
+  }
+  for (let i = 0; i < entries.length; i++) {
+    const k = entries[i].key.trim();
+    if (!k) {
+      continue;
+    }
+    target[k] = parseCustomBodyValue(entries[i].value);
+  }
+}
+
+function shouldIncludeSampling(
+  spec: ModelSpec,
+  control: ReasoningControl,
+  params: GenerationParams | undefined,
+  defaultAllow: boolean
+): boolean {
+  if (spec.samplingPolicy === 'always') {
+    return true;
+  }
+  if (spec.samplingPolicy === 'never') {
+    return false;
+  }
+  if (spec.samplingPolicy === 'only_when_reasoning_off') {
+    if (!spec.reasoning || !control.levels.length) {
+      return true;
+    }
+    const effort = params?.reasoningEffort ? effectiveEffort(control, params.reasoningEffort) : 'off';
+    return effort === 'off';
+  }
+  return defaultAllow;
+}
+
+function setWireMessageReasoning(
+  msg: WireMessage,
+  text: string,
+  field?: ModelReasoningReplayField
+): void {
+  if (!text) {
+    return;
+  }
+  if (field === 'reasoning') {
+    msg.reasoning = text;
+    return;
+  }
+  if (field === 'reasoning_details') {
+    const detail: Record<string, Object> = {};
+    detail['type'] = 'reasoning.text';
+    detail['text'] = text;
+    msg.reasoning_details = [detail];
+    return;
+  }
+  msg.reasoning_content = text;
 }
 
 export function buildProviderHeaders(
@@ -504,15 +628,31 @@ export function makeAdvancedChatCall(
   if (!modelName) throw new Error('请在模型设置中填写模型 ID。');
   const base = checkEndpoint(provider.baseUrl);
   const host = extractUrlHost(provider.baseUrl);
-  const headers = buildProviderHeaders(provider, key, opts.conversationId, opts.customHeaders, opts.promptCaching);
   const params = opts.params;
   const spec = opts.modelSpec || findProviderModelSpec(provider, modelName);
+  const combinedCustomHeaders: HeaderEntry[] = [
+    ...(spec.customHeaders || []),
+    ...(opts.customHeaders || [])
+  ];
+  const headers = buildProviderHeaders(
+    provider,
+    key,
+    opts.conversationId,
+    combinedCustomHeaders.length > 0 ? combinedCustomHeaders : undefined,
+    opts.promptCaching
+  );
   const useStream = opts.stream !== false;
   const control = reasoningControl(provider, modelName, spec);
 
   const tools = opts.tools || [];
   const toolTurns = opts.toolTurns || [];
   const presets = opts.presetMessages || [];
+  const enableBuiltinSearch = opts.builtinSearch !== undefined
+    ? (opts.builtinSearch && supportsBuiltInSearch(provider, modelName, spec))
+    : isBuiltInSearchEnabled(provider, modelName);
+  const enableClaudeDynamic = opts.claudeDynamicSearch !== undefined
+    ? opts.claudeDynamicSearch
+    : isClaudeDynamicSearchEnabled(provider, modelName);
 
   if (provider.family === 'gemini' || provider.family === 'vertex') {
     const contents: GeminiContent[] = [];
@@ -523,7 +663,7 @@ export function makeAdvancedChatCall(
     }
     for (let i = 0; i < history.length; i++) {
       const msg = history[i];
-      const parts = contentParts(msg, provider.family);
+      const parts = contentParts(msg, provider.family, spec.allowRemoteImageUrls !== false);
       if (parts.length === 0) continue;
       contents.push({ role: msg.role === 'assistant' ? 'model' : 'user', parts });
     }
@@ -557,49 +697,91 @@ export function makeAdvancedChatCall(
     }
 
     const genCfg: Record<string, Object> = {};
-    if (params?.temperature !== undefined) genCfg['temperature'] = params.temperature;
-    if (params?.topP !== undefined) genCfg['topP'] = params.topP;
+    if (shouldIncludeSampling(spec, control, params, true)) {
+      if (params?.temperature !== undefined) genCfg['temperature'] = params.temperature;
+      if (params?.topP !== undefined) genCfg['topP'] = params.topP;
+    }
     if (params?.maxTokens !== undefined && params.maxTokens > 0) genCfg['maxOutputTokens'] = params.maxTokens;
     if (Object.keys(genCfg).length > 0) body['generationConfig'] = genCfg;
     applyReasoning(body, provider, modelName, control, params);
 
-    const gTools: Array<Record<string, Object>> = [];
-    if (tools.length > 0) {
-      const decls: Array<Record<string, Object>> = [];
-      for (let i = 0; i < tools.length; i++) {
-        const td = tools[i];
-        const decl: Record<string, Object> = {};
-        decl['name'] = td.name;
-        decl['description'] = td.description;
-        const gParams = sanitizeGeminiParameters(td.parametersJson);
-        if (gParams) {
-          decl['parameters'] = gParams;
-        }
-        decls.push(decl);
+    const decls: Array<Record<string, Object>> = [];
+    for (let i = 0; i < tools.length; i++) {
+      const td = tools[i];
+      const decl: Record<string, Object> = {};
+      decl['name'] = td.name;
+      decl['description'] = td.description;
+      const gParams = sanitizeGeminiParameters(td.parametersJson);
+      if (gParams) {
+        decl['parameters'] = gParams;
       }
-      const fnGroup: Record<string, Object> = {};
-      fnGroup['functionDeclarations'] = decls;
-      gTools.push(fnGroup);
-    } else {
-      if (opts.builtinSearch || provider.builtinSearch) {
+      decls.push(decl);
+    }
+
+    const gTools: Array<Record<string, Object>> = [];
+    const allowCoexistence = supportsGeminiMixedBuiltInAndFunctionTools(modelName);
+    const hasBuiltinUrl = opts.builtinUrlContext !== undefined
+      ? opts.builtinUrlContext
+      : (spec.builtinUrlContext !== undefined ? spec.builtinUrlContext : Boolean(provider.builtinUrlContext));
+    const hasBuiltinCode = opts.builtinCodeExec !== undefined
+      ? opts.builtinCodeExec
+      : (spec.builtinCodeExec !== undefined ? spec.builtinCodeExec : Boolean(provider.builtinCodeExec));
+
+    if (allowCoexistence) {
+      if (hasBuiltinCode) {
+        const ce: Record<string, Object> = {};
+        ce['codeExecution'] = new Object();
+        gTools.push(ce);
+      }
+      if (enableBuiltinSearch) {
         const gs: Record<string, Object> = {};
         gs['googleSearch'] = new Object();
         gTools.push(gs);
       }
-      if (opts.builtinUrlContext || provider.builtinUrlContext) {
+      if (hasBuiltinUrl) {
         const uc: Record<string, Object> = {};
         uc['urlContext'] = new Object();
         gTools.push(uc);
       }
-      if (opts.builtinCodeExec || provider.builtinCodeExec) {
+      if (decls.length > 0) {
+        const fnGroup: Record<string, Object> = {};
+        fnGroup['functionDeclarations'] = decls;
+        gTools.push(fnGroup);
+      }
+      if ((hasBuiltinCode || enableBuiltinSearch || hasBuiltinUrl) && decls.length > 0 && provider.family !== 'vertex') {
+        const fnCallCfg: Record<string, Object> = {};
+        fnCallCfg['mode'] = 'VALIDATED';
+        const toolCfg: Record<string, Object> = {};
+        toolCfg['functionCallingConfig'] = fnCallCfg;
+        toolCfg['includeServerSideToolInvocations'] = true;
+        body['toolConfig'] = toolCfg;
+      }
+    } else {
+      if (hasBuiltinCode) {
         const ce: Record<string, Object> = {};
         ce['codeExecution'] = new Object();
         gTools.push(ce);
+      } else if (enableBuiltinSearch || hasBuiltinUrl) {
+        if (enableBuiltinSearch) {
+          const gs: Record<string, Object> = {};
+          gs['googleSearch'] = new Object();
+          gTools.push(gs);
+        }
+        if (hasBuiltinUrl) {
+          const uc: Record<string, Object> = {};
+          uc['urlContext'] = new Object();
+          gTools.push(uc);
+        }
+      } else if (decls.length > 0) {
+        const fnGroup: Record<string, Object> = {};
+        fnGroup['functionDeclarations'] = decls;
+        gTools.push(fnGroup);
       }
     }
     if (gTools.length > 0) body['tools'] = gTools;
 
     mergeCustomBody(body, provider.customBodyJson);
+    mergeCustomBodyEntries(body, spec.customBodyEntries);
     mergeCustomBody(body, opts.customBodyJson);
     const cleanModel = encodeURIComponent(modelName.replace(/^models\//, ''));
     const suffix = useStream ? ':streamGenerateContent?alt=sse' : ':generateContent';
@@ -637,11 +819,22 @@ export function makeAdvancedChatCall(
         }
         for (let k = 0; k < files.length; k++) {
           if (files[k].mime.startsWith('image/') && files[k].data) {
+            const trimmed = files[k].data.trim();
+            const isRemote = /^https?:\/\//i.test(trimmed);
+            if (isRemote && spec.allowRemoteImageUrls === false) {
+              continue;
+            }
             const ip: Record<string, Object> = {};
             ip['type'] = 'input_image';
-            ip['image_url'] = 'data:' + files[k].mime + ';base64,' + files[k].data;
+            ip['image_url'] = isRemote ? trimmed : ('data:' + files[k].mime + ';base64,' + files[k].data);
             respParts.push(ip);
           }
+        }
+        if (respParts.length === 0) {
+          const emptyTxt: Record<string, Object> = {};
+          emptyTxt['type'] = msg.role === 'assistant' ? 'output_text' : 'input_text';
+          emptyTxt['text'] = ' ';
+          respParts.push(emptyTxt);
         }
         item['content'] = respParts;
       } else {
@@ -687,7 +880,7 @@ export function makeAdvancedChatCall(
       body['store'] = false;
       if (!body['instructions']) body['instructions'] = 'You are a helpful assistant.';
     }
-    if (!spec.reasoning && !host.includes('chatgpt.com')) {
+    if (!host.includes('chatgpt.com') && shouldIncludeSampling(spec, control, params, !spec.reasoning)) {
       if (params?.temperature !== undefined) body['temperature'] = params.temperature;
       if (params?.topP !== undefined) body['top_p'] = params.topP;
     }
@@ -711,14 +904,28 @@ export function makeAdvancedChatCall(
       rt['parameters'] = normalizeObjectToolSchema(td.parametersJson);
       rTools.push(rt);
     }
-    if (opts.builtinSearch || provider.builtinSearch) {
-      const ws: Record<string, Object> = {};
-      ws['type'] = 'web_search_preview';
-      rTools.push(ws);
+    if (enableBuiltinSearch) {
+      const builtinTools = buildResponsesBuiltInSearchTools(provider, modelName);
+      for (let i = 0; i < builtinTools.length; i++) {
+        const bt = builtinTools[i];
+        const bType = bt['type'];
+        if (!rTools.some((existing: Record<string, Object>): boolean => existing['type'] === bType)) {
+          rTools.push(bt);
+        }
+      }
+    }
+    const extraRespTools = buildModelExtraResponsesTools(provider, spec);
+    for (let i = 0; i < extraRespTools.length; i++) {
+      const et = extraRespTools[i];
+      const eType = et['type'];
+      if (!rTools.some((existing: Record<string, Object>): boolean => existing['type'] === eType)) {
+        rTools.push(et);
+      }
     }
     if (rTools.length > 0) body['tools'] = rTools;
 
     mergeCustomBody(body, provider.customBodyJson);
+    mergeCustomBodyEntries(body, spec.customBodyEntries);
     mergeCustomBody(body, opts.customBodyJson);
     return { address: resolveEndpointUrl(base, provider.chatPath, '/responses'), headers, body: JSON.stringify(body) };
   }
@@ -736,7 +943,11 @@ export function makeAdvancedChatCall(
       const hasImg = files.some((f: Attachment): boolean => f.mime.startsWith('image/') && !!f.data);
       const txt = messageText(msg);
       if (!hasImg && !txt.trim()) continue;
-      pushAnthropicMessage(messages, msg.role, hasImg ? contentParts(msg, 'anthropic') : txt);
+      pushAnthropicMessage(
+        messages,
+        msg.role,
+        hasImg ? contentParts(msg, 'anthropic', spec.allowRemoteImageUrls !== false) : txt
+      );
     }
     for (let i = 0; i < toolTurns.length; i++) {
       const turn = toolTurns[i];
@@ -772,27 +983,47 @@ export function makeAdvancedChatCall(
       }
     }
     applyReasoning(body, provider, modelName, control, params);
-    if ((!spec.reasoning || !params?.reasoningEffort || params.reasoningEffort === 'off') &&
-      control.dialect !== 'adaptive') {
+    const defaultAnthropicSampling = !spec.reasoning || !params?.reasoningEffort || params.reasoningEffort === 'off';
+    if (control.dialect !== 'adaptive' && shouldIncludeSampling(spec, control, params, defaultAnthropicSampling)) {
       if (params?.temperature !== undefined) {
         body['temperature'] = params.temperature;
       } else if (params?.topP !== undefined) {
         body['top_p'] = params.topP;
       }
     }
-    if (tools.length > 0) {
-      const cTools: Array<Record<string, Object>> = [];
-      for (let i = 0; i < tools.length; i++) {
-        const td = tools[i];
-        const ct: Record<string, Object> = {};
-        ct['name'] = td.name;
-        ct['description'] = td.description;
-        ct['input_schema'] = normalizeObjectToolSchema(td.parametersJson);
-        cTools.push(ct);
-      }
+    const cTools: Array<Record<string, Object>> = [];
+    const claimedToolNames = new Set<string>();
+    for (let i = 0; i < tools.length; i++) {
+      const td = tools[i];
+      const ct: Record<string, Object> = {};
+      ct['name'] = td.name;
+      ct['description'] = td.description;
+      ct['input_schema'] = normalizeObjectToolSchema(td.parametersJson);
+      cTools.push(ct);
+      claimedToolNames.add(td.name);
+    }
+    if (enableBuiltinSearch && !claimedToolNames.has('web_search')) {
+      const wsTool: Record<string, Object> = {};
+      wsTool['type'] = claudeSearchToolType(provider, modelName, enableClaudeDynamic);
+      wsTool['name'] = 'web_search';
+      cTools.push(wsTool);
+      claimedToolNames.add('web_search');
+    }
+    const extraClaudeTools = buildModelExtraClaudeTools(
+      provider,
+      modelName,
+      spec,
+      enableClaudeDynamic,
+      claimedToolNames
+    );
+    for (let i = 0; i < extraClaudeTools.length; i++) {
+      cTools.push(extraClaudeTools[i]);
+    }
+    if (cTools.length > 0) {
       body['tools'] = cTools;
     }
     mergeCustomBody(body, provider.customBodyJson);
+    mergeCustomBodyEntries(body, spec.customBodyEntries);
     mergeCustomBody(body, opts.customBodyJson);
     return { address: resolveEndpointUrl(base, provider.chatPath, '/messages'), headers, body: JSON.stringify(body) };
   }
@@ -810,7 +1041,14 @@ export function makeAdvancedChatCall(
     const hasMedia = files.some((f: Attachment): boolean => (f.mime.startsWith('image/') || f.mime.startsWith('audio/')) && !!f.data);
     const txt = messageText(msg);
     if (!hasMedia && !txt.trim() && i < history.length - 1) continue;
-    messages.push({ role: msg.role, content: hasMedia ? contentParts(msg, 'openai') : txt });
+    const wireHist: WireMessage = {
+      role: msg.role,
+      content: hasMedia ? contentParts(msg, 'openai', spec.allowRemoteImageUrls !== false) : txt
+    };
+    if (msg.role === 'assistant' && msg.reasoning && spec.reasoningReplay === 'all') {
+      setWireMessageReasoning(wireHist, msg.reasoning, spec.reasoningReplayField);
+    }
+    messages.push(wireHist);
   }
   for (let i = 0; i < toolTurns.length; i++) {
     const turn = toolTurns[i];
@@ -827,8 +1065,8 @@ export function makeAdvancedChatCall(
         content: turn.text ? turn.text : (openCalls.length ? '' : null),
         tool_calls: openCalls.length ? openCalls : undefined
       };
-      if (turn.reasoning) {
-        wireTurn.reasoning_content = turn.reasoning;
+      if (turn.reasoning && spec.reasoningReplay !== 'none') {
+        setWireMessageReasoning(wireTurn, turn.reasoning, spec.reasoningReplayField);
       }
       messages.push(wireTurn);
     } else {
@@ -851,7 +1089,8 @@ export function makeAdvancedChatCall(
     body['stream_options'] = streamOpts;
   }
   const openAIReasoner = spec.reasoning && /(?:gpt-[56]|\bo[134]\b)/i.test(modelName);
-  if (!openAIReasoner || (params?.reasoningEffort === 'off' && control.levels.includes('off'))) {
+  const defaultOpenAISampling = !openAIReasoner || (params?.reasoningEffort === 'off' && control.levels.includes('off'));
+  if (shouldIncludeSampling(spec, control, params, defaultOpenAISampling)) {
     if (params?.temperature !== undefined) body['temperature'] = params.temperature;
     if (params?.topP !== undefined) body['top_p'] = params.topP;
   }
@@ -881,8 +1120,13 @@ export function makeAdvancedChatCall(
     body['tools'] = oTools;
   }
   mergeCustomBody(body, provider.customBodyJson);
+  mergeCustomBodyEntries(body, spec.customBodyEntries);
   mergeCustomBody(body, opts.customBodyJson);
-  return { address: resolveEndpointUrl(base, provider.chatPath, '/chat/completions'), headers, body: JSON.stringify(body) };
+  const finalBody = enableBuiltinSearch
+    ? applyChatCompletionsBuiltInSearch(body, provider, modelName)
+    : body;
+  applyModelExtraChatCompletionsTools(finalBody, provider, spec);
+  return { address: resolveEndpointUrl(base, provider.chatPath, '/chat/completions'), headers, body: JSON.stringify(finalBody) };
 }
 
 function usageFromWire(u?: ReplyUsage): TokenUsage | undefined {
@@ -900,6 +1144,92 @@ function usageFromWire(u?: ReplyUsage): TokenUsage | undefined {
     totalTokens: total,
     durationMs: 0
   };
+}
+
+function pushAnnotationHit(target: SearchHit[], ann?: ReplyAnnotation): void {
+  if (!ann || (ann.type && ann.type !== 'url_citation')) {
+    return;
+  }
+  const url = (ann.url_citation?.url || ann.url || '').trim();
+  if (!url) {
+    return;
+  }
+  const title = (ann.url_citation?.title || ann.title || '').trim() || url;
+  target.push({ title, url, excerpt: '' });
+}
+
+function collectResponsesOutputCitations(target: SearchHit[], output?: ReplyResponseItem[]): void {
+  if (!output) {
+    return;
+  }
+  for (let i = 0; i < output.length; i++) {
+    const blocks = output[i].content;
+    if (!blocks) {
+      continue;
+    }
+    for (let j = 0; j < blocks.length; j++) {
+      const anns = blocks[j].annotations;
+      if (!anns) {
+        continue;
+      }
+      for (let k = 0; k < anns.length; k++) {
+        pushAnnotationHit(target, anns[k]);
+      }
+    }
+  }
+}
+
+function collectClaudeBlockCitations(target: SearchHit[], block?: ReplyContentBlock): void {
+  if (!block) {
+    return;
+  }
+  if (block.type === 'web_search_tool_result' && Array.isArray(block.content)) {
+    const items = block.content;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type && item.type !== 'web_search_result') {
+        continue;
+      }
+      const url = (item.url || '').trim();
+      if (!url) {
+        continue;
+      }
+      const title = (item.title || '').trim() || url;
+      target.push({ title, url, excerpt: '' });
+    }
+  }
+  if (block.citations) {
+    for (let i = 0; i < block.citations.length; i++) {
+      const cite = block.citations[i];
+      const url = (cite.url || '').trim();
+      if (!url) {
+        continue;
+      }
+      const title = (cite.title || '').trim() || url;
+      const excerpt = (cite.cited_text || '').trim();
+      target.push({ title, url, excerpt });
+    }
+  }
+}
+
+function collectGeminiGroundingCitations(target: SearchHit[], gm?: ReplyGroundingMetadata): void {
+  const chunks = gm?.groundingChunks;
+  if (!chunks) {
+    return;
+  }
+  for (let i = 0; i < chunks.length; i++) {
+    const ch = chunks[i];
+    const web = ch.web ?? ch.webSite ?? ch.webPage;
+    if (!web) {
+      continue;
+    }
+    const url = (web.uri || '').trim();
+    if (!url) {
+      continue;
+    }
+    const title = (web.title || '').trim() || url;
+    target.push({ title, url, excerpt: '' });
+  }
 }
 
 export function parseRichReply(data: string): RichFragment {
@@ -939,6 +1269,15 @@ export function parseRichReply(data: string): RichFragment {
     else if (event.delta) result.reasoning = event.delta.text || '';
     return result;
   }
+  if (event.type === 'response.output_text.annotation.added') {
+    const hits: SearchHit[] = [];
+    pushAnnotationHit(hits, event.annotation);
+    const deduped = mergeDeduplicatedCitations([], hits);
+    if (deduped.length > 0) {
+      result.citations = deduped;
+    }
+    return result;
+  }
   if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') {
     result.toolCalls.push({
       index: event.output_index ?? 0,
@@ -962,12 +1301,19 @@ export function parseRichReply(data: string): RichFragment {
   if (event.type === 'response.completed') {
     result.done = true;
     result.usage = usageFromWire(event.response?.usage);
+    const hits: SearchHit[] = [];
+    collectResponsesOutputCitations(hits, event.response?.output);
+    const deduped = mergeDeduplicatedCitations([], hits);
+    if (deduped.length > 0) {
+      result.citations = deduped;
+    }
     return result;
   }
 
+  const rawHits: SearchHit[] = [];
   const objDelta: ReplyDelta | undefined = (typeof event.delta === 'object' && event.delta !== null) ? event.delta : undefined;
 
-  // Anthropic tool_use start & delta
+  // Anthropic tool_use start & delta, plus built-in search result / citation blocks
   if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
     result.toolCalls.push({
       index: event.index ?? 0,
@@ -977,6 +1323,9 @@ export function parseRichReply(data: string): RichFragment {
       done: false
     });
   }
+  if (event.type === 'content_block_start' && event.content_block) {
+    collectClaudeBlockCitations(rawHits, event.content_block);
+  }
   if (event.type === 'content_block_delta' && objDelta?.type === 'input_json_delta') {
     result.toolCalls.push({
       index: event.index ?? 0,
@@ -985,6 +1334,16 @@ export function parseRichReply(data: string): RichFragment {
       argsDelta: objDelta.partial_json || '',
       done: false
     });
+  }
+  if (event.type === 'content_block_delta' && objDelta?.type === 'citations_delta' && objDelta.citation?.url) {
+    const url = objDelta.citation.url.trim();
+    if (url) {
+      rawHits.push({
+        title: (objDelta.citation.title || '').trim() || url,
+        url,
+        excerpt: (objDelta.citation.cited_text || '').trim()
+      });
+    }
   }
 
   // OpenAI Chat Completions & Anthropic deltas
@@ -1005,13 +1364,58 @@ export function parseRichReply(data: string): RichFragment {
         });
       }
     }
+    if (delta.annotations) {
+      for (let i = 0; i < delta.annotations.length; i++) {
+        pushAnnotationHit(rawHits, delta.annotations[i]);
+      }
+    }
+  }
+  if (choice?.message?.annotations && delta !== choice.message) {
+    for (let i = 0; i < choice.message.annotations.length; i++) {
+      pushAnnotationHit(rawHits, choice.message.annotations[i]);
+    }
+  }
+  if (event.annotations) {
+    for (let i = 0; i < event.annotations.length; i++) {
+      pushAnnotationHit(rawHits, event.annotations[i]);
+    }
+  }
+  if (event.citations) {
+    for (let i = 0; i < event.citations.length; i++) {
+      const cItem = event.citations[i];
+      if (typeof cItem === 'string') {
+        const cUrl = cItem.trim();
+        if (cUrl) {
+          rawHits.push({ title: cUrl, url: cUrl, excerpt: '' });
+        }
+      } else {
+        pushAnnotationHit(rawHits, cItem);
+      }
+    }
+  }
+  if (event.web_search) {
+    for (let i = 0; i < event.web_search.length; i++) {
+      const ws = event.web_search[i];
+      const url = (ws.link || ws.url || '').trim();
+      if (!url) {
+        continue;
+      }
+      rawHits.push({
+        title: (ws.title || '').trim() || url,
+        url,
+        excerpt: (ws.content || '').trim()
+      });
+    }
+  }
+  if (event.output) {
+    collectResponsesOutputCitations(rawHits, event.output);
   }
 
-  // Gemini / Vertex / Anthropic non-stream parts
-  const parts = event.candidates?.[0]?.content?.parts ?? event.content;
-  if (parts) {
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
+  // Gemini / Vertex parts & groundingMetadata
+  const gemParts = event.candidates?.[0]?.content?.parts;
+  if (gemParts) {
+    for (let i = 0; i < gemParts.length; i++) {
+      const part = gemParts[i];
       if (part.thought) {
         result.reasoning += part.text || '';
       } else if (part.functionCall) {
@@ -1033,6 +1437,27 @@ export function parseRichReply(data: string): RichFragment {
         result.text += part.text || '';
       }
     }
+  }
+  collectGeminiGroundingCitations(rawHits, event.candidates?.[0]?.groundingMetadata ?? event.groundingMetadata);
+
+  // Anthropic non-stream content blocks
+  if (event.content) {
+    for (let i = 0; i < event.content.length; i++) {
+      const block = event.content[i];
+      if (block.type === 'thinking') {
+        result.reasoning += block.thinking || '';
+      } else if (block.type === 'web_search_tool_result') {
+        collectClaudeBlockCitations(rawHits, block);
+      } else {
+        result.text += block.text || '';
+        collectClaudeBlockCitations(rawHits, block);
+      }
+    }
+  }
+
+  const dedupedHits = mergeDeduplicatedCitations([], rawHits);
+  if (dedupedHits.length > 0) {
+    result.citations = dedupedHits;
   }
 
   result.usage = usageFromWire(event.usage ?? event.usageMetadata ?? event.message?.usage);

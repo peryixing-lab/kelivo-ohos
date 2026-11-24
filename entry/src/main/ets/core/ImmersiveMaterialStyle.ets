@@ -106,8 +106,14 @@ export class ImmersiveMaterialStyle {
     return ImmersiveMaterialStyle.ultraThickCache;
   }
 
-  private static cachedUltraThin(tint: string, lightHex: string, invert: boolean): uiMaterial.ImmersiveMaterial {
-    const key = `${tint}_${lightHex}_${invert ? '1' : '0'}`;
+  private static cachedUltraThin(
+    tint: string,
+    lightHex: string,
+    invert: boolean,
+    applyShadow: boolean = false,
+    interactive: boolean = true
+  ): uiMaterial.ImmersiveMaterial {
+    const key = `${tint}_${lightHex}_${invert ? '1' : '0'}_${applyShadow ? '1' : '0'}_${interactive ? '1' : '0'}`;
     const existing = ImmersiveMaterialStyle.ultraThinCache.get(key);
     if (existing !== undefined) {
       return existing;
@@ -119,8 +125,8 @@ export class ImmersiveMaterialStyle {
       style: uiMaterial.ImmersiveStyle.ULTRA_THIN,
       materialColor: tint,
       colorInvert: invert,
-      interactive: true,
-      applyShadow: false,
+      interactive,
+      applyShadow,
       lightEffect: { color: lightHex }
     });
     ImmersiveMaterialStyle.ultraThinCache.set(key, created);
@@ -281,6 +287,23 @@ export class ImmersiveMaterialStyle {
     const tint = hexWithAlpha(baseHex, active ? (isDark ? 'B0' : '42') : (isDark ? '96' : '58'));
     const lightHex = normalizeHexColor(accentHex, '#4D5C92');
     return ImmersiveMaterialStyle.cachedUltraThin(tint, lightHex, !active);
+  }
+
+  static titleCapsuleMaterial(
+    surfaceHex: string,
+    accentHex: string,
+    isDark: boolean,
+    enabled: boolean
+  ): uiMaterial.Material | undefined {
+    if (!ImmersiveMaterialStyle.isApi26Available()) {
+      return undefined;
+    }
+    if (!enabled || !ImmersiveMaterialStyle.isSupported()) {
+      return uiMaterial.Material.empty;
+    }
+    const tint = hexWithAlpha(normalizeHexColor(surfaceHex, '#FFFFFF'), isDark ? '8C' : '52');
+    const lightHex = normalizeHexColor(accentHex, '#4D5C92');
+    return ImmersiveMaterialStyle.cachedUltraThin(tint, lightHex, true, true, false);
   }
 
   static menuOptions(enabled: boolean): MenuOptions {

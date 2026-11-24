@@ -10,13 +10,131 @@ export struct SearchQuickSheet {
   @Prop searchServices: SearchServiceConfig[] = [];
   @Prop activeSearchId: string = '';
   @Prop immersiveLightEnabled: boolean = true;
+  @Prop supportsBuiltinSearch: boolean = false;
+  @Prop builtinSearchOn: boolean = false;
+  @Prop needsResponsesHint: boolean = false;
+  @Prop supportsClaudeDynamicSearch: boolean = false;
+  @Prop claudeDynamicSearchOn: boolean = false;
 
   onToggleSearch: (enabled: boolean) => void = () => {};
   onSelectSearchService: (id: string) => void = () => {};
   onOpenSearchSettings: () => void = () => {};
+  onToggleBuiltinSearch: (enabled: boolean) => void = () => {};
+  onToggleClaudeDynamicSearch: (enabled: boolean) => void = () => {};
+  onOpenProviderSettings: () => void = () => {};
 
   build() {
     Column({ space: 10 }) {
+      if (this.supportsBuiltinSearch) {
+        Row({ space: 10 }) {
+          SymbolGlyph($r('sys.symbol.magnifyingglass'))
+            .fontSize(20)
+            .fontColor([$r('app.color.accent')])
+          Column({ space: 2 }) {
+            Text('模型内置搜索')
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.ink'))
+              .maxLines(1)
+            Text('使用模型自带联网搜索，自动关闭外置服务')
+              .fontSize(11)
+              .fontColor($r('app.color.muted'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          Toggle({ type: ToggleType.Switch, isOn: this.builtinSearchOn })
+            .selectedColor($r('app.color.accent'))
+            .onChange((v: boolean) => {
+              if (v !== this.builtinSearchOn) {
+                this.onToggleBuiltinSearch(v);
+              }
+            })
+            .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(14)
+        .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
+        .onClick(() => {
+          this.onToggleBuiltinSearch(!this.builtinSearchOn);
+        })
+
+        if (this.supportsClaudeDynamicSearch && this.builtinSearchOn) {
+          Row({ space: 10 }) {
+            SymbolGlyph($r('sys.symbol.magnifyingglass'))
+              .fontSize(18)
+              .fontColor([$r('app.color.accent')])
+            Column({ space: 2 }) {
+              Text('动态过滤')
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.ink'))
+                .maxLines(1)
+              Text('筛选搜索结果，节省 token')
+                .fontSize(11)
+                .fontColor($r('app.color.muted'))
+                .maxLines(1)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+
+            Toggle({ type: ToggleType.Switch, isOn: this.claudeDynamicSearchOn })
+              .selectedColor($r('app.color.accent'))
+              .onChange((v: boolean) => {
+                if (v !== this.claudeDynamicSearchOn) {
+                  this.onToggleClaudeDynamicSearch(v);
+                }
+              })
+              .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+          }
+          .width('100%')
+          .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+          .borderRadius(14)
+          .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
+          .onClick(() => {
+            this.onToggleClaudeDynamicSearch(!this.claudeDynamicSearchOn);
+          })
+        }
+      } else if (this.needsResponsesHint) {
+        Row({ space: 10 }) {
+          SymbolGlyph($r('sys.symbol.magnifyingglass'))
+            .fontSize(20)
+            .fontColor([$r('app.color.muted')])
+          Column({ space: 2 }) {
+            Text('模型内置搜索')
+              .fontSize(15)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.ink'))
+              .maxLines(1)
+            Text('当前服务商需在设置中切换为 OpenAI Responses 协议')
+              .fontSize(11)
+              .fontColor($r('app.color.muted'))
+              .maxLines(2)
+          }
+          .alignItems(HorizontalAlign.Start)
+          .layoutWeight(1)
+
+          Button('去设置')
+            .type(ButtonType.Normal)
+            .height(28)
+            .fontSize(12)
+            .borderRadius(8)
+            .padding({ left: 10, right: 10 })
+            .backgroundColor($r('app.color.tint'))
+            .fontColor($r('app.color.accent'))
+            .onClick(() => {
+              this.onOpenProviderSettings();
+            })
+        }
+        .width('100%')
+        .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+        .borderRadius(14)
+        .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
+      }
+
       Row({ space: 10 }) {
         SymbolGlyph($r('sys.symbol.globe_badge_message'))
           .fontSize(20)
@@ -37,7 +155,12 @@ export struct SearchQuickSheet {
         .backgroundColor(Color.Transparent)
         .onClick(() => { this.onOpenSearchSettings(); })
         Toggle({ type: ToggleType.Switch, isOn: this.searchOn })
-          .onChange((v: boolean) => { this.onToggleSearch(v); })
+          .selectedColor($r('app.color.accent'))
+          .onChange((v: boolean) => {
+            if (v !== this.searchOn) {
+              this.onToggleSearch(v);
+            }
+          })
           .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
       }
       .width('100%')
@@ -69,19 +192,19 @@ export struct SearchQuickSheet {
               if (svc.id === this.activeSearchId) {
                 SymbolGlyph($r('sys.symbol.checkmark'))
                   .fontSize(17)
-                  .fontColor([$r('app.color.accent')])
+                  .fontColor([this.searchOn ? $r('app.color.accent') : $r('app.color.muted')])
               }
             }
             .width('100%')
             .padding({ left: 12, right: 12, top: 10, bottom: 10 })
             .borderRadius(12)
-            .backgroundColor(svc.id === this.activeSearchId ? $r('app.color.tint') : Color.Transparent)
+            .backgroundColor(svc.id === this.activeSearchId && this.searchOn ? $r('app.color.tint') : Color.Transparent)
             .onClick(() => { this.onSelectSearchService(svc.id); })
           }, (svc: SearchServiceConfig) => svc.id)
         }
         .width('100%')
       }
-      .constraintSize({ maxHeight: 340 })
+      .constraintSize({ maxHeight: 280 })
       .width('100%')
     }
     .width('100%')

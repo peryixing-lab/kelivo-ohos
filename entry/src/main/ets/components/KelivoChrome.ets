@@ -168,17 +168,21 @@ export struct KelivoNavTitleBar {
         Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
           SymbolGlyph(this.rightSymbol)
             .fontSize(19)
-            .fontColor([$r('sys.color.icon_primary')])
+            .fontColor([
+              this.rightPrimary && !ImmersiveMaterialStyle.isActive(this.immersiveLight)
+                ? $r('app.color.accent')
+                : $r('sys.color.icon_primary')
+            ])
         }
         .width(40)
         .height(40)
         .padding(0)
         .backgroundColor(ImmersiveMaterialStyle.headerActionBackground(
-          this.surfaceHex, this.tintHex, this.immersiveLight, false
+          this.surfaceHex, this.tintHex, this.immersiveLight, this.rightPrimary
         ))
         .onClick(() => { this.onRightAction(); })
         .systemMaterial(ImmersiveMaterialStyle.headerActionMaterial(
-          this.surfaceHex, this.accentHex, this.isDark, this.immersiveLight, false
+          this.surfaceHex, this.accentHex, this.isDark, this.immersiveLight, this.rightPrimary
         ))
       }
     }

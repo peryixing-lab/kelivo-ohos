@@ -55,6 +55,9 @@ import {
   defaultQuickPhrases,
   defaultSearchServices,
   defaultSystemSettings,
+  cloneModelSpec,
+  cloneProvider,
+  defaultModelSpec,
   findProviderModelSpec,
   getAllAttachments,
   initialWorkspace,
@@ -65,6 +68,7 @@ import {
   normalizeProxyConfig,
   normalizeQuickPhrases,
   normalizeWorldBooks,
+  preset,
   resolveActiveModel
 } from '../core/Models';
 import { ReasoningControl, effectiveEffort, reasoningBulbRayCount, reasoningControl, reasoningTokens, withReasoning } from '../core/Reasoning';
@@ -98,7 +102,7 @@ import { Narration } from '../core/Narration';
 import { SpeechInputController } from '../core/SpeechInput';
 import { McpManager, McpTool } from '../core/RemoteTools';
 import { McpDiscoveredDescriptor, RegisteredTool, assembleToolRegistry, defaultMaxToolSteps } from '../core/ToolRegistry';
-import { ToolExecutionOutput, runAgentToolLoop } from '../core/ToolLoop';
+import { ToolCallGroup, ToolExecutionOutput, groupToolCallRecords, runAgentToolLoop } from '../core/ToolLoop';
 import { PromptTemplateContext, applyRegexRules, buildAssembledPrompt } from '../core/PromptEngine';
 import {
   buildMemoryInjectionBlock,
@@ -125,9 +129,19 @@ import {
 } from '../core/SystemBridge';
 import { StreamTextSmoother } from '../core/StreamSmoother';
 import { formatLocalDay } from '../core/UsageStatsLogic';
+import {
+  isBuiltInSearchEnabled,
+  isClaudeDynamicSearchEnabled,
+  mergeDeduplicatedCitations,
+  needsMoonshotBuiltinSearchLoop,
+  requiresResponsesApiForBuiltInSearch,
+  supportsBuiltInSearch,
+  supportsClaudeDynamicWebSearch
+} from '../core/BuiltinSearch';
 import { MessageBody } from '../components/MessageBody';
 import { PersonaEditor } from '../components/PersonaEditor';
 import { ProviderEditor } from '../components/ProviderEditor';
+import { ModelSpecEditor } from '../components/ModelSpecEditor';
 import { SearchEditor } from '../components/SearchEditor';
 import { ToolsPanel } from '../components/ToolsPanel';
 import { WebDavPanel } from '../components/WebDavPanel';
@@ -285,6 +299,11 @@ struct Index {
   @State promptTabInit: number = 0;
   @State diagTabInit: number = 0;
   @State providerOpenProxy: boolean = false;
+  @State providerDetailId: string = '';
+  @State providerDetailTab: number = 0;
+  @State modelEditProvider: Provider = preset('', '', 'openai', '', '');
+  @State modelEditSpec: ModelSpec = defaultModelSpec('');
+  @State modelEditIsNew: boolean = false;
   @State globalProxyPasswordPlain: string = '';
   @State personaEditTargetId: string = '';
   @State preferencesSubView: string = '';
@@ -320,6 +339,7 @@ struct Index {
 
   private store?: WorkspaceStore;
   private cachedHostContext?: common.UIAbilityContext;
+  private modelEditSaveCallback?: (spec: ModelSpec) => void = undefined;
   private genRegistry: GenerationSessionRegistry = new GenerationSessionRegistry();
   private mcpManager: McpManager = new McpManager();
   private browserManager: BrowserAgentManager = new BrowserAgentManager();
@@ -1113,7 +1133,80 @@ struct Index {
     this.toast('已重置上下文窗口');
   }
 
+  private currentModelSpec(): ModelSpec {
+    return findProviderModelSpec(this.provider(), this.activeModelId());
+  }
+
+  private currentSupportsBuiltinSearch(): boolean {
+    return supportsBuiltInSearch(this.provider(), this.activeModelId(), this.currentModelSpec());
+  }
+
+  private currentBuiltinSearchOn(): boolean {
+    return isBuiltInSearchEnabled(this.provider(), this.activeModelId());
+  }
+
+  private currentNeedsResponsesHint(): boolean {
+    return requiresResponsesApiForBuiltInSearch(this.provider(), this.activeModelId(), this.currentModelSpec());
+  }
+
+  private currentSupportsClaudeDynamicSearch(): boolean {
+    return supportsClaudeDynamicWebSearch(this.provider(), this.activeModelId(), this.currentModelSpec());
+  }
+
+  private currentClaudeDynamicSearchOn(): boolean {
+    return isClaudeDynamicSearchEnabled(this.provider(), this.activeModelId());
+  }
+
+  private updateCurrentModelBuiltinFlags(updateFn: (spec: ModelSpec) => ModelSpec, save: boolean = true): void {
+    const prov = this.provider();
+    const mid = this.activeModelId();
+    if (!prov || !mid) {
+      return;
+    }
+    const cloned = cloneProvider(prov);
+    const existingModels = cloned.models ? cloned.models.slice() : [];
+    const idx = existingModels.findIndex((m: ModelSpec): boolean => m.id === mid);
+    const baseSpec = idx >= 0 ? existingModels[idx] : defaultModelSpec(mid);
+    const nextSpec = updateFn(cloneModelSpec(baseSpec));
+    if (idx >= 0) {
+      existingModels[idx] = nextSpec;
+    } else {
+      existingModels.unshift(nextSpec);
+    }
+    cloned.models = existingModels;
+    this.workspace.providers = this.workspace.providers.map((item: Provider): Provider =>
+      item.id === cloned.id ? cloned : item
+    );
+    this.modelConfigTick += 1;
+    if (save) {
+      this.persistAction();
+    }
+  }
+
+  private setModelBuiltinSearchEnabled(enabled: boolean): void {
+    if (enabled) {
+      this.setSearchEnabled(false, false);
+    }
+    this.updateCurrentModelBuiltinFlags((spec: ModelSpec): ModelSpec => {
+      spec.builtinSearch = enabled;
+      return spec;
+    }, true);
+  }
+
+  private setModelClaudeDynamicSearchEnabled(enabled: boolean): void {
+    this.updateCurrentModelBuiltinFlags((spec: ModelSpec): ModelSpec => {
+      spec.claudeDynamicSearch = enabled;
+      return spec;
+    }, true);
+  }
+
   private setSearchEnabled(enabled: boolean, save: boolean = true): void {
+    if (enabled && this.currentBuiltinSearchOn()) {
+      this.updateCurrentModelBuiltinFlags((spec: ModelSpec): ModelSpec => {
+        spec.builtinSearch = false;
+        return spec;
+      }, false);
+    }
     this.searchOn = enabled;
     const sys = this.workspace.systemSettings || defaultSystemSettings();
     sys.searchEnabled = enabled;
@@ -1345,6 +1438,29 @@ struct Index {
         this.workspace.modelDefaults.chatModelId = p.model.trim();
       }
     }
+    const checkMid = (p.id === priorId || setActive) ? (this.activeModelId() || p.model.trim()) : p.model.trim();
+    if ((p.id === priorId || setActive) && checkMid) {
+      const prevSpec = priorActiveProv && priorActiveProv.id === p.id
+        ? findProviderModelSpec(priorActiveProv, checkMid)
+        : undefined;
+      const nextSpec = findProviderModelSpec(p, checkMid);
+      if (
+        nextSpec.reasoningDefaultLevel &&
+        nextSpec.reasoningDefaultLevel !== 'auto' &&
+        nextSpec.reasoningDefaultLevel !== prevSpec?.reasoningDefaultLevel
+      ) {
+        const curGen = this.workspace.generationParams || defaultGenerationParams();
+        this.workspace.generationParams = withReasoning(curGen, nextSpec.reasoningDefaultLevel, curGen.reasoningBudget);
+        const curPersona = this.persona();
+        if (curPersona.params?.reasoningEffort) {
+          curPersona.params = withReasoning(
+            curPersona.params,
+            nextSpec.reasoningDefaultLevel,
+            curPersona.params.reasoningBudget
+          );
+        }
+      }
+    }
     try { await this.persist(); }
     catch (e) {
       this.workspace.providers = previous;
@@ -1526,7 +1642,11 @@ struct Index {
   }
 
   private activeReasoningEffort(): ReasoningEffort {
-    return effectiveEffort(this.activeReasoningControl(), this.effectiveParams().reasoningEffort || 'off');
+    const spec = findProviderModelSpec(this.provider(), this.activeModelId());
+    const fallback: ReasoningEffort = (spec.reasoningDefaultLevel && spec.reasoningDefaultLevel !== 'auto')
+      ? spec.reasoningDefaultLevel
+      : 'off';
+    return effectiveEffort(this.activeReasoningControl(), this.effectiveParams().reasoningEffort || fallback);
   }
 
   private isActiveReasoningToggleOnly(): boolean {
@@ -2415,6 +2535,9 @@ struct Index {
     const sysPrompt = (target.overridePrompt || persona.prompt || '').trim();
     const params = this.effectiveParams();
     const useSearchOn = this.searchOn;
+    const useBuiltinSearch = isBuiltInSearchEnabled(p, modelId);
+    const useClaudeDynamicSearch = isClaudeDynamicSearchEnabled(p, modelId);
+    const effectiveExternalSearch = useSearchOn && !useBuiltinSearch;
     const useImageGen = this.imageGenMode;
     const useFullAccess = this.fullAccessMode;
     const useBrowserPanel = this.sidePanelMode === 'browser';
@@ -2479,6 +2602,7 @@ struct Index {
     let thoughts = '';
     let genImages: Attachment[] = [];
     let toolCallsUsed: ToolCallRecord[] = [];
+    let replySources: SearchHit[] = [];
     const finalUsage: TokenUsage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0, totalTokens: 0, durationMs: 0 };
     let hasUsage = false;
     let isImageTask = useImageGen;
@@ -2648,7 +2772,7 @@ struct Index {
       const question = history[history.length - 1];
       const activeSearch = this.activeSearchService();
       const searchMode = activeSearch?.mode || 'pre_search';
-      if (useSearchOn && searchMode === 'pre_search' && question.text && !question.sources?.length) {
+      if (effectiveExternalSearch && searchMode === 'pre_search' && question.text && !question.sources?.length) {
         job.fetchingSources = true;
         if (isViewingThisChat()) this.fetchingSources = true;
         backgroundGenerationManager.updateTask(target.id, latestChatTitle(), 'searching', 0);
@@ -2790,8 +2914,8 @@ struct Index {
         ];
         const registeredTools = modelSpec.tools ? assembleToolRegistry({
           searchService: activeSearch,
-          searchEnabled: useSearchOn,
-          builtinFetchEnabled: sysCfg.builtinFetchEnabled && useSearchOn,
+          searchEnabled: effectiveExternalSearch,
+          builtinFetchEnabled: sysCfg.builtinFetchEnabled && effectiveExternalSearch,
           mcpTools: mcpDescriptors,
           mcpServers,
           extraTools,
@@ -2800,7 +2924,7 @@ struct Index {
 
         const useStreamMode = persona.streamOutput !== false;
 
-        if (registeredTools.length > 0) {
+        if (registeredTools.length > 0 || needsMoonshotBuiltinSearchLoop(p, modelId, useBuiltinSearch)) {
           const permMode: ToolPermissionMode = useFullAccess ? 'full' : (target.toolPermissionMode || sysCfg.defaultToolPermission);
           const loopOut = await runAgentToolLoop({
             provider: p,
@@ -2815,6 +2939,8 @@ struct Index {
             presetMessages: undefined,
             customHeaders: persona.customHeaders,
             customBodyJson: persona.customBodyJson,
+            builtinSearch: useBuiltinSearch,
+            claudeDynamicSearch: useClaudeDynamicSearch,
             tools: registeredTools,
             permissionMode: permMode,
             maxSteps: defaultMaxToolSteps(sysCfg),
@@ -2868,6 +2994,7 @@ struct Index {
           thoughts = loopOut.reasoning;
           toolCallsUsed = loopOut.toolCalls;
           if (loopOut.generatedImages.length) genImages.push(...loopOut.generatedImages);
+          if (loopOut.citations.length) replySources = mergeDeduplicatedCitations(replySources, loopOut.citations);
           if (loopOut.usage) {
             finalUsage.promptTokens = loopOut.usage.promptTokens;
             finalUsage.completionTokens = loopOut.usage.completionTokens;
@@ -2886,9 +3013,10 @@ struct Index {
             customHeaders: persona.customHeaders,
             customBodyJson: persona.customBodyJson,
             promptCaching: p.promptCaching,
-            builtinSearch: p.builtinSearch,
-            builtinUrlContext: p.builtinUrlContext,
-            builtinCodeExec: p.builtinCodeExec
+            builtinSearch: useBuiltinSearch,
+            claudeDynamicSearch: useClaudeDynamicSearch,
+            builtinUrlContext: modelSpec.builtinUrlContext !== undefined ? modelSpec.builtinUrlContext : p.builtinUrlContext,
+            builtinCodeExec: modelSpec.builtinCodeExec !== undefined ? modelSpec.builtinCodeExec : p.builtinCodeExec
           };
           const call = makeAdvancedChatCall(p, auth.key, assembled.systemPrompt, assembled.messages, callOpts);
 
@@ -2912,6 +3040,9 @@ struct Index {
             answer += part.text;
             thoughts += part.reasoning;
             if (part.generatedImages.length) genImages.push(...part.generatedImages);
+            if (part.citations && part.citations.length > 0) {
+              replySources = mergeDeduplicatedCitations(replySources, part.citations);
+            }
             if (part.usage) {
               finalUsage.promptTokens = part.usage.promptTokens;
               finalUsage.completionTokens = part.usage.completionTokens;
@@ -2987,7 +3118,8 @@ struct Index {
               createdAt: Date.now(),
               usage: recordedUsage,
               toolCalls: toolCallsUsed.length ? toolCallsUsed : undefined,
-              generatedImages: genImages.length ? genImages : undefined
+              generatedImages: genImages.length ? genImages : undefined,
+              sources: replySources.length ? replySources : undefined
             });
           } else {
             nextMsg = {
@@ -3000,7 +3132,8 @@ struct Index {
               createdAt: Date.now(),
               usage: recordedUsage,
               toolCalls: toolCallsUsed.length ? toolCallsUsed : undefined,
-              generatedImages: genImages.length ? genImages : undefined
+              generatedImages: genImages.length ? genImages : undefined,
+              sources: replySources.length ? replySources : undefined
             };
           }
           const finalMessages = [...history, nextMsg, ...tailMessages];
@@ -3802,7 +3935,7 @@ struct Index {
               .onClick(() => {
                 this.drawerAssistantsExpanded = false;
                 this.personaEditTargetId = pItem.id;
-                this.navigateTo('personas');
+                this.navigateTo('persona_detail');
               })
             }
             .width('100%')
@@ -4054,6 +4187,8 @@ struct Index {
       case 'update_user_profile': return '更新用户画像';
       case 'web_search': return '搜索网页';
       case 'web_fetch': return '读取网页';
+      case '$web_search':
+      case 'builtin_search': return '模型内置搜索';
       default: return name;
     }
   }
@@ -4076,17 +4211,53 @@ struct Index {
     }.width('100%').padding(10).alignItems(HorizontalAlign.Start)
   }
 
+  private toolRecordStatusLabel(status: string): string {
+    if (status === 'pending') return '待授权';
+    if (status === 'running') return '执行中';
+    if (status === 'denied') return '已拒绝';
+    if (status === 'error') return '失败';
+    return '完成';
+  }
+
+  private toolGroupBadgeText(grp: ToolCallGroup): string {
+    if (grp.status === 'pending') return '待授权';
+    if (grp.status === 'running') return '执行中';
+    if (grp.status === 'denied') return '已拒绝';
+    if (grp.status === 'error') return '失败';
+    if (grp.failedCount > 0) return `${grp.failedCount} 次失败`;
+    return '';
+  }
+
   @Builder
-  toolCallRow(tc: ToolCallRecord, rowId: string, isLive: boolean) {
+  toolCallGroupRow(grp: ToolCallGroup, rowId: string, isLive: boolean) {
     Column({ space: 4 }) {
       Button({ type: ButtonType.Normal }) {
         Row({ space: 8 }) {
           Text('•••').fontSize(11).fontColor($r('app.color.muted'))
-          Text(this.toolRowLabel(tc.name)).fontSize(13).fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.muted')).layoutWeight(1).maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
-          if (tc.status !== 'done') {
-            Text(tc.status === 'pending' ? '待授权' : tc.status === 'running' ? '执行中' : tc.status === 'denied' ? '已拒绝' : '失败')
-              .fontSize(11).fontColor(tc.status === 'error' || tc.status === 'denied' ? $r('app.color.warning') : $r('app.color.accent'))
+          Row({ space: 5 }) {
+            Text(this.toolRowLabel(grp.name))
+              .fontSize(13)
+              .fontWeight(FontWeight.Medium)
+              .fontColor($r('app.color.muted'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .constraintSize({ maxWidth: '80%' })
+            if (grp.count > 1) {
+              Text(`×${grp.count}`)
+                .fontSize(11)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.muted'))
+            }
+          }
+          .layoutWeight(1)
+          .alignItems(VerticalAlign.Center)
+
+          if (this.toolGroupBadgeText(grp).length > 0) {
+            Text(this.toolGroupBadgeText(grp))
+              .fontSize(11)
+              .fontColor((grp.status === 'error' || grp.status === 'denied' || grp.failedCount > 0)
+                ? $r('app.color.warning')
+                : $r('app.color.accent'))
           }
           SymbolGlyph(this.expandedToolId === rowId ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
             .fontSize(12).fontColor([$r('app.color.muted')])
@@ -4096,21 +4267,37 @@ struct Index {
       .onClick(() => { this.expandedToolId = this.expandedToolId === rowId ? '' : rowId; })
 
       if (this.expandedToolId === rowId) {
-        Column({ space: 4 }) {
-          Text(tc.name + (tc.durationMs > 0 ? ' · ' + tc.durationMs + ' ms' : ''))
-            .fontSize(11).fontColor($r('app.color.muted'))
-          Text('参数：' + tc.argsJson).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
-            .copyOption(CopyOptions.LocalDevice)
-          if (tc.diffText) {
-            Text(tc.diffText).fontFamily('monospace').fontSize(11).fontColor($r('app.color.ink'))
-              .padding(6).borderRadius(6).backgroundColor($r('app.color.surface')).copyOption(CopyOptions.LocalDevice)
-          }
-          if (tc.resultText) {
-            Text(tc.resultText.slice(0, 2000)).fontSize(12).fontColor($r('app.color.ink')).copyOption(CopyOptions.LocalDevice)
-          }
+        Column({ space: 8 }) {
+          ForEach(grp.records, (tc: ToolCallRecord, idx: number) => {
+            Column({ space: 4 }) {
+              if (grp.count > 1) {
+                if (idx > 0) {
+                  Divider().color($r('app.color.line')).margin({ bottom: 2 })
+                }
+                Text(`#${idx + 1} · ${this.toolRecordStatusLabel(tc.status)}${tc.durationMs > 0 ? ' · ' + tc.durationMs + ' ms' : ''}`)
+                  .fontSize(11)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor((tc.status === 'error' || tc.status === 'denied') ? $r('app.color.warning') : $r('app.color.muted'))
+              } else {
+                Text(tc.name + (tc.durationMs > 0 ? ' · ' + tc.durationMs + ' ms' : ''))
+                  .fontSize(11).fontColor($r('app.color.muted'))
+              }
+              Text('参数：' + tc.argsJson).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
+                .copyOption(CopyOptions.LocalDevice)
+              if (tc.diffText) {
+                Text(tc.diffText).fontFamily('monospace').fontSize(11).fontColor($r('app.color.ink'))
+                  .padding(6).borderRadius(6).backgroundColor($r('app.color.surface')).copyOption(CopyOptions.LocalDevice)
+              }
+              if (tc.resultText) {
+                Text(tc.resultText.slice(0, 2000)).fontSize(12).fontColor($r('app.color.ink')).copyOption(CopyOptions.LocalDevice)
+              }
+            }
+            .width('100%')
+            .alignItems(HorizontalAlign.Start)
+          }, (tc: ToolCallRecord, idx: number) => `${rowId}-${idx}-${tc.id}-${tc.status}`)
         }.width('100%').alignItems(HorizontalAlign.Start).padding({ left: 12, right: 12, bottom: 8 })
       }
-      if (isLive && tc.status === 'pending' && this.pendingApprovalTool === tc.name) {
+      if (isLive && grp.status === 'pending' && this.pendingApprovalTool === grp.name) {
         this.toolApprovalControls()
       }
     }.width('100%').alignItems(HorizontalAlign.Start)
@@ -4169,9 +4356,13 @@ struct Index {
           }
         }
         if (this.chatDisplayCfg().showToolCards) {
-          ForEach($$.records, (tc: ToolCallRecord, index: number) => {
-            this.toolCallRow(tc, $$.messageId + '/' + index + '/' + tc.id, $$.messageId === this.liveMessageId && this.working)
-          }, (tc: ToolCallRecord, index: number) => $$.messageId + '/' + index + '/' + tc.id + '/' + tc.status)
+          ForEach(
+            groupToolCallRecords($$.records),
+            (grp: ToolCallGroup) => {
+              this.toolCallGroupRow(grp, $$.messageId + '/' + grp.name, $$.messageId === this.liveMessageId && this.working);
+            },
+            (grp: ToolCallGroup) => `${$$.messageId}/${grp.name}/${grp.count}/${grp.status}/${grp.failedCount}`
+          )
         }
       }.width('100%').padding({ top: 2, bottom: 2 }).borderRadius(16)
         .clip(true)
@@ -4267,6 +4458,44 @@ struct Index {
             .backgroundBlurStyle(this.appearanceCfg().bubbleStyle === 'frosted' ? BlurStyle.COMPONENT_THICK : BlurStyle.NONE)
           }, (para: string, pi: number) => `${msg.id}-${this.versionLabel(msg)}-p-${pi}-${para.length}-${this.appearanceCfg().bubbleStyle}-${this.appearanceCfg().fitAssistantBubble}`)
 
+          if (msg.sources?.length) {
+            Button('搜索来源 · ' + msg.sources.length)
+              .type(ButtonType.Normal)
+              .height(28)
+              .fontSize(12)
+              .borderRadius(14)
+              .padding({ left: 10, right: 10 })
+              .fontColor($r('app.color.accent'))
+              .backgroundColor($r('app.color.tint'))
+              .onClick(() => { this.expandedSources = this.expandedSources === msg.id ? '' : msg.id; })
+            if (this.expandedSources === msg.id) {
+              Column({ space: 6 }) {
+                ForEach(msg.sources, (hit: SearchHit, i: number) => {
+                  Column({ space: 2 }) {
+                    Text(`[${i + 1}] ${hit.title || hit.url}`)
+                      .fontSize(12)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor($r('app.color.ink'))
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                    Text(hit.url)
+                      .fontSize(11)
+                      .fontColor($r('app.color.accent'))
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  }
+                  .width('100%')
+                  .alignItems(HorizontalAlign.Start)
+                  .padding({ left: 10, right: 10, top: 6, bottom: 6 })
+                  .borderRadius(8)
+                  .backgroundColor($r('app.color.panel'))
+                  .onClick(() => { this.openUrlInBrowser(hit.url); })
+                }, (hit: SearchHit, i: number) => `${msg.id}-src-${i}-${hit.url}`)
+              }
+              .width('100%')
+              .alignItems(HorizontalAlign.Start)
+            }
+          }
           if (msg.generatedImages?.length && this.chatDisplayCfg().showFilesBelowReplies) {
             Row({ space: 8 }) {
               ForEach(msg.generatedImages, (imgAtt: Attachment, ii: number) => {
@@ -4807,16 +5036,22 @@ struct Index {
       .onClick(() => { this.showModelQuickSheet = true; })
 
       Button({ type: ButtonType.Normal, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-        SymbolGlyph($r('sys.symbol.globe_badge_message'))
+        SymbolGlyph(this.currentBuiltinSearchOn()
+          ? $r('sys.symbol.magnifyingglass')
+          : $r('sys.symbol.globe_badge_message'))
           .fontSize(19)
-          .fontColor([this.searchOn ? $r('app.color.accent') : this.composerInactiveIconColor()])
+          .fontColor([(this.currentBuiltinSearchOn() || this.searchOn)
+            ? $r('app.color.accent')
+            : this.composerInactiveIconColor()])
       }
       .id('webSearch')
       .width(36)
       .height(36)
       .padding(0)
       .borderRadius(10)
-      .accessibilityText(this.searchOn ? '联网搜索已开启' : '联网搜索')
+      .accessibilityText(this.currentBuiltinSearchOn()
+        ? '模型内置搜索已开启'
+        : (this.searchOn ? '联网搜索已开启' : '联网搜索'))
       .enabled(!this.working && !this.picking)
       .backgroundColor(Color.Transparent)
       .onClick(() => { this.showSearchQuickSheet = true; })
@@ -5515,6 +5750,11 @@ struct Index {
         searchServices: this.workspace.searchServices || defaultSearchServices(),
         activeSearchId: this.workspace.activeSearchId || '',
         immersiveLightEnabled: this.immersiveLightOn(),
+        supportsBuiltinSearch: this.currentSupportsBuiltinSearch(),
+        builtinSearchOn: this.currentBuiltinSearchOn(),
+        needsResponsesHint: this.currentNeedsResponsesHint(),
+        supportsClaudeDynamicSearch: this.currentSupportsClaudeDynamicSearch(),
+        claudeDynamicSearchOn: this.currentClaudeDynamicSearchOn(),
         onToggleSearch: (enabled: boolean) => {
           this.setSearchEnabled(enabled);
         },
@@ -5524,6 +5764,17 @@ struct Index {
         onOpenSearchSettings: () => {
           this.showSearchQuickSheet = false;
           this.navigateTo('search');
+        },
+        onToggleBuiltinSearch: (enabled: boolean) => {
+          this.setModelBuiltinSearchEnabled(enabled);
+        },
+        onToggleClaudeDynamicSearch: (enabled: boolean) => {
+          this.setModelClaudeDynamicSearchEnabled(enabled);
+        },
+        onOpenProviderSettings: () => {
+          this.showSearchQuickSheet = false;
+          this.providerOpenProxy = false;
+          this.navigateTo('providers');
         }
       })
     }
@@ -5871,29 +6122,112 @@ struct Index {
   }
 
   @Builder
+  providerNavPage(pageMode: 'list' | 'detail', initialProviderId: string, initialTab: number) {
+    ProviderEditor({
+      providers: this.workspace.providers,
+      activeId: this.workspace.activeProvider,
+      pageMode,
+      initialProviderId,
+      initialTab,
+      modelDefaults: this.workspace.modelDefaults || {
+        chatProviderId: '', chatModelId: '', titleProviderId: '', titleModelId: '',
+        translateProviderId: '', translateModelId: '', ocrProviderId: '', ocrModelId: '',
+        memoryProviderId: '', memoryModelId: ''
+      },
+      onApply: (p: Provider, key: string, reuse: boolean, setActive: boolean) => this.applyProvider(p, key, reuse, setActive),
+      onImportProviders: (items: ImportedProvider[]) => this.importProviders(items),
+      onDeleteProvider: (id: string) => this.deleteProvider(id),
+      onStartOAuth: (kind: OAuthProviderKind) => {
+        this.oauthKind = kind;
+        SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
+          this.oauthModalVisible = true;
+        });
+      },
+      onOpenDetail: (pid: string, tab: number) => {
+        this.providerDetailId = pid;
+        this.providerDetailTab = tab;
+        this.navigateTo('provider_detail');
+      },
+      onOpenModelEditor: (
+        editProv: Provider,
+        editSpec: ModelSpec,
+        isNew: boolean,
+        onSaved: (spec: ModelSpec) => void
+      ) => {
+        this.modelEditProvider = cloneProvider(editProv);
+        this.modelEditSpec = cloneModelSpec(editSpec);
+        this.modelEditIsNew = isNew;
+        this.modelEditSaveCallback = onSaved;
+        this.navigateTo('model_edit');
+      },
+      onDismissOverlay: () => this.dismissTopOverlay(),
+      onRouteShown: () => { this.syncActiveRouteFromStack(); },
+      onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+      onClose: () => { this.navigateBack(); }
+    })
+  }
+
+  @Builder
+  personaNavPage(pageMode: 'list' | 'detail', initialEditId: string) {
+    PersonaEditor({
+      personas: this.workspace.personas,
+      activeId: this.persona().id,
+      pageMode,
+      initialEditId,
+      providers: this.workspace.providers,
+      worldBooks: this.workspace.worldBooks || [],
+      mcpServers: this.workspace.mcpServers || [],
+      skills: this.workspace.skills || defaultBuiltinSkills(),
+      localWorkspaces: this.workspace.workspaces || [],
+      memories: this.workspace.memories || [],
+      memorySettings: normalizeMemorySettings(this.workspace.memorySettings),
+      organizingMemoryAssistantId: this.organizingMemoryAssistantId,
+      memoryTraces: this.workspace.memoryTraces || [],
+      onSavePersona: (p: Persona, setActive: boolean) => this.savePersona(p, setActive),
+      onDeletePersona: (id: string) => this.deletePersonaById(id),
+      onApply: (p: Persona) => this.applyPersona(p),
+      onSaveMemories: async (entries: MemoryEntry[]) => {
+        this.workspace.memories = entries;
+        await this.persist();
+      },
+      onOrganizeMemory: (asstId: string) => this.organizeMemoryForAssistant(asstId),
+      onOpenMemorySettings: () => { this.navigateTo('memory'); },
+      onOpenDetail: (pid: string) => {
+        this.personaEditTargetId = pid;
+        this.navigateTo('persona_detail');
+      },
+      onDismissOverlay: () => this.dismissTopOverlay(),
+      onRouteShown: () => { this.syncActiveRouteFromStack(); },
+      onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+      onClose: () => { this.navigateBack(); }
+    })
+  }
+
+  @Builder
   routeDestination(name: string, _param: Object) {
     if (name === 'providers') {
-      ProviderEditor({
-        providers: this.workspace.providers,
-        activeId: this.workspace.activeProvider,
-        initialViewMode: this.providerOpenProxy ? 'detail' : 'list',
-        initialTab: this.providerOpenProxy ? 2 : 0,
-        modelDefaults: this.workspace.modelDefaults || {
-          chatProviderId: '', chatModelId: '', titleProviderId: '', titleModelId: '',
-          translateProviderId: '', translateModelId: '', ocrProviderId: '', ocrModelId: '',
-          memoryProviderId: '', memoryModelId: ''
+      this.providerNavPage(this.providerOpenProxy ? 'detail' : 'list', '', this.providerOpenProxy ? 2 : 0)
+    } else if (name === 'provider_detail') {
+      this.providerNavPage('detail', this.providerDetailId, this.providerDetailTab)
+    } else if (name === 'model_edit') {
+      ModelSpecEditor({
+        provider: this.modelEditProvider,
+        initialSpec: this.modelEditSpec,
+        isNew: this.modelEditIsNew,
+        onSave: (spec: ModelSpec) => {
+          if (this.modelEditSaveCallback) {
+            this.modelEditSaveCallback(spec);
+          }
+          this.modelEditSaveCallback = undefined;
+          this.navigateBack();
         },
-        onApply: (p: Provider, key: string, reuse: boolean, setActive: boolean) => this.applyProvider(p, key, reuse, setActive),
-        onImportProviders: (items: ImportedProvider[]) => this.importProviders(items),
-        onDeleteProvider: (id: string) => this.deleteProvider(id),
-        onStartOAuth: (kind: OAuthProviderKind) => {
-          this.oauthKind = kind;
-          SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-            this.oauthModalVisible = true;
-          });
+        onCancel: () => {
+          this.modelEditSaveCallback = undefined;
+          this.navigateBack();
         },
         onDismissOverlay: () => this.dismissTopOverlay(),
-        onClose: () => { this.navigateBack(); }
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); }
       })
     } else if (name === 'context') {
       ContextSheet({
@@ -5938,33 +6272,9 @@ struct Index {
         onClose: () => { this.navigateBack(); }
       })
     } else if (name === 'personas') {
-      PersonaEditor({
-        personas: this.workspace.personas,
-        activeId: this.persona().id,
-        initialEditId: this.personaEditTargetId,
-        providers: this.workspace.providers,
-        worldBooks: this.workspace.worldBooks || [],
-        mcpServers: this.workspace.mcpServers || [],
-        skills: this.workspace.skills || defaultBuiltinSkills(),
-        localWorkspaces: this.workspace.workspaces || [],
-        memories: this.workspace.memories || [],
-        memorySettings: normalizeMemorySettings(this.workspace.memorySettings),
-        organizingMemoryAssistantId: this.organizingMemoryAssistantId,
-        memoryTraces: this.workspace.memoryTraces || [],
-        onSavePersona: (p: Persona, setActive: boolean) => this.savePersona(p, setActive),
-        onDeletePersona: (id: string) => this.deletePersonaById(id),
-        onApply: (p: Persona) => this.applyPersona(p),
-        onSaveMemories: async (entries: MemoryEntry[]) => {
-          this.workspace.memories = entries;
-          await this.persist();
-        },
-        onOrganizeMemory: (asstId: string) => this.organizeMemoryForAssistant(asstId),
-        onOpenMemorySettings: () => { this.navigateTo('memory'); },
-        onDismissOverlay: () => this.dismissTopOverlay(),
-        onRouteShown: () => { this.syncActiveRouteFromStack(); },
-        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
-        onClose: () => { this.navigateBack(); }
-      })
+      this.personaNavPage('list', '')
+    } else if (name === 'persona_detail') {
+      this.personaNavPage('detail', this.personaEditTargetId)
     } else if (name === 'tools') {
       NavDestination() {
         Column() {

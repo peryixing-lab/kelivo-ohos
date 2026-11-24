@@ -7,10 +7,12 @@ import {
   PresetMessage,
   Provider,
   ProxyConfig,
+  SearchHit,
   TokenUsage,
   ToolCallRecord,
   ToolPermissionMode
 } from './Models';
+import { mergeDeduplicatedCitations } from './BuiltinSearch';
 import {
   ChatCall,
   ChatCallOptions,
@@ -42,6 +44,8 @@ export interface AgentLoopParams {
   presetMessages?: PresetMessage[];
   customHeaders?: HeaderEntry[];
   customBodyJson?: string;
+  builtinSearch?: boolean;
+  claudeDynamicSearch?: boolean;
   tools: RegisteredTool[];
   permissionMode: ToolPermissionMode;
   maxSteps: number;
@@ -60,7 +64,82 @@ export interface AgentLoopResult {
   reasoning: string;
   toolCalls: ToolCallRecord[];
   generatedImages: Attachment[];
+  citations: SearchHit[];
   usage?: TokenUsage;
+}
+
+export interface ToolCallGroup {
+  name: string;
+  records: ToolCallRecord[];
+  count: number;
+  status: 'pending' | 'running' | 'done' | 'error' | 'denied';
+  failedCount: number;
+  totalDurationMs: number;
+}
+
+function resolveGroupStatus(records: ToolCallRecord[]): 'pending' | 'running' | 'done' | 'error' | 'denied' {
+  let hasPending = false;
+  let hasRunning = false;
+  let hasDone = false;
+  let hasError = false;
+  let hasDenied = false;
+  for (let i = 0; i < records.length; i++) {
+    const st = records[i].status;
+    if (st === 'pending') hasPending = true;
+    else if (st === 'running') hasRunning = true;
+    else if (st === 'done') hasDone = true;
+    else if (st === 'error') hasError = true;
+    else if (st === 'denied') hasDenied = true;
+  }
+  if (hasPending) return 'pending';
+  if (hasRunning) return 'running';
+  if (hasDenied && !hasDone && !hasError && !hasPending && !hasRunning) return 'denied';
+  if ((hasError || hasDenied) && !hasDone) return 'error';
+  return 'done';
+}
+
+/**
+ * Collapses repeated tool calls with the same tool name into ordered groups.
+ */
+export function groupToolCallRecords(records: ToolCallRecord[]): ToolCallGroup[] {
+  const groups: ToolCallGroup[] = [];
+  const indexByName = new Map<string, number>();
+
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
+    const existingIdx = indexByName.get(rec.name);
+    if (existingIdx !== undefined) {
+      groups[existingIdx].records.push(rec);
+    } else {
+      indexByName.set(rec.name, groups.length);
+      groups.push({
+        name: rec.name,
+        records: [rec],
+        count: 1,
+        status: rec.status,
+        failedCount: 0,
+        totalDurationMs: 0
+      });
+    }
+  }
+
+  for (let i = 0; i < groups.length; i++) {
+    const grp = groups[i];
+    let failed = 0;
+    let totalMs = 0;
+    for (let j = 0; j < grp.records.length; j++) {
+      const item = grp.records[j];
+      totalMs += item.durationMs;
+      if (item.status === 'error' || item.status === 'denied') {
+        failed += 1;
+      }
+    }
+    grp.count = grp.records.length;
+    grp.failedCount = failed;
+    grp.totalDurationMs = totalMs;
+    grp.status = resolveGroupStatus(grp.records);
+  }
+  return groups;
 }
 
 interface PendingToolCall {
@@ -92,6 +171,7 @@ export async function runAgentToolLoop(params: AgentLoopParams): Promise<AgentLo
   const toolTurns: WireToolTurn[] = [];
   const allToolRecords: ToolCallRecord[] = [];
   const allGeneratedImages: Attachment[] = [];
+  let allCitations: SearchHit[] = [];
   const decls: ToolDeclaration[] = params.tools.map((t: RegisteredTool): ToolDeclaration => t.declaration);
   let permMode: ToolPermissionMode = params.permissionMode;
   let totalText = '';
@@ -115,9 +195,10 @@ export async function runAgentToolLoop(params: AgentLoopParams): Promise<AgentLo
       customHeaders: params.customHeaders,
       customBodyJson: params.customBodyJson,
       promptCaching: params.provider.promptCaching,
-      builtinSearch: params.provider.builtinSearch,
-      builtinUrlContext: params.provider.builtinUrlContext,
-      builtinCodeExec: params.provider.builtinCodeExec
+      builtinSearch: params.builtinSearch,
+      claudeDynamicSearch: params.claudeDynamicSearch,
+      builtinUrlContext: params.modelSpec?.builtinUrlContext ?? params.provider.builtinUrlContext,
+      builtinCodeExec: params.modelSpec?.builtinCodeExec ?? params.provider.builtinCodeExec
     };
     const call = makeAdvancedChatCall(params.provider, params.apiKey, params.systemPrompt, params.history, callOpts);
     params.onContextLog?.(call.body);
@@ -142,6 +223,9 @@ export async function runAgentToolLoop(params: AgentLoopParams): Promise<AgentLo
       }
       if (frag.generatedImages.length > 0) {
         allGeneratedImages.push(...frag.generatedImages);
+      }
+      if (frag.citations && frag.citations.length > 0) {
+        allCitations = mergeDeduplicatedCitations(allCitations, frag.citations);
       }
       if (frag.usage) {
         stepUsage.promptTokens = frag.usage.promptTokens;
@@ -200,6 +284,14 @@ export async function runAgentToolLoop(params: AgentLoopParams): Promise<AgentLo
       params.onUpdate(totalText, totalReasoning, allToolRecords);
 
       const tStart = Date.now();
+      if (pc.name === '$web_search' && params.builtinSearch) {
+        record.status = 'done';
+        record.resultText = '已触发模型内置联网搜索';
+        record.durationMs = Date.now() - tStart;
+        params.onUpdate(totalText, totalReasoning, allToolRecords);
+        toolTurns.push({ role: 'tool', toolCallId: pc.id, toolName: pc.name, toolResult: argsJson });
+        continue;
+      }
       if (!registered) {
         record.status = 'error';
         record.resultText = '未找到工具: ' + pc.name;
@@ -257,6 +349,7 @@ export async function runAgentToolLoop(params: AgentLoopParams): Promise<AgentLo
     reasoning: totalReasoning,
     toolCalls: allToolRecords,
     generatedImages: allGeneratedImages,
+    citations: allCitations,
     usage: lastUsage
   };
 }

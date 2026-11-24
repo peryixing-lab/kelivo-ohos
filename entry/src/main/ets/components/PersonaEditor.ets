@@ -55,6 +55,7 @@ const BUILTIN_LOCAL_TOOLS: LocalToolSpec[] = [
 export struct PersonaEditor {
   @Prop personas: Persona[] = [];
   @Prop activeId: string = '';
+  pageMode: 'list' | 'detail' = 'list';
   @Prop initialEditId: string = '';
   @Prop providers: Provider[] = [];
   @Prop worldBooks: WorldBook[] = [];
@@ -72,12 +73,12 @@ export struct PersonaEditor {
   onSaveMemories: (entries: MemoryEntry[]) => Promise<void> = async () => {};
   onOrganizeMemory: (assistantId: string) => void = () => {};
   onOpenMemorySettings: () => void = () => {};
+  onOpenDetail: (personaId: string) => void = () => {};
   onDismissOverlay: () => boolean = () => false;
   onRouteShown: () => void = () => {};
   onRouteHidden: () => void = () => {};
   onClose: () => void = () => {};
 
-  @State viewMode: 'list' | 'detail' = 'list';
   @State selectedId: string = '';
   @State activeTab: number = 0; // 0:基础设置 1:提示词 2:记忆 3:本地工具 4:技能 5:MCP 6:快捷短语 7:自定义请求 8:正则替换
   @StorageProp('windowTopInsetVp') winTopInset: number = 0;
@@ -162,15 +163,13 @@ export struct PersonaEditor {
   ];
 
   aboutToAppear(): void {
-    const editTarget = this.initialEditId ? this.findPersonaById(this.initialEditId) : undefined;
-    if (editTarget) {
-      this.loadFromPersona(editTarget);
-      this.viewMode = 'detail';
-      return;
-    }
-    const initial = this.findPersonaById(this.activeId) ?? (this.personas.length > 0 ? this.personas[0] : undefined);
-    if (initial) {
-      this.loadFromPersona(initial);
+    if (this.pageMode === 'detail') {
+      const target = (this.initialEditId ? this.findPersonaById(this.initialEditId) : undefined) ??
+        this.findPersonaById(this.activeId) ??
+        (this.personas.length > 0 ? this.personas[0] : undefined);
+      if (target) {
+        this.loadFromPersona(target);
+      }
     }
   }
 
@@ -405,12 +404,8 @@ export struct PersonaEditor {
     }
     const delId = this.selectedId;
     await this.onDeletePersona(delId);
-    const fallback = this.personas.find((item: Persona): boolean => item.id !== delId);
-    if (fallback) {
-      this.loadFromPersona(fallback);
-    }
-    this.setViewMode('list');
     this.showToastTip('已删除助手');
+    this.onClose();
   }
 
   private async saveCurrent(setActive: boolean): Promise<void> {
@@ -430,7 +425,7 @@ export struct PersonaEditor {
     this.showToastTip(this.statusMsg);
   }
 
-  private async createNewPersona(): Promise<void> {
+  private async createNewPersona(): Promise<string> {
     const fresh: Persona = {
       id: 'p_' + newId(),
       name: '新助手',
@@ -444,6 +439,7 @@ export struct PersonaEditor {
     this.loadFromPersona(fresh);
     this.statusMsg = '已新建助手';
     this.showToastTip(this.statusMsg);
+    return fresh.id;
   }
 
   private async cloneCurrentPersona(): Promise<void> {
@@ -493,20 +489,6 @@ export struct PersonaEditor {
 
   private appendTemplateVar(tag: string): void {
     this.editPrompt = this.editPrompt.length > 0 ? `${this.editPrompt}${tag}` : tag;
-  }
-
-  private setViewMode(mode: 'list' | 'detail'): void {
-    this.closeSheet();
-    SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-      this.viewMode = mode;
-    });
-    try {
-      if (mode === 'list') {
-        this.listScroller.scrollTo({ xOffset: 0, yOffset: 0 });
-      } else {
-        this.detailScroller.scrollTo({ xOffset: 0, yOffset: 0 });
-      }
-    } catch (_) {}
   }
 
   private memCategoryLabel(cat: MemoryCategory): string {
@@ -2049,7 +2031,7 @@ export struct PersonaEditor {
 
   @Builder
   private navTitleBar() {
-    if (this.viewMode === 'detail') {
+    if (this.pageMode === 'detail') {
       KelivoNavTitleBar({
         titleText: this.editName || '编辑助手',
         subtitleText: this.selectedId === this.activeId ? '当前启用助手' : '助手配置',
@@ -2058,7 +2040,7 @@ export struct PersonaEditor {
         secondSymbol: this.personas.length > 1 ? $r('sys.symbol.trash') : undefined,
         rightText: '保存',
         rightPrimary: true,
-        onBack: () => { this.setViewMode('list'); },
+        onBack: () => { this.onClose(); },
         onThirdAction: () => { this.cloneCurrentPersona().catch(() => {}); },
         onSecondAction: () => { this.deleteCurrentPersonaAndReturn().catch(() => {}); },
         onRightAction: () => { this.saveCurrent(false).catch(() => {}); }
@@ -2071,8 +2053,8 @@ export struct PersonaEditor {
         rightSymbol: $r('sys.symbol.plus'),
         onBack: () => { this.onClose(); },
         onRightAction: () => {
-          this.createNewPersona().then(() => {
-            this.setViewMode('detail');
+          this.createNewPersona().then((id: string) => {
+            this.onOpenDetail(id);
           });
         }
       })
@@ -2146,8 +2128,7 @@ export struct PersonaEditor {
           .backgroundColor($r('app.color.surface'))
           .border({ width: p.id === this.activeId ? 1.5 : 0, color: $r('app.color.accent') })
           .onClick(() => {
-            this.loadFromPersona(p);
-            this.setViewMode('detail');
+            this.onOpenDetail(p.id);
           })
         }, (p: Persona) => `${p.id}-${p.name}-${p.avatar || ''}-${this.activeId === p.id}`)
       }
@@ -2163,7 +2144,6 @@ export struct PersonaEditor {
     .width('100%')
     .edgeEffect(EdgeEffect.Spring)
     .align(Alignment.Top)
-    .transition(SystemMotion.subViewTransition(this.reduceMotion))
   }
 
   @Builder
@@ -2270,7 +2250,7 @@ export struct PersonaEditor {
             .borderRadius(12)
             .onClick(async () => {
               await this.saveCurrent(true);
-              this.setViewMode('list');
+              this.onClose();
             })
         }
         .width('100%')
@@ -2293,13 +2273,12 @@ export struct PersonaEditor {
     }
     .width('100%')
     .layoutWeight(1)
-    .transition(SystemMotion.subViewTransition(this.reduceMotion))
   }
 
   build() {
     NavDestination() {
       Column() {
-        if (this.viewMode === 'detail') {
+        if (this.pageMode === 'detail') {
           this.personaDetailView()
         } else {
           this.personaListView()
@@ -2337,10 +2316,6 @@ export struct PersonaEditor {
         return true;
       }
       if (this.onDismissOverlay()) {
-        return true;
-      }
-      if (this.viewMode === 'detail') {
-        this.setViewMode('list');
         return true;
       }
       return false;

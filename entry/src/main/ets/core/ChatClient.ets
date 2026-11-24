@@ -495,7 +495,8 @@ export class ChatStream {
       let reasoningPreview = '';
       try {
         await this.runOnce(call, (frag: RichFragment) => {
-          if (frag.text || frag.reasoning || frag.toolCalls.length || frag.generatedImages.length) {
+          if (frag.text || frag.reasoning || frag.toolCalls.length || frag.generatedImages.length ||
+            Boolean(frag.citations && frag.citations.length > 0)) {
             emittedAny = true;
             if (respPreview.length < 2000 && frag.text) respPreview += frag.text;
             if (reasoningPreview.length < 1800 && frag.reasoning) reasoningPreview += frag.reasoning;
@@ -575,7 +576,9 @@ export class ChatStream {
         part.reasoningPhase = part.reasoningPhase ?? split.reasoningPhase;
         part.reasoning = (part.reasoning || '') + split.reasoning;
       }
-      if (part.text || part.reasoning || part.reasoningPhase || part.toolCalls.length || part.generatedImages.length || part.usage || part.done) {
+      if (part.text || part.reasoning || part.reasoningPhase || part.toolCalls.length ||
+        part.generatedImages.length || Boolean(part.citations && part.citations.length > 0) ||
+        part.usage || part.done) {
         onFragment(part);
       }
     };

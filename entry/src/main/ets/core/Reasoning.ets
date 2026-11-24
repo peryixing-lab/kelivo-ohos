@@ -1,7 +1,9 @@
 import { GenerationParams, ModelSpec, Provider, ReasoningEffort, extractUrlHost } from './Models';
 
-type ReasoningDialect = 'effort' | 'router' | 'budgetFlag' | 'thinkingType' | 'kimi' | 'intern' |
+export type ReasoningDialect = 'effort' | 'router' | 'budgetFlag' | 'thinkingType' | 'kimi' | 'intern' |
   'claudeBudget' | 'adaptive' | 'geminiBudget' | 'geminiLevel' | 'fixed';
+
+export const REASONING_NON_OFF_ORDER: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 export interface ReasoningControl {
   dialect: ReasoningDialect;
@@ -21,11 +23,11 @@ export function usesResponsesApi(provider: Provider): boolean {
   return provider.family === 'openai-responses' && !/^(?:v1\/)?chat\/completions$/i.test(path);
 }
 
-export function reasoningControl(provider: Provider, model: string, spec: ModelSpec): ReasoningControl {
+export function inferReasoningControl(provider: Provider, model: string, reasoningEnabled: boolean): ReasoningControl {
   const id = model.toLowerCase();
   const host = extractUrlHost(provider.baseUrl);
   const deepseek = /deepseek-(v4|flash|chat)/.test(id) || (host === 'api.deepseek.com' && !id.includes('r1'));
-  if (!spec.reasoning) return { dialect: 'fixed', levels: [], budgetLimit: 0 };
+  if (!reasoningEnabled) return { dialect: 'fixed', levels: [], budgetLimit: 0 };
 
   if (provider.family === 'gemini' || provider.family === 'vertex') {
     if (/gemini-[34]/.test(id)) {
@@ -91,6 +93,45 @@ export function reasoningControl(provider: Provider, model: string, spec: ModelS
   if (/grok-3-mini/.test(id)) return { dialect: 'effort', levels: ['low', 'high'], budgetLimit: 0 };
   // A custom OpenAI-compatible model explicitly marked as reasoning uses the standard effort field.
   return { dialect: 'effort', levels: STANDARD, budgetLimit: 0 };
+}
+
+function resolveBudgetLimitForDialect(provider: Provider, model: string, dialect: ReasoningDialect): number {
+  if (dialect === 'claudeBudget') {
+    return 32768;
+  }
+  if (dialect === 'geminiBudget') {
+    return model.toLowerCase().includes('2.5-pro') ? 32768 : 24576;
+  }
+  if (dialect === 'budgetFlag') {
+    return usesResponsesApi(provider) ? 0 : 32768;
+  }
+  return 0;
+}
+
+export function reasoningControl(provider: Provider, model: string, spec: ModelSpec): ReasoningControl {
+  if (!spec.reasoning) {
+    return { dialect: 'fixed', levels: [], budgetLimit: 0 };
+  }
+  const base = inferReasoningControl(provider, model, true);
+  const dialect: ReasoningDialect = (spec.reasoningDialect && spec.reasoningDialect !== 'auto')
+    ? spec.reasoningDialect
+    : base.dialect;
+  if (dialect === 'fixed') {
+    return { dialect: 'fixed', levels: [], budgetLimit: 0 };
+  }
+  const budgetLimit = resolveBudgetLimitForDialect(provider, model, dialect);
+  let nonOff: ReasoningEffort[];
+  if (spec.reasoningLevels !== undefined) {
+    nonOff = REASONING_NON_OFF_ORDER.filter((lv: ReasoningEffort): boolean => spec.reasoningLevels!.includes(lv));
+  } else {
+    nonOff = base.levels.filter((lv: ReasoningEffort): boolean => lv !== 'off');
+    if (nonOff.length === 0) {
+      nonOff = ['low', 'medium', 'high'];
+    }
+  }
+  const allowOff = spec.reasoningAllowOff !== undefined ? spec.reasoningAllowOff : base.levels.includes('off');
+  const levels: ReasoningEffort[] = allowOff ? (['off'] as ReasoningEffort[]).concat(nonOff) : nonOff;
+  return { dialect, levels, budgetLimit };
 }
 
 export function withReasoning(params: GenerationParams, effort?: ReasoningEffort, budget?: number): GenerationParams {

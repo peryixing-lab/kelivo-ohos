@@ -3,21 +3,27 @@ import {
   ApiFamily,
   ApiKeyEntry,
   AppearanceConfig,
+  Attachment,
   ChatMessage,
   Conversation,
+  HeaderEntry,
   InstructionCard,
   MemoryEntry,
   MemorySettings,
+  ModelSpec,
   Persona,
   Provider,
   ReasoningEffort,
   QuickPhrase,
   RegexRule,
   ScheduledTask,
+  SearchHit,
   SearchServiceConfig,
+  ToolCallRecord,
   UserProfileField,
   UsageStatRow,
   WorldBook,
+  cloneModelSpec,
   defaultAppearance,
   defaultChatItemDisplay,
   defaultGenerationParams,
@@ -25,6 +31,7 @@ import {
   estimateTokens,
   initialWorkspace,
   isProviderConfigured,
+  messageText,
   normalizeAppearanceConfig,
   normalizeInstructionCards,
   normalizeQuickPhrases,
@@ -118,7 +125,15 @@ import {
 } from '../main/ets/core/SearchAdapters';
 import { parseMcpConfigJson } from '../main/ets/core/McpConfigParser';
 import { RegisteredTool, assembleToolRegistry } from '../main/ets/core/ToolRegistry';
-import { ToolExecutionOutput, accumulateToolDeltas, runAgentToolLoop } from '../main/ets/core/ToolLoop';
+import { ToolCallGroup, ToolExecutionOutput, accumulateToolDeltas, groupToolCallRecords, runAgentToolLoop } from '../main/ets/core/ToolLoop';
+import {
+  applyChatCompletionsBuiltInSearch,
+  isBuiltInSearchEnabled,
+  needsMoonshotBuiltinSearchLoop,
+  requiresResponsesApiForBuiltInSearch,
+  supportsBuiltInSearch,
+  supportsClaudeDynamicWebSearch
+} from '../main/ets/core/BuiltinSearch';
 import {
   computeStackedBarPcts,
   computeUsageDashboard,
@@ -264,7 +279,7 @@ export default function localUnitTest() {
       });
       expect(call.address).assertEqual('https://api.openai.com/v1/responses');
       expect(call.body).assertContain('"instructions":"Be concise"');
-      expect(call.body).assertContain('"web_search_preview"');
+      expect(call.body).assertContain('"type":"web_search"');
       const frag = parseRichReply('{"type":"response.output_text.delta","delta":"hello"}');
       expect(frag.text).assertEqual('hello');
       const tc = parseRichReply('{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"calc","arguments":"{\\"x\\":1}"}}]}}]}');
@@ -1313,15 +1328,22 @@ export default function localUnitTest() {
       expect(clCall.body.includes('"top_p"')).assertFalse();
       expect(clCall.body).assertContain('first\\n\\nsecond');
 
-      // 3. Gemini omits empty object parameters and does not mix googleSearch with functionDeclarations
+      // 3. Gemini 2.x omits empty object parameters, prioritizes googleSearch when builtinSearch is on, and does not mix with functionDeclarations
       const gm = preset('gm2', 'Gemini', 'gemini', 'https://generativelanguage.googleapis.com/v1beta', 'gemini-2.5-flash');
-      gm.builtinSearch = true;
-      const gmCall = makeAdvancedChatCall(gm, 'AIza-test', 'sys', [u1], {
+      gm.builtinSearch = false;
+      const gmFnCall = makeAdvancedChatCall(gm, 'AIza-test', 'sys', [u1], {
         tools: [{ name: 'get_time_info', description: 'time', parametersJson: '{"type":"object","properties":{}}' }]
       });
-      expect(gmCall.body).assertContain('"functionDeclarations"');
-      expect(gmCall.body.includes('"parameters"')).assertFalse();
-      expect(gmCall.body.includes('"googleSearch"')).assertFalse();
+      expect(gmFnCall.body).assertContain('"functionDeclarations"');
+      expect(gmFnCall.body.includes('"parameters"')).assertFalse();
+      expect(gmFnCall.body.includes('"googleSearch"')).assertFalse();
+
+      gm.builtinSearch = true;
+      const gmSearchCall = makeAdvancedChatCall(gm, 'AIza-test', 'sys', [u1], {
+        tools: [{ name: 'get_time_info', description: 'time', parametersJson: '{"type":"object","properties":{}}' }]
+      });
+      expect(gmSearchCall.body).assertContain('"googleSearch"');
+      expect(gmSearchCall.body.includes('"functionDeclarations"')).assertFalse();
 
       // 4. OpenAI Responses ChatGPT codex sets store:false, omits temp/top_p/summary, preserves call_id across deltas
       const codex = preset('cg', 'ChatGPT', 'openai-responses', 'https://chatgpt.com/backend-api/codex', 'gpt-5.4');
@@ -2420,6 +2442,377 @@ export default function localUnitTest() {
       expect(dash.personaRanks[0].ratioPct).assertEqual(100);
       expect(dash.personaRanks[1].key).assertEqual('coder');
       expect(dash.personaRanks[1].label).assertEqual('编程专家');
+    });
+
+    it('builtin_search_support_payloads_citations_and_moonshot_loop', 0, async () => {
+      // 1. Provider / model built-in search capability matrix
+      const geminiProv = preset('gm', 'Google Gemini', 'gemini', 'https://generativelanguage.googleapis.com/v1beta', 'gemini-3-pro-preview');
+      const vertexProv = preset('vx', 'Vertex AI', 'vertex', 'https://aiplatform.googleapis.com/v1', 'gemini-2.5-flash');
+      const claudeProv = preset('cl', 'Anthropic', 'anthropic', 'https://api.anthropic.com/v1', 'claude-sonnet-4-6');
+      const deepseekAnthropic = preset('deepseek', 'DeepSeek', 'anthropic', 'https://api.deepseek.com/anthropic', 'deepseek-chat');
+      const openaiChat = preset('oai-c', 'OpenAI Chat', 'openai', 'https://api.openai.com/v1', 'gpt-5');
+      const openaiChatSearch = preset('oai-cs', 'OpenAI Search', 'openai', 'https://api.openai.com/v1', 'gpt-4o-search-preview');
+      const openaiResp = preset('oai-r', 'OpenAI Resp', 'openai-responses', 'https://api.openai.com/v1', 'gpt-5');
+      const grokChat = preset('xai-c', 'xAI Grok', 'openai', 'https://api.x.ai/v1', 'grok-4');
+      const grokResp = preset('xai-r', 'xAI Grok', 'openai-responses', 'https://api.x.ai/v1', 'grok-4');
+      const orChat = preset('openrouter', 'OpenRouter', 'openai', 'https://openrouter.ai/api/v1', 'openai/gpt-5');
+      const qwenChat = preset('qwen', '阿里云百炼', 'openai', 'https://dashscope.aliyuncs.com/compatible-mode/v1', 'qwen3-max');
+      const zhipuChat = preset('zhipu', '智谱 GLM', 'openai', 'https://open.bigmodel.cn/api/paas/v4', 'glm-4.5');
+      const kimiChat = preset('kimi', 'Moonshot', 'openai', 'https://api.moonshot.cn/v1', 'kimi-k2');
+      const mimoChat = preset('mimo', 'MiMo', 'openai', 'https://api.xiaomimimo.com/v1', 'mimo-v2');
+      const ollamaChat = preset('ollama', 'Ollama', 'openai', 'http://127.0.0.1:11434/v1', 'llama3.3');
+
+      expect(supportsBuiltInSearch(geminiProv, 'gemini-3-pro-preview')).assertTrue();
+      expect(supportsBuiltInSearch(vertexProv, 'gemini-2.5-flash')).assertTrue();
+      expect(supportsBuiltInSearch(claudeProv, 'claude-sonnet-4-6')).assertTrue();
+      expect(supportsClaudeDynamicWebSearch(claudeProv, 'claude-sonnet-4-6')).assertTrue();
+      expect(supportsClaudeDynamicWebSearch(claudeProv, 'claude-3-7-sonnet')).assertFalse();
+      expect(supportsBuiltInSearch(deepseekAnthropic, 'deepseek-chat')).assertFalse();
+      expect(supportsBuiltInSearch(openaiChat, 'gpt-5')).assertFalse();
+      expect(requiresResponsesApiForBuiltInSearch(openaiChat, 'gpt-5')).assertTrue();
+      expect(supportsBuiltInSearch(openaiChatSearch, 'gpt-4o-search-preview')).assertTrue();
+      expect(supportsBuiltInSearch(openaiResp, 'gpt-5')).assertTrue();
+      expect(supportsBuiltInSearch(grokChat, 'grok-4')).assertFalse();
+      expect(requiresResponsesApiForBuiltInSearch(grokChat, 'grok-4')).assertTrue();
+      expect(supportsBuiltInSearch(grokResp, 'grok-4')).assertTrue();
+      expect(supportsBuiltInSearch(orChat, 'openai/gpt-5')).assertTrue();
+      expect(supportsBuiltInSearch(qwenChat, 'qwen3-max')).assertTrue();
+      expect(supportsBuiltInSearch(zhipuChat, 'glm-4.5')).assertTrue();
+      expect(supportsBuiltInSearch(kimiChat, 'kimi-k2')).assertTrue();
+      expect(supportsBuiltInSearch(mimoChat, 'mimo-v2')).assertTrue();
+      expect(supportsBuiltInSearch(ollamaChat, 'llama3.3')).assertFalse();
+      expect(supportsBuiltInSearch(geminiProv, 'imagen-3.0-generate-002')).assertFalse();
+      expect(supportsBuiltInSearch(openaiResp, 'text-embedding-3-large')).assertFalse();
+
+      // 2. Per-model ModelSpec.builtinSearch overrides provider.builtinSearch fallback
+      const gm3Spec: ModelSpec = defaultModelSpec('gemini-3-pro-preview');
+      gm3Spec.builtinSearch = false;
+      geminiProv.builtinSearch = true;
+      geminiProv.models = [gm3Spec];
+      expect(isBuiltInSearchEnabled(geminiProv, 'gemini-3-pro-preview')).assertFalse();
+      gm3Spec.builtinSearch = true;
+      expect(isBuiltInSearchEnabled(geminiProv, 'gemini-3-pro-preview')).assertTrue();
+
+      const uMsg: ChatMessage = { id: 'u1', role: 'user', text: '今天有什么新闻', model: '' };
+
+      // 3. Gemini 3 Pro coexists googleSearch + functionDeclarations with VALIDATED toolConfig
+      const g3Call = makeAdvancedChatCall(geminiProv, 'AIza-key', '', [uMsg], {
+        modelId: 'gemini-3-pro-preview',
+        tools: [{ name: 'memory_read', description: 'read mem', parametersJson: '{"type":"object","properties":{"q":{"type":"string"}}}' }]
+      });
+      expect(g3Call.body).assertContain('"googleSearch"');
+      expect(g3Call.body).assertContain('"functionDeclarations"');
+      expect(g3Call.body).assertContain('"VALIDATED"');
+      expect(g3Call.body).assertContain('"includeServerSideToolInvocations":true');
+
+      // 4. Anthropic basic vs dynamic search and client tool name deduplication
+      const clDynamicSpec: ModelSpec = defaultModelSpec('claude-sonnet-4-6');
+      clDynamicSpec.builtinSearch = true;
+      clDynamicSpec.claudeDynamicSearch = true;
+      claudeProv.models = [clDynamicSpec];
+      const clDynCall = makeAdvancedChatCall(claudeProv, 'sk-ant', '', [uMsg]);
+      expect(clDynCall.body).assertContain('"type":"web_search_20260318"');
+      expect(clDynCall.body).assertContain('"name":"web_search"');
+
+      const clBasicCall = makeAdvancedChatCall(claudeProv, 'sk-ant', '', [uMsg], { claudeDynamicSearch: false });
+      expect(clBasicCall.body).assertContain('"type":"web_search_20250305"');
+
+      const clCollisionCall = makeAdvancedChatCall(claudeProv, 'sk-ant', '', [uMsg], {
+        tools: [{ name: 'web_search', description: 'ext', parametersJson: '{"type":"object","properties":{"q":{"type":"string"}}}' }]
+      });
+      expect(clCollisionCall.body.includes('"web_search_20260318"')).assertFalse();
+
+      // 5. Responses / Grok / OpenRouter / DashScope / Zhipu / Moonshot / OpenAI search payloads
+      const grokCall = makeAdvancedChatCall(grokResp, 'xai-key', '', [uMsg], { builtinSearch: true });
+      expect(grokCall.body).assertContain('"type":"web_search"');
+      expect(grokCall.body).assertContain('"type":"x_search"');
+
+      const orBody: Record<string, Object> = {};
+      orBody['model'] = 'openai/gpt-5';
+      const legacyWebPlugin: Record<string, Object> = {};
+      legacyWebPlugin['id'] = 'web';
+      const pdfPlugin: Record<string, Object> = {};
+      pdfPlugin['id'] = 'file-parser';
+      orBody['plugins'] = [legacyWebPlugin, pdfPlugin];
+      const orFinal = applyChatCompletionsBuiltInSearch(orBody, orChat, 'openai/gpt-5');
+      const orJson = JSON.stringify(orFinal);
+      expect(orJson).assertContain('"openrouter:web_search"');
+      expect(orJson).assertContain('"file-parser"');
+      expect(orJson.includes('"id":"web"')).assertFalse();
+
+      // When only web plugin was present, plugins key is omitted completely
+      const orOnlyWebBody: Record<string, Object> = {};
+      orOnlyWebBody['plugins'] = [legacyWebPlugin];
+      const orStripped = applyChatCompletionsBuiltInSearch(orOnlyWebBody, orChat, 'openai/gpt-5');
+      expect(JSON.stringify(orStripped).includes('"plugins"')).assertFalse();
+
+      const qwenCall = makeAdvancedChatCall(qwenChat, 'q-key', '', [uMsg], { builtinSearch: true });
+      expect(qwenCall.body).assertContain('"enable_search":true');
+
+      const zhipuCall = makeAdvancedChatCall(zhipuChat, 'z-key', '', [uMsg], { builtinSearch: true });
+      expect(zhipuCall.body).assertContain('"search_result":true');
+
+      const kimiCall = makeAdvancedChatCall(kimiChat, 'k-key', '', [uMsg], { builtinSearch: true });
+      expect(kimiCall.body).assertContain('"type":"builtin_function"');
+      expect(kimiCall.body).assertContain('"$web_search"');
+      expect(needsMoonshotBuiltinSearchLoop(kimiChat, 'kimi-k2', true)).assertTrue();
+
+      const oaiSearchCall = makeAdvancedChatCall(openaiChatSearch, 'o-key', '', [uMsg], { builtinSearch: true });
+      expect(oaiSearchCall.body).assertContain('"web_search_options"');
+
+      // 6. Citation extraction across all formats
+      const gemCitations = parseRichReply(
+        '{"candidates":[{"content":{"parts":[{"text":"answer"}]},"groundingMetadata":{"groundingChunks":[{"web":{"uri":"https://example.com/a","title":"Site A"}},{"web":{"uri":"https://example.com/a","title":"Site A"}}]}}]}'
+      );
+      expect(gemCitations.citations?.length).assertEqual(1);
+      expect(gemCitations.citations?.[0].title).assertEqual('Site A');
+
+      const clStartCitations = parseRichReply(
+        '{"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","content":[{"type":"web_search_result","title":"Claude Doc","url":"https://docs.anthropic.com"}]}}'
+      );
+      expect(clStartCitations.citations?.length).assertEqual(1);
+      expect(clStartCitations.citations?.[0].url).assertEqual('https://docs.anthropic.com');
+
+      const clDeltaCitations = parseRichReply(
+        '{"type":"content_block_delta","index":2,"delta":{"type":"citations_delta","citation":{"title":"Cited Page","url":"https://example.com/cite","cited_text":"snippet"}}}'
+      );
+      expect(clDeltaCitations.citations?.[0].excerpt).assertEqual('snippet');
+
+      const respAnn = parseRichReply(
+        '{"type":"response.output_text.annotation.added","annotation":{"type":"url_citation","url":"https://openai.com/news","title":"OpenAI News"}}'
+      );
+      expect(respAnn.citations?.[0].title).assertEqual('OpenAI News');
+
+      const respDone = parseRichReply(
+        '{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","annotations":[{"type":"url_citation","url":"https://openai.com/done","title":"Done Ref"}]}]}]}}'
+      );
+      expect(respDone.citations?.[0].url).assertEqual('https://openai.com/done');
+
+      const chatCite = parseRichReply(
+        '{"citations":["https://perplexity.ai/post"],"web_search":[{"title":"Zhipu Result","link":"https://bigmodel.cn/info","content":"body"}]}'
+      );
+      expect(chatCite.citations?.length).assertEqual(2);
+
+      // 7. Assistant messages with sources do NOT get user pre-search prompt appended
+      const aMsgWithSources: ChatMessage = {
+        id: 'a1',
+        role: 'assistant',
+        text: '结论如下',
+        model: 'gpt-5',
+        sources: [{ title: 'Source', url: 'https://example.com', excerpt: 'detail' }]
+      };
+      expect(messageText(aMsgWithSources)).assertEqual('结论如下');
+      const uMsgWithSources: ChatMessage = {
+        id: 'u2',
+        role: 'user',
+        text: '查询这个问题',
+        model: '',
+        sources: [{ title: 'UserSource', url: 'https://example.com/u', excerpt: 'detail' }]
+      };
+      expect(messageText(uMsgWithSources)).assertContain('以下为网页检索资料');
+
+      // 8. Moonshot $web_search tool loop auto-echoes arguments without external executeTool
+      let externalToolExecuted = false;
+      let kimiRound = 0;
+      const kimiLoopOut = await runAgentToolLoop({
+        provider: kimiChat,
+        apiKey: 'k-key',
+        modelId: 'kimi-k2',
+        systemPrompt: '',
+        history: [uMsg],
+        genParams: defaultGenerationParams(),
+        builtinSearch: true,
+        tools: [],
+        permissionMode: 'ask',
+        maxSteps: 4,
+        runStream: async (call: ChatCall, onFrag: (f: RichFragment) => void): Promise<void> => {
+          expect(call.body).assertContain('"$web_search"');
+          kimiRound++;
+          if (kimiRound === 1) {
+            onFrag({
+              text: '', reasoning: '', generatedImages: [], done: false,
+              toolCalls: [{ index: 0, id: 'ws_1', name: '$web_search', argsDelta: '{"query":"OpenHarmony"}', done: false }]
+            });
+          } else {
+            expect(call.body).assertContain('OpenHarmony');
+            onFrag({
+              text: '搜索完成', reasoning: '', toolCalls: [], generatedImages: [],
+              citations: [{ title: 'Harmony', url: 'https://developer.huawei.com', excerpt: '' }],
+              done: true
+            });
+          }
+        },
+        executeTool: async (): Promise<ToolExecutionOutput> => {
+          externalToolExecuted = true;
+          return { text: 'should not run' };
+        },
+        requestApproval: async (): Promise<'allow_once' | 'allow_all' | 'deny'> => 'deny',
+        onUpdate: () => {},
+        isStopped: () => false
+      });
+      expect(externalToolExecuted).assertFalse();
+      expect(kimiRound).assertEqual(2);
+      expect(kimiLoopOut.text).assertEqual('搜索完成');
+      expect(kimiLoopOut.toolCalls[0].name).assertEqual('$web_search');
+      expect(kimiLoopOut.toolCalls[0].status).assertEqual('done');
+      expect(kimiLoopOut.citations.length).assertEqual(1);
+      const firstHit: SearchHit = kimiLoopOut.citations[0];
+      expect(firstHit.url).assertEqual('https://developer.huawei.com');
+    });
+
+    it('tool_call_record_grouping_deduplicates_and_aggregates_status', 0, () => {
+      const makeRec = (
+        id: string,
+        name: string,
+        status: 'pending' | 'running' | 'done' | 'error' | 'denied',
+        durationMs: number
+      ): ToolCallRecord => {
+        return { id, name, argsJson: '{}', status, resultText: '', durationMs };
+      };
+      const records: ToolCallRecord[] = [
+        makeRec('s1', 'web_search', 'done', 120),
+        makeRec('s2', 'web_search', 'done', 140),
+        makeRec('f1', 'web_fetch', 'done', 200),
+        makeRec('f2', 'web_fetch', 'error', 300),
+        makeRec('f3', 'web_fetch', 'done', 180),
+        makeRec('f4', 'web_fetch', 'error', 90),
+        makeRec('x1', 'bad_tool', 'error', 50),
+        makeRec('x2', 'bad_tool', 'error', 60)
+      ];
+      const groups: ToolCallGroup[] = groupToolCallRecords(records);
+      expect(groups.length).assertEqual(3);
+      expect(groups[0].name).assertEqual('web_search');
+      expect(groups[0].count).assertEqual(2);
+      expect(groups[0].failedCount).assertEqual(0);
+      expect(groups[0].status).assertEqual('done');
+      expect(groups[0].totalDurationMs).assertEqual(260);
+      expect(groups[1].name).assertEqual('web_fetch');
+      expect(groups[1].count).assertEqual(4);
+      expect(groups[1].failedCount).assertEqual(2);
+      expect(groups[1].status).assertEqual('done');
+      expect(groups[1].records.length).assertEqual(4);
+      expect(groups[2].name).assertEqual('bad_tool');
+      expect(groups[2].count).assertEqual(2);
+      expect(groups[2].failedCount).assertEqual(2);
+      expect(groups[2].status).assertEqual('error');
+
+      const runningRecords: ToolCallRecord[] = [
+        makeRec('r1', 'web_fetch', 'done', 50),
+        makeRec('r2', 'web_fetch', 'error', 60),
+        makeRec('r3', 'web_fetch', 'running', 0)
+      ];
+      const runningGroups: ToolCallGroup[] = groupToolCallRecords(runningRecords);
+      expect(runningGroups.length).assertEqual(1);
+      expect(runningGroups[0].status).assertEqual('running');
+      expect(runningGroups[0].failedCount).assertEqual(1);
+      expect(runningGroups[0].count).assertEqual(3);
+    });
+
+    it('model_spec_editor_overrides_reasoning_sampling_headers_body_and_tools', 0, () => {
+      const spec: ModelSpec = defaultModelSpec('custom-think-model');
+      spec.displayName = 'Custom Think';
+      spec.modelType = 'chat';
+      spec.inputModalities = ['text', 'image', 'pdf'];
+      spec.outputModalities = ['text', 'image'];
+      spec.vision = true;
+      spec.tools = true;
+      spec.reasoning = true;
+      spec.imageGen = true;
+      spec.structuredOutput = true;
+      spec.pricing = { inputPerMillion: 0.12, outputPerMillion: 0.48, cacheReadPerMillion: 0.0024, currency: 'USD' };
+      spec.reasoningDialect = 'thinkingType';
+      spec.reasoningLevels = ['low', 'high', 'max'];
+      spec.reasoningAllowOff = false;
+      spec.reasoningDefaultLevel = 'high';
+      spec.samplingPolicy = 'never';
+      spec.reasoningReplay = 'all';
+      spec.reasoningReplayField = 'reasoning';
+      const h1: HeaderEntry = { key: 'X-Model-Header', value: 'model-v1' };
+      spec.customHeaders = [h1];
+      const b1: HeaderEntry = { key: 'seed', value: '42' };
+      const b2: HeaderEntry = { key: 'strict', value: 'true' };
+      const b3: HeaderEntry = { key: 'meta', value: '{"tag":"t1"}' };
+      spec.customBodyEntries = [b1, b2, b3];
+      spec.allowRemoteImageUrls = false;
+      spec.builtinCodeInterpreter = true;
+      spec.builtinImageGen = true;
+      spec.builtinUrlContext = true;
+
+      const cloned = cloneModelSpec(spec);
+      cloned.displayName = 'Changed';
+      cloned.customHeaders![0].value = 'mutated';
+      expect(spec.displayName).assertEqual('Custom Think');
+      expect(spec.customHeaders![0].value).assertEqual('model-v1');
+      expect(cloned.reasoningDefaultLevel).assertEqual('high');
+      expect(cloned.pricing?.cacheReadPerMillion).assertEqual(0.0024);
+
+      const openaiProv = preset('oai-custom', 'OpenAI Custom', 'openai', 'https://api.openai.com/v1', spec.id);
+      openaiProv.models = [spec];
+      const ctrl = reasoningControl(openaiProv, spec.id, spec);
+      expect(ctrl.dialect).assertEqual('thinkingType');
+      expect(ctrl.levels.join(',')).assertEqual('low,high,max');
+
+      const attRemote: Attachment = { id: 'a1', name: 'remote.png', mime: 'image/png', data: 'https://example.com/a.png' };
+      const attLocal: Attachment = { id: 'a2', name: 'local.png', mime: 'image/png', data: 'AAAA' };
+      const atts: Attachment[] = [attRemote, attLocal];
+      const m1: ChatMessage = { id: 'm1', role: 'user', text: 'first question', model: spec.id, createdAt: 1000 };
+      const m2: ChatMessage = { id: 'm2', role: 'assistant', text: 'first reply', model: spec.id, reasoning: 'prior chain', createdAt: 1001 };
+      const m3: ChatMessage = { id: 'm3', role: 'user', text: 'check image', model: spec.id, createdAt: 1002, attachments: atts };
+      const history: ChatMessage[] = [m1, m2, m3];
+      const call = makeAdvancedChatCall(openaiProv, 'sk-test', 'sys', history, {
+        modelId: spec.id,
+        modelSpec: spec,
+        stream: false,
+        params: withReasoning(defaultGenerationParams(), 'high')
+      });
+      expect(call.headers['X-Model-Header']).assertEqual('model-v1');
+      const parsedBody = JSON.parse(call.body) as Record<string, Object>;
+      expect(parsedBody['seed']).assertEqual(42);
+      expect(parsedBody['strict']).assertEqual(true);
+      expect((parsedBody['meta'] as Record<string, Object>)['tag']).assertEqual('t1');
+      expect(parsedBody['temperature'] === undefined).assertTrue();
+      expect(parsedBody['top_p'] === undefined).assertTrue();
+      const wireMsgs = parsedBody['messages'] as Array<Record<string, Object>>;
+      expect(wireMsgs[2]['reasoning']).assertEqual('prior chain');
+      const userParts = wireMsgs[3]['content'] as Array<Record<string, Object>>;
+      expect(userParts.length).assertEqual(2);
+      const localImgObj = userParts[1]['image_url'] as Record<string, Object>;
+      expect(localImgObj['url']).assertEqual('data:image/png;base64,AAAA');
+
+      const respProv = preset('oai-resp', 'OpenAI Responses', 'openai-responses', 'https://api.openai.com/v1', spec.id);
+      respProv.models = [spec];
+      const respCall = makeAdvancedChatCall(respProv, 'sk-test', '', [m1], {
+        modelId: spec.id,
+        modelSpec: spec,
+        stream: false,
+        params: withReasoning(defaultGenerationParams(), 'high')
+      });
+      const respBody = JSON.parse(respCall.body) as Record<string, Object>;
+      const respTools = respBody['tools'] as Array<Record<string, Object>>;
+      const respToolTypes = respTools.map((t: Record<string, Object>): string => String(t['type'] || '')).join(',');
+      expect(respToolTypes.includes('code_interpreter')).assertTrue();
+      expect(respToolTypes.includes('image_generation')).assertTrue();
+
+      const gemProv = preset('gem-spec', 'Gemini', 'gemini', 'https://generativelanguage.googleapis.com/v1beta', spec.id);
+      const gemSpec = cloneModelSpec(spec);
+      gemSpec.builtinCodeExec = false;
+      gemProv.models = [gemSpec];
+      const gemUrlCall = makeAdvancedChatCall(gemProv, 'gm-key', '', [m1], {
+        modelId: gemSpec.id,
+        modelSpec: gemSpec,
+        stream: false,
+        builtinUrlContext: true
+      });
+      expect(gemUrlCall.body.includes('"urlContext"')).assertTrue();
+
+      gemSpec.builtinCodeExec = true;
+      const gemCodeCall = makeAdvancedChatCall(gemProv, 'gm-key', '', [m1], {
+        modelId: gemSpec.id,
+        modelSpec: gemSpec,
+        stream: false,
+        builtinCodeExec: true
+      });
+      expect(gemCodeCall.body.includes('"codeExecution"')).assertTrue();
     });
   });
 }

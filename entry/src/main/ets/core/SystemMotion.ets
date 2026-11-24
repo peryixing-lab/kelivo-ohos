@@ -65,6 +65,15 @@ export class SystemMotion {
       .animation({ curve: curves.responsiveSpringMotion(0.28, 0.90) });
   }
 
+  static subViewBackTransition(reduceMotion: boolean): TransitionEffect {
+    if (reduceMotion) {
+      return TransitionEffect.OPACITY.animation({ duration: 120, curve: Curve.Linear });
+    }
+    return TransitionEffect.OPACITY
+      .combine(TransitionEffect.translate({ x: -24 }))
+      .animation({ curve: curves.responsiveSpringMotion(0.28, 0.90) });
+  }
+
   static inlineBarTransition(reduceMotion: boolean): TransitionEffect {
     if (reduceMotion) {
       return TransitionEffect.OPACITY.animation({ duration: 100, curve: Curve.Linear });
