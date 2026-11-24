@@ -16,6 +16,7 @@ import {
   ScheduledTask,
   SearchServiceConfig,
   UserProfileField,
+  UsageStatRow,
   WorldBook,
   defaultAppearance,
   defaultChatItemDisplay,
@@ -118,6 +119,13 @@ import {
 import { parseMcpConfigJson } from '../main/ets/core/McpConfigParser';
 import { RegisteredTool, assembleToolRegistry } from '../main/ets/core/ToolRegistry';
 import { ToolExecutionOutput, accumulateToolDeltas, runAgentToolLoop } from '../main/ets/core/ToolLoop';
+import {
+  computeStackedBarPcts,
+  computeUsageDashboard,
+  formatLocalDay,
+  formatLocalTime,
+  formatUsageCount
+} from '../main/ets/core/UsageStatsLogic';
 import {
   BackupScopeConfig,
   countSelectedBackupScope,
@@ -2293,6 +2301,125 @@ export default function localUnitTest() {
       const split2 = splitInlineTail('**onlyBold**');
       expect(split2.prefix.length).assertEqual(1);
       expect(split2.suffix).assertEqual('');
+    });
+
+    it('usage_stats_dashboard_calendar_bars_and_ranks', 0, () => {
+      // Local date and time formatting with zero-padding (never shifts on local midnight)
+      const earlyJan = new Date(2026, 0, 5, 1, 2, 3);
+      expect(formatLocalDay(earlyJan)).assertEqual('2026-01-05');
+      expect(formatLocalTime(earlyJan)).assertEqual('01:02:03');
+
+      const refTuesdayMidnight = new Date(2026, 10, 24, 0, 15, 0); // 2026-11-24 is Tuesday
+      expect(formatLocalDay(refTuesdayMidnight)).assertEqual('2026-11-24');
+
+      expect(formatUsageCount(0)).assertEqual('0');
+      expect(formatUsageCount(98900)).assertEqual('98.9K');
+      expect(formatUsageCount(8810000)).assertEqual('8.81M');
+
+      // Stacked bar percentages never exceed 100 and preserve zero components
+      const zeroBar = computeStackedBarPcts(0, 0, 1000);
+      expect(zeroBar.promptPct).assertEqual(0);
+      expect(zeroBar.compPct).assertEqual(0);
+
+      const onlyPrompt = computeStackedBarPcts(500, 0, 1000);
+      expect(onlyPrompt.promptPct).assertEqual(50);
+      expect(onlyPrompt.compPct).assertEqual(0);
+
+      const skewed = computeStackedBarPcts(999, 1, 1000);
+      expect(skewed.promptPct + skewed.compPct).assertEqual(100);
+      expect(skewed.compPct).assertEqual(2);
+      expect(skewed.promptPct).assertEqual(98);
+
+      // Dashboard aggregation, Mon-Sun alignment, future masking, and rankings
+      const personas: Persona[] = [
+        { id: 'default', name: '通用助手', prompt: '', avatar: '', tags: [], memoryEnabled: true },
+        { id: 'coder', name: '编程专家', prompt: '', avatar: '', tags: [], memoryEnabled: true }
+      ];
+      const rows: UsageStatRow[] = [
+        {
+          id: '2026-11-23::deepseek-v4.1-flash::default',
+          day: '2026-11-23',
+          model: 'deepseek-v4.1-flash',
+          personaId: 'default',
+          promptTokens: 5800000,
+          completionTokens: 130000,
+          cachedTokens: 3000000,
+          msgCount: 50
+        },
+        {
+          id: '2026-11-24::deepseek-v4.1-flash::coder',
+          day: '2026-11-24',
+          model: 'deepseek-v4.1-flash',
+          personaId: 'coder',
+          promptTokens: 160000,
+          completionTokens: 10400,
+          cachedTokens: 40000,
+          msgCount: 4
+        },
+        {
+          id: '2026-11-24::gpt-5.2::',
+          day: '2026-11-24',
+          model: 'gpt-5.2',
+          personaId: '',
+          promptTokens: 200000,
+          completionTokens: 100000,
+          cachedTokens: 0,
+          msgCount: 6
+        }
+      ];
+
+      const dash = computeUsageDashboard(rows, personas, refTuesdayMidnight);
+      expect(dash.promptTokens).assertEqual(6160000);
+      expect(dash.completionTokens).assertEqual(240400);
+      expect(dash.totalTokens).assertEqual(6400400);
+      expect(dash.cachedTokens).assertEqual(3040000);
+      expect(dash.totalMessages).assertEqual(60);
+      expect(dash.activeDays).assertEqual(2);
+      expect(dash.heatmapEndDay).assertEqual('2026-11-24');
+
+      // Heatmap is 7 weekday rows x 13 week columns
+      expect(dash.heatmapRows.length).assertEqual(7);
+      expect(dash.heatmapRows[0].label).assertEqual('一');
+      expect(dash.heatmapRows[6].label).assertEqual('日');
+      expect(dash.heatmapRows[0].cells.length).assertEqual(13);
+
+      // Week 12 Monday = 2026-11-23 (active), Tuesday = 2026-11-24 (today), Wed..Sun = -1 future
+      const monTodayWeek = dash.heatmapRows[0].cells[12];
+      const tueTodayCell = dash.heatmapRows[1].cells[12];
+      const wedFutureCell = dash.heatmapRows[2].cells[12];
+      const sunFutureCell = dash.heatmapRows[6].cells[12];
+      expect(monTodayWeek.day).assertEqual('2026-11-23');
+      expect(monTodayWeek.level).assertEqual(4);
+      expect(tueTodayCell.day).assertEqual('2026-11-24');
+      expect(tueTodayCell.isToday).assertTrue();
+      expect(tueTodayCell.totalTokens).assertEqual(470400);
+      expect(tueTodayCell.level > 0).assertTrue();
+      expect(wedFutureCell.level).assertEqual(-1);
+      expect(sunFutureCell.level).assertEqual(-1);
+
+      // 14 daily bars end on today and every bar sums <= 100%
+      expect(dash.recentBars.length).assertEqual(14);
+      expect(dash.recentBars[13].day).assertEqual('2026-11-24');
+      expect(dash.recentBars[13].isToday).assertTrue();
+      for (let i = 0; i < dash.recentBars.length; i++) {
+        const b = dash.recentBars[i];
+        expect(b.promptPct + b.compPct <= 100).assertTrue();
+      }
+      expect(dash.recentBars[12].promptPct + dash.recentBars[12].compPct).assertEqual(100);
+
+      // Model & persona rankings sorted descending with ratioPct in [4, 100]
+      expect(dash.modelRanks.length).assertEqual(2);
+      expect(dash.modelRanks[0].key).assertEqual('deepseek-v4.1-flash');
+      expect(dash.modelRanks[0].ratioPct).assertEqual(100);
+      expect(dash.modelRanks[1].key).assertEqual('gpt-5.2');
+      expect(dash.modelRanks[1].ratioPct >= 4 && dash.modelRanks[1].ratioPct <= 100).assertTrue();
+
+      expect(dash.personaRanks.length).assertEqual(2);
+      expect(dash.personaRanks[0].key).assertEqual('default');
+      expect(dash.personaRanks[0].label).assertEqual('通用助手');
+      expect(dash.personaRanks[0].ratioPct).assertEqual(100);
+      expect(dash.personaRanks[1].key).assertEqual('coder');
+      expect(dash.personaRanks[1].label).assertEqual('编程专家');
     });
   });
 }

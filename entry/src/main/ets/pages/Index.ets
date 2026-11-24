@@ -2,7 +2,6 @@ import { ConfigurationConstant, common } from '@kit.AbilityKit';
 import { displaySync } from '@kit.ArkGraphics2D';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { pasteboard } from '@kit.BasicServicesKit';
-import { motion } from '@kit.MultimodalAwarenessKit';
 import {
   AppearanceConfig,
   AsrConfig,
@@ -125,6 +124,7 @@ import {
   triggerHapticFeedback
 } from '../core/SystemBridge';
 import { StreamTextSmoother } from '../core/StreamSmoother';
+import { formatLocalDay } from '../core/UsageStatsLogic';
 import { MessageBody } from '../components/MessageBody';
 import { PersonaEditor } from '../components/PersonaEditor';
 import { ProviderEditor } from '../components/ProviderEditor';
@@ -298,7 +298,6 @@ struct Index {
   @State regeneratingMsgId: string = '';
   @State composerBarHeightVp: number = 136;
   @State chatScrollNavVisible: boolean = false;
-  @State chatScrollNavSide: 'left' | 'right' = 'right';
   @State lastSendError: string = '';
   @State lastSendErrorChatId: string = '';
   @State expandedLongMsgIds: string[] = [];
@@ -339,63 +338,12 @@ struct Index {
   private chatFirstVisibleIdx: number = 0;
   private chatLastVisibleIdx: number = 0;
   private chatNavTargetIdx: number = -1;
-  private holdingHandSubscribed: boolean = false;
   private navPathStack: NavPathStack = new NavPathStack();
-
-  private readonly handleHoldingHandChanged = (status: motion.HoldingHandStatus): void => {
-    let nextSide: 'left' | 'right' = this.chatScrollNavSide;
-    if (status === motion.HoldingHandStatus.LEFT_HAND_HELD) {
-      nextSide = 'left';
-    } else if (
-      status === motion.HoldingHandStatus.RIGHT_HAND_HELD ||
-      status === motion.HoldingHandStatus.BOTH_HANDS_HELD
-    ) {
-      nextSide = 'right';
-    }
-    if (nextSide !== this.chatScrollNavSide) {
-      if (this.chatScrollNavVisible) {
-        SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
-          this.chatScrollNavSide = nextSide;
-        });
-      } else {
-        this.chatScrollNavSide = nextSide;
-      }
-    }
-  };
-
-  private startHoldingHandMonitor(): void {
-    if (this.holdingHandSubscribed || !canIUse('SystemCapability.MultimodalAwareness.Motion')) {
-      return;
-    }
-    try {
-      const recent = motion.getRecentOperatingHandStatus();
-      if (recent === motion.OperatingHandStatus.LEFT_HAND_OPERATED) {
-        this.chatScrollNavSide = 'left';
-      } else if (recent === motion.OperatingHandStatus.RIGHT_HAND_OPERATED) {
-        this.chatScrollNavSide = 'right';
-      }
-    } catch (_) {}
-    try {
-      motion.on('holdingHandChanged', this.handleHoldingHandChanged);
-      this.holdingHandSubscribed = true;
-    } catch (_) {}
-  }
-
-  private stopHoldingHandMonitor(): void {
-    if (!this.holdingHandSubscribed) {
-      return;
-    }
-    this.holdingHandSubscribed = false;
-    try {
-      motion.off('holdingHandChanged', this.handleHoldingHandChanged);
-    } catch (_) {}
-  }
 
   aboutToAppear(): void {
     try {
       this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.RESIZE);
     } catch (_) {}
-    this.startHoldingHandMonitor();
     this.navPathStack.setInterception({
       didShow: (_from: NavDestinationContext | NavBar, _to: NavDestinationContext | NavBar, _op: NavigationOperation, _animated: boolean) => {
         this.syncActiveRouteFromStack();
@@ -404,7 +352,6 @@ struct Index {
     this.loadWorkspace();
   }
   onPageShow(): void {
-    this.startHoldingHandMonitor();
     this.consumePendingShareText();
     this.consumePendingOpenChat();
     this.syncActiveGenerationView();
@@ -412,11 +359,7 @@ struct Index {
       this.scrollDown();
     }
   }
-  onPageHide(): void {
-    this.stopHoldingHandMonitor();
-  }
   aboutToDisappear(): void {
-    this.stopHoldingHandMonitor();
     this.hideChatScrollNavImmediate();
     if (this.scrollFollowTimer >= 0) {
       clearTimeout(this.scrollFollowTimer);
@@ -1687,9 +1630,20 @@ struct Index {
 
   private async refreshLogsAndStats(): Promise<void> {
     if (!this.store) return;
-    this.requestLogs = await this.store.listRequestLogs();
-    this.contextLogs = await this.store.listContextLogs();
-    this.usageStats = await this.store.listUsageStats();
+    try {
+      this.requestLogs = await this.store.listRequestLogs();
+    } catch (_) {}
+    try {
+      this.contextLogs = await this.store.listContextLogs();
+    } catch (_) {}
+    await this.refreshUsageStats().catch(() => {});
+  }
+
+  private async refreshUsageStats(): Promise<UsageStatRow[]> {
+    if (!this.store) return this.usageStats;
+    const rows = await this.store.listUsageStats();
+    this.usageStats = rows;
+    return rows;
   }
 
   private buildToolSchemaCandidates(): ToolSchemaCandidate[] {
@@ -3066,9 +3020,11 @@ struct Index {
             }
           }
           if (hasUsage) {
-            const day = new Date().toISOString().slice(0, 10);
+            const day = formatLocalDay(new Date());
             this.store?.recordUsage(day, modelId, latestPersonaId,
-              finalUsage.promptTokens, finalUsage.completionTokens, finalUsage.cachedTokens).catch(() => {});
+              finalUsage.promptTokens, finalUsage.completionTokens, finalUsage.cachedTokens)
+              .then(() => { this.refreshUsageStats().catch(() => {}); })
+              .catch(() => {});
           }
           if (completed) {
             if (!this.appInBackground && isViewingThisChat() && this.activeRoute === 'chat') {
@@ -4724,7 +4680,7 @@ struct Index {
           { value: '助手与提示词设置', action: () => { this.navigateTo('personas'); } },
           { value: '上下文与生成参数', action: () => { this.navigateTo('context'); } },
           { value: '内置浏览器', action: () => { this.navigateTo('browser'); } },
-          { value: '用量统计', action: () => { this.refreshLogsAndStats().catch(() => {}); this.navigateTo('stats'); } },
+          { value: '用量统计', action: () => { this.refreshUsageStats().catch(() => {}); this.navigateTo('stats'); } },
           { value: '设置中心', action: () => { this.refreshStorageSize().catch(() => {}); this.navigateTo('settings'); } }
         ], ImmersiveMaterialStyle.menuOptions(this.immersiveLightOn()))
         .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
@@ -5126,7 +5082,7 @@ struct Index {
   }
 
   @Builder
-  chatScrollNavButtons(side: 'left' | 'right') {
+  chatScrollNavButtons() {
     Row() {
       Column({ space: 6 }) {
         this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), false, '跳转到顶部对话', () => { this.jumpChatTop(); })
@@ -5135,19 +5091,14 @@ struct Index {
         this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), true, '跳转到最新对话', () => { this.jumpChatBottom(); })
       }
       .margin({
-        left: side === 'left' ? ((this.wide ? 0 : this.winLeftInset) + 10) : 0,
-        right: side === 'right' ? ((this.sidePanelMode !== '' && this.wideSide ? 0 : this.winRightInset) + 10) : 0,
+        right: (this.sidePanelMode !== '' && this.wideSide ? 0 : this.winRightInset) + 10,
         bottom: this.composerBarHeightVp + 4
       })
     }
     .width('100%')
-    .justifyContent(side === 'left' ? FlexAlign.Start : FlexAlign.End)
+    .justifyContent(FlexAlign.End)
     .hitTestBehavior(HitTestMode.None)
-    .transition(
-      side === 'left'
-        ? SystemMotion.startSlideTransition(this.reduceMotion)
-        : SystemMotion.endSlideTransition(this.reduceMotion)
-    )
+    .transition(SystemMotion.endSlideTransition(this.reduceMotion))
   }
 
   @Builder
@@ -5456,11 +5407,7 @@ struct Index {
       }
 
       if (this.chatScrollNavVisible && (this.activeChat()?.messages.length || 0) > 0 && !this.isIncognitoEmpty() && !this.showProviderHintBanner()) {
-        if (this.chatScrollNavSide === 'left') {
-          this.chatScrollNavButtons('left')
-        } else {
-          this.chatScrollNavButtons('right')
-        }
+        this.chatScrollNavButtons()
       }
     }
     .backgroundColor(this.chatBgColor())
@@ -6251,7 +6198,7 @@ struct Index {
         },
         onNavigateRoute: (route: string) => {
           if (route === 'stats') {
-            this.refreshLogsAndStats().catch(() => {});
+            this.refreshUsageStats().catch(() => {});
             this.navigateTo('stats');
           } else if (route === 'diagnostics' || route === 'diagnostics_logs') {
             this.diagTabInit = 0;
@@ -6549,7 +6496,7 @@ struct Index {
             usageStats: this.usageStats,
             personas: this.workspace.personas,
             embeddedInNav: true,
-            onRefresh: () => this.refreshLogsAndStats(),
+            onRefresh: () => this.refreshUsageStats(),
             onClose: () => { this.navigateBack(); }
           })
         }
@@ -6566,7 +6513,10 @@ struct Index {
         ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
       )
       .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
+      .onShown(() => {
+        this.syncActiveRouteFromStack();
+        this.refreshUsageStats().catch(() => {});
+      })
       .onHidden(() => { this.syncActiveRouteFromStack(); })
       .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'diagnostics') {

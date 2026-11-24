@@ -1,241 +1,134 @@
 import { Persona, UsageStatRow } from '../core/Models';
-
-interface HeatmapCell {
-  day: string;
-  tokens: number;
-  level: number;
-}
-
-interface HeatmapWeek {
-  weekIdx: number;
-  cells: HeatmapCell[];
-}
-
-interface DailyBarItem {
-  day: string;
-  shortDay: string;
-  promptTokens: number;
-  completionTokens: number;
-  total: number;
-  promptPct: number;
-  compPct: number;
-}
-
-interface UsageRankItem {
-  key: string;
-  label: string;
-  totalTokens: number;
-  msgCount: number;
-  ratioPct: number;
-}
-
-interface DayTokenBucket {
-  prompt: number;
-  comp: number;
-}
-
-interface UsageCountBucket {
-  total: number;
-  msgs: number;
-}
-
-interface RawRankRow {
-  key: string;
-  label: string;
-  totalTokens: number;
-  msgCount: number;
-}
+import {
+  computeUsageDashboard,
+  formatLocalTime,
+  formatUsageCount,
+  UsageDailyBar,
+  UsageDashboardData,
+  UsageHeatmapCell,
+  UsageHeatmapRow,
+  UsageRankRow
+} from '../core/UsageStatsLogic';
 
 @Component
 export struct StatsPanel {
-  @Prop usageStats: UsageStatRow[] = [];
-  @Prop personas: Persona[] = [];
+  @Prop @Watch('onPropsChanged') usageStats: UsageStatRow[] = [];
+  @Prop @Watch('onPropsChanged') personas: Persona[] = [];
   @Prop embeddedInNav: boolean = false;
-  onRefresh: () => Promise<void> = async () => {};
+  onRefresh: () => Promise<UsageStatRow[] | void> = async () => {};
   onClose: () => void = () => {};
 
   @StorageProp('windowTopInsetVp') winTopInset: number = 0;
+  @StorageProp('windowBottomInsetVp') winBottomInset: number = 0;
+  @StorageProp('effectiveDarkMode') isDark: boolean = false;
 
-  @State totalTokens: number = 0;
-  @State promptTokens: number = 0;
-  @State completionTokens: number = 0;
-  @State cachedTokens: number = 0;
-  @State totalMessages: number = 0;
-  @State activeDays: number = 0;
-  @State weeksGrid: HeatmapWeek[] = [];
-  @State recentBars: DailyBarItem[] = [];
-  @State modelRanks: UsageRankItem[] = [];
-  @State personaRanks: UsageRankItem[] = [];
+  @State dashboard: UsageDashboardData = computeUsageDashboard([], []);
+  @State dataRev: number = 0;
+  @State refreshing: boolean = false;
+  @State lastRefreshedText: string = '';
+  @State selectedDay: string = '';
   @State selectedDayTip: string = '';
 
+  private readonly legendLevels: number[] = [0, 1, 2, 3, 4];
+
   aboutToAppear(): void {
-    this.recompute();
+    this.applyStats(this.usageStats);
+    this.triggerRefresh(false);
   }
 
-  private pad2(n: number): string {
-    return n < 10 ? `0${n}` : `${n}`;
+  private onPropsChanged(): void {
+    this.applyStats(this.usageStats);
   }
 
-  private formatDay(d: Date): string {
-    return `${d.getFullYear()}-${this.pad2(d.getMonth() + 1)}-${this.pad2(d.getDate())}`;
-  }
-
-  private personaLabel(pid: string): string {
-    if (!pid) {
-      return '默认助手';
-    }
-    for (let i = 0; i < this.personas.length; i++) {
-      if (this.personas[i].id === pid) {
-        return this.personas[i].name;
+  private applyStats(rows: UsageStatRow[]): void {
+    const next = computeUsageDashboard(rows, this.personas);
+    this.dashboard = next;
+    this.dataRev += 1;
+    if (this.selectedDay.length > 0) {
+      let matched = false;
+      for (let r = 0; r < next.heatmapRows.length; r++) {
+        const cells = next.heatmapRows[r].cells;
+        for (let c = 0; c < cells.length; c++) {
+          if (cells[c].day === this.selectedDay && cells[c].level >= 0) {
+            this.selectedDayTip = this.formatCellTip(cells[c]);
+            matched = true;
+            break;
+          }
+        }
+        if (matched) {
+          break;
+        }
+      }
+      if (!matched) {
+        this.selectedDay = '';
+        this.selectedDayTip = '';
       }
     }
-    return pid;
   }
 
-  private formatCount(n: number): string {
-    if (n >= 1000000) {
-      return `${(n / 1000000).toFixed(2)}M`;
+  private async triggerRefresh(showTimestamp: boolean): Promise<void> {
+    if (this.refreshing) {
+      return;
     }
-    if (n >= 1000) {
-      return `${(n / 1000).toFixed(1)}K`;
+    this.refreshing = true;
+    try {
+      const fresh = await this.onRefresh();
+      if (Array.isArray(fresh)) {
+        this.applyStats(fresh);
+      } else {
+        this.applyStats(this.usageStats);
+      }
+      if (showTimestamp) {
+        this.lastRefreshedText = '已更新 ' + formatLocalTime(new Date());
+      }
+    } catch (_) {
+      if (showTimestamp) {
+        this.lastRefreshedText = '刷新失败，请重试';
+      }
+    } finally {
+      this.refreshing = false;
     }
-    return `${n}`;
   }
 
-  private recompute(): void {
-    let pSum = 0;
-    let cSum = 0;
-    let cachedSum = 0;
-    let mSum = 0;
-    const dayMap = new Map<string, DayTokenBucket>();
-    const modelMap = new Map<string, UsageCountBucket>();
-    const personaMap = new Map<string, UsageCountBucket>();
-
-    for (let i = 0; i < this.usageStats.length; i++) {
-      const r = this.usageStats[i];
-      pSum += r.promptTokens;
-      cSum += r.completionTokens;
-      cachedSum += r.cachedTokens;
-      mSum += r.msgCount;
-
-      const dEntry: DayTokenBucket = dayMap.get(r.day) ?? { prompt: 0, comp: 0 };
-      dEntry.prompt += r.promptTokens;
-      dEntry.comp += r.completionTokens;
-      dayMap.set(r.day, dEntry);
-
-      const mKey = r.model || 'unknown';
-      const mEntry: UsageCountBucket = modelMap.get(mKey) ?? { total: 0, msgs: 0 };
-      mEntry.total += r.promptTokens + r.completionTokens;
-      mEntry.msgs += r.msgCount;
-      modelMap.set(mKey, mEntry);
-
-      const perKey = r.personaId || 'default';
-      const perEntry: UsageCountBucket = personaMap.get(perKey) ?? { total: 0, msgs: 0 };
-      perEntry.total += r.promptTokens + r.completionTokens;
-      perEntry.msgs += r.msgCount;
-      personaMap.set(perKey, perEntry);
+  private formatCellTip(cell: UsageHeatmapCell): string {
+    if (cell.totalTokens <= 0) {
+      return `${cell.day} · 暂无记录`;
     }
-
-    this.promptTokens = pSum;
-    this.completionTokens = cSum;
-    this.totalTokens = pSum + cSum;
-    this.cachedTokens = cachedSum;
-    this.totalMessages = mSum;
-    this.activeDays = dayMap.size;
-
-    // Compute 91-day (13 weeks x 7 days) heatmap ending today
-    let maxDaily = 1;
-    dayMap.forEach((v) => {
-      const tot = v.prompt + v.comp;
-      if (tot > maxDaily) {
-        maxDaily = tot;
-      }
-    });
-
-    const today = new Date();
-    const totalDays = 91;
-    const flatCells: HeatmapCell[] = [];
-    for (let offset = totalDays - 1; offset >= 0; offset--) {
-      const dt = new Date(today.getTime() - offset * 86400000);
-      const dayStr = this.formatDay(dt);
-      const stat = dayMap.get(dayStr);
-      const tok = stat ? stat.prompt + stat.comp : 0;
-      let level = 0;
-      if (tok > 0) {
-        const ratio = tok / maxDaily;
-        level = ratio > 0.75 ? 4 : (ratio > 0.45 ? 3 : (ratio > 0.18 ? 2 : 1));
-      }
-      flatCells.push({ day: dayStr, tokens: tok, level });
-    }
-
-    const weeks: HeatmapWeek[] = [];
-    for (let w = 0; w < 13; w++) {
-      weeks.push({
-        weekIdx: w,
-        cells: flatCells.slice(w * 7, w * 7 + 7)
-      });
-    }
-    this.weeksGrid = weeks;
-
-    // Last 14 days bar chart
-    const bars: DailyBarItem[] = [];
-    let maxBar = 1;
-    for (let offset = 13; offset >= 0; offset--) {
-      const dt = new Date(today.getTime() - offset * 86400000);
-      const dayStr = this.formatDay(dt);
-      const stat = dayMap.get(dayStr);
-      const tot = stat ? stat.prompt + stat.comp : 0;
-      if (tot > maxBar) {
-        maxBar = tot;
-      }
-    }
-    for (let offset = 13; offset >= 0; offset--) {
-      const dt = new Date(today.getTime() - offset * 86400000);
-      const dayStr = this.formatDay(dt);
-      const stat = dayMap.get(dayStr);
-      const pr = stat ? stat.prompt : 0;
-      const cp = stat ? stat.comp : 0;
-      const tot = pr + cp;
-      bars.push({
-        day: dayStr,
-        shortDay: dayStr.slice(5),
-        promptTokens: pr,
-        completionTokens: cp,
-        total: tot,
-        promptPct: tot > 0 ? Math.max(2, Math.round((pr / maxBar) * 100)) : 0,
-        compPct: tot > 0 ? Math.max(2, Math.round((cp / maxBar) * 100)) : 0
-      });
-    }
-    this.recentBars = bars;
-
-    // Rankings
-    this.modelRanks = this.buildRankList(modelMap, (k: string): string => k);
-    this.personaRanks = this.buildRankList(personaMap, (k: string): string => this.personaLabel(k));
+    return `${cell.day} · ${formatUsageCount(cell.totalTokens)}（输入 ${formatUsageCount(cell.promptTokens)} / 输出 ${formatUsageCount(cell.completionTokens)}）`;
   }
 
-  private buildRankList(
-    src: Map<string, UsageCountBucket>,
-    labelFn: (k: string) => string
-  ): UsageRankItem[] {
-    const raw: RawRankRow[] = [];
-    let maxTok = 1;
-    src.forEach((v, k) => {
-      if (v.total > maxTok) {
-        maxTok = v.total;
-      }
-      raw.push({ key: k, label: labelFn(k), totalTokens: v.total, msgCount: v.msgs });
-    });
-    raw.sort((a, b) => b.totalTokens - a.totalTokens);
-    return raw.map((item): UsageRankItem => ({
-      key: item.key,
-      label: item.label,
-      totalTokens: item.totalTokens,
-      msgCount: item.msgCount,
-      ratioPct: Math.max(4, Math.round((item.totalTokens / maxTok) * 100))
-    }));
+  private selectCell(cell: UsageHeatmapCell): void {
+    if (cell.level < 0) {
+      return;
+    }
+    if (this.selectedDay === cell.day) {
+      this.selectedDay = '';
+      this.selectedDayTip = '';
+      return;
+    }
+    this.selectedDay = cell.day;
+    this.selectedDayTip = this.formatCellTip(cell);
   }
 
-  private cellColor(level: number): string {
+  private cellColor(level: number): ResourceColor {
+    if (level < 0) {
+      return Color.Transparent;
+    }
+    if (this.isDark) {
+      if (level === 4) {
+        return '#60A5FA';
+      }
+      if (level === 3) {
+        return '#3B82F6';
+      }
+      if (level === 2) {
+        return '#1D4ED8';
+      }
+      if (level === 1) {
+        return '#1E3A5F';
+      }
+      return '#272B36';
+    }
     if (level === 4) {
       return '#1D4ED8';
     }
@@ -253,23 +146,69 @@ export struct StatsPanel {
 
   @Builder
   private metricBox(title: string, metricVal: string, sub: string) {
-    Column({ space: 4 }) {
+    Column() {
       Text(title)
-        .fontSize(11)
+        .fontSize(12)
         .fontColor($r('app.color.muted'))
+        .maxLines(1)
       Text(metricVal)
-        .fontSize(18)
+        .fontSize(20)
         .fontWeight(FontWeight.Bold)
         .fontColor($r('app.color.ink'))
+        .maxLines(1)
+        .minFontSize(14)
+        .maxFontSize(20)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
       Text(sub)
-        .fontSize(10)
+        .fontSize(11)
         .fontColor($r('app.color.accent'))
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
     }
+    .justifyContent(FlexAlign.SpaceBetween)
     .alignItems(HorizontalAlign.Start)
-    .padding(10)
+    .padding({ left: 12, right: 12, top: 10, bottom: 10 })
+    .height(82)
     .layoutWeight(1)
     .backgroundColor($r('app.color.surface'))
-    .borderRadius(10)
+    .borderRadius(12)
+    .border({ width: 1, color: $r('app.color.line') })
+  }
+
+  @Builder
+  private rankRowItem(item: UsageRankRow, barColor: ResourceColor) {
+    Column({ space: 5 }) {
+      Row({ space: 8 }) {
+        Text(item.label)
+          .fontSize(12)
+          .fontColor($r('app.color.ink'))
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .layoutWeight(1)
+        Text(`${formatUsageCount(item.totalTokens)} (${item.msgCount} 次)`)
+          .fontSize(11)
+          .maxLines(1)
+          .fontColor($r('app.color.muted'))
+      }
+      .width('100%')
+
+      Row() {
+        if (item.ratioPct > 0) {
+          Row()
+            .height('100%')
+            .width(`${item.ratioPct}%`)
+            .backgroundColor(barColor)
+            .borderRadius(3)
+        }
+      }
+      .width('100%')
+      .height(6)
+      .borderRadius(3)
+      .backgroundColor($r('app.color.panel'))
+      .clip(true)
+    }
+    .alignItems(HorizontalAlign.Start)
+    .width('100%')
   }
 
   build() {
@@ -281,143 +220,254 @@ export struct StatsPanel {
             .fontWeight(FontWeight.Bold)
             .fontColor($r('app.color.ink'))
           Blank()
-          Button('刷新')
+          Button(this.refreshing ? '刷新中...' : '刷新')
             .type(ButtonType.Normal)
             .height(32)
             .fontSize(12)
             .borderRadius(8)
+            .padding({ left: 12, right: 12 })
             .fontColor($r('app.color.accent'))
             .backgroundColor($r('app.color.tint'))
             .margin({ right: 6 })
-            .onClick(async () => {
-              await this.onRefresh();
-              this.recompute();
+            .enabled(!this.refreshing)
+            .opacity(this.refreshing ? 0.65 : 1)
+            .onClick(() => {
+              this.triggerRefresh(true);
             })
           Button('关闭')
             .type(ButtonType.Normal)
             .height(32)
             .fontSize(12)
             .borderRadius(8)
+            .padding({ left: 12, right: 12 })
             .fontColor($r('app.color.ink'))
             .backgroundColor($r('app.color.surface'))
             .onClick(() => this.onClose())
         }
         .width('100%')
+        .padding({ left: 16, right: 16 })
       }
 
       Scroll() {
         Column({ space: 12 }) {
           if (this.embeddedInNav) {
-            Row() {
-              Text('用量汇总与热力图')
-                .fontSize(13)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.muted'))
-              Blank()
-              Button('刷新数据')
+            Row({ space: 8 }) {
+              Column({ space: 2 }) {
+                Text('用量汇总与热力图')
+                  .fontSize(13)
+                  .fontWeight(FontWeight.Medium)
+                  .fontColor($r('app.color.muted'))
+                if (this.lastRefreshedText.length > 0) {
+                  Text(this.lastRefreshedText)
+                    .fontSize(11)
+                    .fontColor($r('app.color.muted'))
+                }
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              Button(this.refreshing ? '刷新中...' : '刷新数据')
                 .type(ButtonType.Normal)
                 .height(30)
                 .fontSize(12)
                 .borderRadius(8)
+                .padding({ left: 12, right: 12 })
                 .fontColor($r('app.color.accent'))
                 .backgroundColor($r('app.color.tint'))
-                .onClick(async () => {
-                  await this.onRefresh();
-                  this.recompute();
+                .enabled(!this.refreshing)
+                .opacity(this.refreshing ? 0.65 : 1)
+                .onClick(() => {
+                  this.triggerRefresh(true);
                 })
             }
             .width('100%')
+            .alignItems(VerticalAlign.Center)
           }
-          Row({ space: 8 }) {
-            this.metricBox('总 Token', this.formatCount(this.totalTokens), `${this.activeDays} 个活跃日`)
-            this.metricBox('输入 / 输出', `${this.formatCount(this.promptTokens)} / ${this.formatCount(this.completionTokens)}`, `缓存命中 ${this.formatCount(this.cachedTokens)}`)
-            this.metricBox('对话轮次', `${this.totalMessages}`, 'SQLite 持久化统计')
+
+          Column({ space: 10 }) {
+            Row({ space: 10 }) {
+              this.metricBox('总 Token', formatUsageCount(this.dashboard.totalTokens), `${this.dashboard.activeDays} 个活跃日`)
+              this.metricBox('对话轮次', `${this.dashboard.totalMessages} 次`, `次均 ${formatUsageCount(this.dashboard.avgTokensPerMsg)}`)
+            }
+            .width('100%')
+
+            Row({ space: 10 }) {
+              this.metricBox('输入 Token', formatUsageCount(this.dashboard.promptTokens), `缓存命中 ${formatUsageCount(this.dashboard.cachedTokens)}`)
+              this.metricBox('输出 Token', formatUsageCount(this.dashboard.completionTokens), `占总量 ${this.dashboard.outputSharePct.toFixed(1)}%`)
+            }
+            .width('100%')
           }
           .width('100%')
 
-          Column({ space: 8 }) {
-            Row() {
+          Column({ space: 10 }) {
+            Row({ space: 8 }) {
               Text('近 91 天活跃度热力图')
                 .fontSize(13)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.ink'))
-              Blank()
-              if (this.selectedDayTip.length > 0) {
-                Text(this.selectedDayTip)
-                  .fontSize(11)
-                  .fontColor($r('app.color.accent'))
-              }
+                .layoutWeight(1)
+                .maxLines(1)
+              Text(`${this.dashboard.heatmapStartDay.slice(5)} ~ ${this.dashboard.heatmapEndDay.slice(5)}`)
+                .fontSize(11)
+                .fontColor($r('app.color.muted'))
             }
             .width('100%')
 
-            Scroll() {
-              Row({ space: 4 }) {
-                ForEach(this.weeksGrid, (wk: HeatmapWeek) => {
-                  Column({ space: 4 }) {
-                    ForEach(wk.cells, (cell: HeatmapCell) => {
-                      Row()
-                        .width(16)
-                        .height(16)
-                        .borderRadius(3)
-                        .backgroundColor(this.cellColor(cell.level))
-                        .onClick(() => {
-                          this.selectedDayTip = `${cell.day}: ${cell.tokens} tokens`;
-                        })
-                    }, (cell: HeatmapCell) => cell.day)
-                  }
-                }, (wk: HeatmapWeek) => `wk_${wk.weekIdx}`)
-              }
+            Column({ space: 4 }) {
+              ForEach(this.dashboard.heatmapRows, (row: UsageHeatmapRow) => {
+                Row({ space: 4 }) {
+                  Text(row.label)
+                    .width(14)
+                    .fontSize(10)
+                    .textAlign(TextAlign.Start)
+                    .fontColor($r('app.color.muted'))
+                  ForEach(row.cells, (cell: UsageHeatmapCell) => {
+                    Row()
+                      .layoutWeight(1)
+                      .aspectRatio(1)
+                      .borderRadius(3)
+                      .backgroundColor(this.cellColor(cell.level))
+                      .border({
+                        width: cell.level >= 0 && this.selectedDay === cell.day ? 1.5 : 0,
+                        color: $r('app.color.ink')
+                      })
+                      .onClick(() => {
+                        if (cell.level >= 0) {
+                          this.selectCell(cell);
+                        }
+                      })
+                  }, (cell: UsageHeatmapCell) => `${this.dataRev}_${this.isDark ? 'd' : 'l'}_hc_${cell.day}_${cell.level}`)
+                }
+                .width('100%')
+                .alignItems(VerticalAlign.Center)
+              }, (row: UsageHeatmapRow) => `${this.dataRev}_${this.isDark ? 'd' : 'l'}_hr_${row.dayOfWeek}`)
             }
-            .scrollable(ScrollDirection.Horizontal)
-            .scrollBar(BarState.Off)
             .width('100%')
+            .constraintSize({ maxWidth: 380 })
+            .alignSelf(ItemAlign.Center)
+
+            Row({ space: 8 }) {
+              Text(this.selectedDayTip.length > 0 ? this.selectedDayTip : '点击方格查看当日详情')
+                .fontSize(11)
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .fontColor(this.selectedDayTip.length > 0 ? $r('app.color.accent') : $r('app.color.muted'))
+
+              Row({ space: 3 }) {
+                Text('少')
+                  .fontSize(10)
+                  .fontColor($r('app.color.muted'))
+                ForEach(this.legendLevels, (lv: number) => {
+                  Row()
+                    .width(10)
+                    .height(10)
+                    .borderRadius(2)
+                    .backgroundColor(this.cellColor(lv))
+                }, (lv: number) => `${this.isDark ? 'd' : 'l'}_lg_${lv}`)
+                Text('多')
+                  .fontSize(10)
+                  .fontColor($r('app.color.muted'))
+              }
+              .alignItems(VerticalAlign.Center)
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
           }
           .padding(12)
           .backgroundColor($r('app.color.surface'))
           .borderRadius(12)
+          .border({ width: 1, color: $r('app.color.line') })
           .width('100%')
 
           Column({ space: 8 }) {
-            Text('近 14 天每日 Token 分布（蓝：输入 / 浅蓝：输出）')
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.ink'))
-            ForEach(this.recentBars, (bar: DailyBarItem) => {
+            Row({ space: 8 }) {
+              Text('近 14 天每日 Token 分布')
+                .fontSize(13)
+                .fontWeight(FontWeight.Medium)
+                .fontColor($r('app.color.ink'))
+                .layoutWeight(1)
+                .maxLines(1)
+              Row({ space: 8 }) {
+                Row({ space: 4 }) {
+                  Row()
+                    .width(7)
+                    .height(7)
+                    .borderRadius(3.5)
+                    .backgroundColor('#2563EB')
+                  Text('输入')
+                    .fontSize(11)
+                    .fontColor($r('app.color.muted'))
+                }
+                .alignItems(VerticalAlign.Center)
+                Row({ space: 4 }) {
+                  Row()
+                    .width(7)
+                    .height(7)
+                    .borderRadius(3.5)
+                    .backgroundColor('#60A5FA')
+                  Text('输出')
+                    .fontSize(11)
+                    .fontColor($r('app.color.muted'))
+                }
+                .alignItems(VerticalAlign.Center)
+              }
+            }
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
+
+            ForEach(this.dashboard.recentBars, (bar: UsageDailyBar) => {
               Row({ space: 8 }) {
                 Text(bar.shortDay)
                   .fontSize(11)
-                  .width(42)
-                  .fontColor($r('app.color.muted'))
+                  .width(40)
+                  .fontColor(bar.isToday ? $r('app.color.accent') : $r('app.color.muted'))
+                  .fontWeight(bar.isToday ? FontWeight.Medium : FontWeight.Normal)
+
                 Row() {
-                  if (bar.promptPct > 0) {
-                    Row()
-                      .height(10)
-                      .width(`${bar.promptPct}%`)
-                      .backgroundColor('#2563EB')
-                      .borderRadius(3)
-                  }
-                  if (bar.compPct > 0) {
-                    Row()
-                      .height(10)
-                      .width(`${bar.compPct}%`)
-                      .backgroundColor('#60A5FA')
-                      .borderRadius(3)
+                  if (bar.promptPct + bar.compPct > 0) {
+                    Row() {
+                      if (bar.promptPct > 0) {
+                        Row()
+                          .height('100%')
+                          .layoutWeight(bar.promptPct)
+                          .backgroundColor('#2563EB')
+                      }
+                      if (bar.compPct > 0) {
+                        Row()
+                          .height('100%')
+                          .layoutWeight(bar.compPct)
+                          .backgroundColor('#60A5FA')
+                      }
+                    }
+                    .height('100%')
+                    .width(`${bar.promptPct + bar.compPct}%`)
+                    .borderRadius(5)
+                    .clip(true)
                   }
                 }
                 .layoutWeight(1)
-                Text(this.formatCount(bar.total))
+                .height(10)
+                .borderRadius(5)
+                .backgroundColor($r('app.color.panel'))
+                .clip(true)
+
+                Text(formatUsageCount(bar.totalTokens))
                   .fontSize(11)
-                  .width(44)
+                  .width(54)
+                  .maxLines(1)
                   .textAlign(TextAlign.End)
-                  .fontColor($r('app.color.ink'))
+                  .fontColor(bar.totalTokens > 0 ? $r('app.color.ink') : $r('app.color.muted'))
               }
               .width('100%')
-            }, (bar: DailyBarItem) => bar.day)
+              .alignItems(VerticalAlign.Center)
+            }, (bar: UsageDailyBar) => `${this.dataRev}_b_${bar.day}`)
           }
           .alignItems(HorizontalAlign.Start)
           .padding(12)
           .backgroundColor($r('app.color.surface'))
           .borderRadius(12)
+          .border({ width: 1, color: $r('app.color.line') })
           .width('100%')
 
           Column({ space: 8 }) {
@@ -425,38 +475,21 @@ export struct StatsPanel {
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.ink'))
-            if (this.modelRanks.length === 0) {
+            if (this.dashboard.modelRanks.length === 0) {
               Text('暂无记录，发送消息后将自动统计各模型 Token 消耗')
                 .fontSize(12)
                 .fontColor($r('app.color.muted'))
             } else {
-              ForEach(this.modelRanks, (mr: UsageRankItem) => {
-                Column({ space: 4 }) {
-                  Row() {
-                    Text(mr.label)
-                      .fontSize(12)
-                      .fontColor($r('app.color.ink'))
-                      .layoutWeight(1)
-                    Text(`${this.formatCount(mr.totalTokens)} (${mr.msgCount} 次)`)
-                      .fontSize(11)
-                      .fontColor($r('app.color.muted'))
-                  }
-                  .width('100%')
-                  Row()
-                    .height(6)
-                    .width(`${mr.ratioPct}%`)
-                    .backgroundColor($r('app.color.accent'))
-                    .borderRadius(3)
-                }
-                .alignItems(HorizontalAlign.Start)
-                .width('100%')
-              }, (mr: UsageRankItem) => `m_${mr.key}`)
+              ForEach(this.dashboard.modelRanks, (mr: UsageRankRow) => {
+                this.rankRowItem(mr, $r('app.color.accent'))
+              }, (mr: UsageRankRow) => `${this.dataRev}_m_${mr.key}`)
             }
           }
           .alignItems(HorizontalAlign.Start)
           .padding(12)
           .backgroundColor($r('app.color.surface'))
           .borderRadius(12)
+          .border({ width: 1, color: $r('app.color.line') })
           .width('100%')
 
           Column({ space: 8 }) {
@@ -464,44 +497,40 @@ export struct StatsPanel {
               .fontSize(13)
               .fontWeight(FontWeight.Medium)
               .fontColor($r('app.color.ink'))
-            ForEach(this.personaRanks, (pr: UsageRankItem) => {
-              Column({ space: 4 }) {
-                Row() {
-                  Text(pr.label)
-                    .fontSize(12)
-                    .fontColor($r('app.color.ink'))
-                    .layoutWeight(1)
-                  Text(`${this.formatCount(pr.totalTokens)} (${pr.msgCount} 次)`)
-                    .fontSize(11)
-                    .fontColor($r('app.color.muted'))
-                }
-                .width('100%')
-                Row()
-                  .height(6)
-                  .width(`${pr.ratioPct}%`)
-                  .backgroundColor('#10B981')
-                  .borderRadius(3)
-              }
-              .alignItems(HorizontalAlign.Start)
-              .width('100%')
-            }, (pr: UsageRankItem) => `p_${pr.key}`)
+            if (this.dashboard.personaRanks.length === 0) {
+              Text('暂无记录，发送消息后将自动统计各助手 Token 消耗')
+                .fontSize(12)
+                .fontColor($r('app.color.muted'))
+            } else {
+              ForEach(this.dashboard.personaRanks, (pr: UsageRankRow) => {
+                this.rankRowItem(pr, '#10B981')
+              }, (pr: UsageRankRow) => `${this.dataRev}_p_${pr.key}`)
+            }
           }
           .alignItems(HorizontalAlign.Start)
           .padding(12)
           .backgroundColor($r('app.color.surface'))
           .borderRadius(12)
+          .border({ width: 1, color: $r('app.color.line') })
           .width('100%')
         }
         .width('100%')
-        .padding({ top: this.embeddedInNav ? (56 + this.winTopInset + 8) : 0, bottom: 48 })
+        .padding({
+          left: 16,
+          right: 16,
+          top: this.embeddedInNav ? (56 + this.winTopInset + 8) : 0,
+          bottom: 24 + this.winBottomInset
+        })
       }
       .layoutWeight(1)
       .width('100%')
       .align(Alignment.Top)
+      .scrollBar(BarState.Off)
+      .edgeEffect(EdgeEffect.Spring)
     }
     .width('100%')
     .height('100%')
-    .padding({ left: 16, right: 16, top: this.embeddedInNav ? 0 : 16, bottom: 0 })
+    .padding({ top: this.embeddedInNav ? 0 : 16 })
     .backgroundColor(Color.Transparent)
   }
 }
