@@ -263,6 +263,78 @@ export function parseMarkdownBlocks(source: string): MdBlock[] {
   return blocks;
 }
 
+export interface InlineTailSplit {
+  prefix: MdInline[];
+  suffix: string;
+}
+
+export function splitInlineTail(source: string): InlineTailSplit {
+  const runs = parseMdInlines(source);
+  if (runs.length > 0 && runs[runs.length - 1].kind === 'text') {
+    return {
+      prefix: runs.slice(0, runs.length - 1),
+      suffix: runs[runs.length - 1].text
+    };
+  }
+  return {
+    prefix: runs,
+    suffix: ''
+  };
+}
+
+export function findStableMarkdownPrefixEnd(source: string): number {
+  if (!source) return 0;
+  let pos = 0;
+  let inFence = false;
+  let fencePrefix = '';
+  let inMath = false;
+  let sawContent = false;
+  let candidateCut = 0;
+  let lastConfirmedCut = 0;
+
+  while (pos < source.length) {
+    const nlIdx = source.indexOf('\n', pos);
+    const hasNewline = nlIdx >= 0;
+    const rawLineEnd = hasNewline ? nlIdx : source.length;
+    const contentEnd = (rawLineEnd > pos && source[rawLineEnd - 1] === '\r') ? rawLineEnd - 1 : rawLineEnd;
+    const trimmed = source.slice(pos, contentEnd).trim();
+    const lineEndPos = hasNewline ? nlIdx + 1 : source.length;
+
+    if (inFence) {
+      if (trimmed.startsWith(fencePrefix)) {
+        inFence = false;
+        fencePrefix = '';
+      }
+    } else if (inMath) {
+      if (trimmed.endsWith('$$')) {
+        inMath = false;
+      }
+    } else if (!trimmed) {
+      if (sawContent && hasNewline) {
+        candidateCut = lineEndPos;
+      }
+    } else {
+      if (candidateCut > lastConfirmedCut) {
+        lastConfirmedCut = candidateCut;
+      }
+      sawContent = true;
+      const fenceMatch = trimmed.match(/^(```|~~~)(.*)$/);
+      if (fenceMatch) {
+        inFence = true;
+        fencePrefix = fenceMatch[1];
+      } else if (trimmed.startsWith('$$')) {
+        if (!(trimmed.length > 4 && trimmed.endsWith('$$'))) {
+          inMath = true;
+        }
+      }
+    }
+
+    pos = lineEndPos;
+  }
+
+  return lastConfirmedCut;
+}
+
 const INLINE_PATTERN = /(\*\*\*[^*\n]+\*\*\*|\*\*[^*\n]+\*\*|__[^_\n]+__|~~[^~\n]+~~|`[^`\n]+`|\$[^$\n]+\$|\[[^\]\n]+\]\(https?:\/\/[^)\s]+\)|https?:\/\/[^\s<>()]+|\*[^*\n]+\*)/g;
 
 export function parseMdInlines(source: string): MdInline[] {

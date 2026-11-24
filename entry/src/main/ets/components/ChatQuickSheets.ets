@@ -1,3 +1,4 @@
+import { ReasoningControl, reasoningBulbRayCount } from '../core/Reasoning';
 import { resolveBrandIconId } from '../core/BrandIcons';
 import { ImmersiveMaterialStyle } from '../core/ImmersiveMaterialStyle';
 import { LocalWorkspace, McpServerConfig, ReasoningEffort, SearchServiceConfig, ToolPermissionMode } from '../core/Models';
@@ -96,83 +97,145 @@ interface ReasoningChoice {
 
 const REASONING_CHOICES: ReasoningChoice[] = [
   { effort: 'off', label: '关闭思考', desc: '直接回答，速度最快' },
+  { effort: 'minimal', label: '最低推理', desc: '使用模型支持的最低思考强度' },
   { effort: 'low', label: '轻度推理', desc: '简短思考后响应' },
   { effort: 'medium', label: '标准推理', desc: '均衡思考深度与延迟' },
   { effort: 'high', label: '深度推理', desc: '适合复杂架构与推导' },
+  { effort: 'xhigh', label: '极高推理', desc: '为复杂任务增加推理深度' },
   { effort: 'max', label: '极限推理', desc: '分配最大推理预算' }
 ];
+
+export function reasoningBulbResource(rayCount: number): Resource {
+  switch (Math.max(0, Math.min(6, Math.round(rayCount)))) {
+    case 0:
+      return $r('app.media.icon_reasoning_bulb_0');
+    case 1:
+      return $r('app.media.icon_reasoning_bulb_1');
+    case 2:
+      return $r('app.media.icon_reasoning_bulb_2');
+    case 3:
+      return $r('app.media.icon_reasoning_bulb_3');
+    case 4:
+      return $r('app.media.icon_reasoning_bulb_4');
+    case 5:
+      return $r('app.media.icon_reasoning_bulb_5');
+    case 6:
+      return $r('app.media.icon_reasoning_bulb_6');
+    default:
+      return $r('app.media.icon_reasoning_bulb_0');
+  }
+}
 
 @Component
 export struct ReasoningLevelSheet {
   @Prop currentEffort: ReasoningEffort = 'off';
-  @Prop budgetTokens: number = 8192;
+  @Prop budgetTokens: number = 0;
+  @Prop control: ReasoningControl = { dialect: 'fixed', levels: [], budgetLimit: 0 };
   @Prop immersiveLightEnabled: boolean = true;
 
   onSelectEffort: (effort: ReasoningEffort) => void = () => {};
   onChangeBudget: (tokens: number) => void = () => {};
 
+  private toggleOnly(): boolean {
+    return this.control.levels.length === 2 && this.control.levels.includes('off');
+  }
+
+  private visibleChoices(): ReasoningChoice[] {
+    return REASONING_CHOICES.filter((item: ReasoningChoice): boolean => this.control.levels.includes(item.effort));
+  }
+
+  private badgeBgColor(effort: ReasoningEffort, selected: boolean): ResourceColor {
+    if (selected) {
+      return $r('app.color.accent');
+    }
+    return effort === 'off' ? $r('app.color.panel') : $r('app.color.tint');
+  }
+
+  private badgeIconColor(effort: ReasoningEffort, selected: boolean): ResourceColor {
+    if (selected) {
+      return $r('app.color.on_accent');
+    }
+    return effort === 'off' ? $r('app.color.muted') : $r('app.color.accent');
+  }
+
   build() {
-    Column({ space: 10 }) {
-      Column({ space: 2 }) {
-        ForEach(REASONING_CHOICES, (item: ReasoningChoice) => {
-          Row({ space: 10 }) {
-            SymbolGlyph($r('sys.symbol.lightbulb'))
-              .fontSize(18)
-              .fontColor([this.currentEffort === item.effort ? $r('app.color.accent') : $r('app.color.muted')])
-            Column({ space: 2 }) {
-              Text(item.label)
-                .fontSize(15)
-                .fontColor($r('app.color.ink'))
-              Text(item.desc)
-                .fontSize(11)
-                .fontColor($r('app.color.muted'))
-            }
-            .alignItems(HorizontalAlign.Start)
-            .layoutWeight(1)
+    Scroll() {
+      Column({ space: 10 }) {
+        Column({ space: 2 }) {
+          ForEach(this.visibleChoices(), (item: ReasoningChoice) => {
+            Row({ space: 12 }) {
+              Stack({ alignContent: Alignment.Center }) {
+                Image(reasoningBulbResource(reasoningBulbRayCount(this.control, item.effort)))
+                  .width(22)
+                  .height(22)
+                  .objectFit(ImageFit.Contain)
+                  .fillColor(this.badgeIconColor(item.effort, this.currentEffort === item.effort))
+              }
+              .width(34)
+              .height(34)
+              .borderRadius(10)
+              .backgroundColor(this.badgeBgColor(item.effort, this.currentEffort === item.effort))
 
-            if (this.currentEffort === item.effort) {
-              SymbolGlyph($r('sys.symbol.checkmark'))
-                .fontSize(17)
-                .fontColor([$r('app.color.accent')])
-            }
-          }
-          .width('100%')
-          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-          .borderRadius(12)
-          .backgroundColor(this.currentEffort === item.effort ? $r('app.color.tint') : Color.Transparent)
-          .onClick(() => { this.onSelectEffort(item.effort); })
-        }, (item: ReasoningChoice) => item.effort)
-      }
-      .width('100%')
-      .borderRadius(16)
-      .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
-      .padding(6)
-
-      if (this.currentEffort !== 'off') {
-        Column({ space: 6 }) {
-          Row() {
-            Text('思考 Token 预算')
-              .fontSize(14)
-              .fontColor($r('app.color.ink'))
+              Column({ space: 2 }) {
+                Text(this.toggleOnly() && item.effort !== 'off' ? '开启思考' : item.label)
+                  .fontSize(15)
+                  .fontWeight(this.currentEffort === item.effort ? FontWeight.Medium : FontWeight.Normal)
+                  .fontColor($r('app.color.ink'))
+                if (!this.toggleOnly()) {
+                  Text(item.desc)
+                    .fontSize(11)
+                    .fontColor($r('app.color.muted'))
+                }
+              }
+              .alignItems(HorizontalAlign.Start)
               .layoutWeight(1)
-            Text(`${Math.round(this.budgetTokens / 1024)}k`)
-              .fontSize(13)
-              .fontColor($r('app.color.accent'))
-          }
-          .width('100%')
 
-          Slider({ value: this.budgetTokens, min: 2048, max: 32768, step: 2048 })
-            .onChange((v: number) => { this.onChangeBudget(Math.round(v)); })
-            .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+              if (this.currentEffort === item.effort) {
+                SymbolGlyph($r('sys.symbol.checkmark'))
+                  .fontSize(17)
+                  .fontColor([$r('app.color.accent')])
+              }
+            }
+            .width('100%')
+            .padding({ left: 10, right: 12, top: 8, bottom: 8 })
+            .borderRadius(12)
+            .backgroundColor(this.currentEffort === item.effort ? $r('app.color.tint') : Color.Transparent)
+            .onClick(() => { this.onSelectEffort(item.effort); })
+          }, (item: ReasoningChoice): string => item.effort)
         }
         .width('100%')
-        .padding(12)
-        .borderRadius(14)
+        .borderRadius(16)
         .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
+        .padding(6)
+
+        if (this.currentEffort !== 'off' && this.control.budgetLimit > 0) {
+          Column({ space: 6 }) {
+            Row() {
+              Text('思考 Token 预算')
+                .fontSize(14)
+                .fontColor($r('app.color.ink'))
+                .layoutWeight(1)
+              Text(String(this.budgetTokens))
+                .fontSize(13)
+                .fontColor($r('app.color.accent'))
+            }
+            .width('100%')
+
+            Slider({ value: this.budgetTokens, min: 1024, max: this.control.budgetLimit, step: 1024 })
+              .onChange((v: number) => { this.onChangeBudget(Math.round(v)); })
+              .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+          }
+          .width('100%')
+          .padding(12)
+          .borderRadius(14)
+          .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightEnabled))
+        }
       }
+      .width('100%')
+      .padding({ left: 16, right: 16, top: 4, bottom: 20 })
     }
+    .constraintSize({ maxHeight: 520 })
     .width('100%')
-    .padding({ left: 16, right: 16, top: 4, bottom: 20 })
   }
 }
 

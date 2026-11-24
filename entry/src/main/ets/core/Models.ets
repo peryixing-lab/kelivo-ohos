@@ -2,7 +2,7 @@ export type ApiFamily = 'openai' | 'openai-responses' | 'anthropic' | 'gemini' |
 
 export type KeyRotationStrategy = 'round_robin' | 'priority' | 'least_used' | 'random';
 
-export type ReasoningEffort = 'off' | 'low' | 'medium' | 'high' | 'max';
+export type ReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export type ResponseSpeedMode = 'standard' | 'fast' | 'ultrafast';
 
@@ -730,7 +730,7 @@ export interface Workspace {
 export function defaultModelSpec(id: string): ModelSpec {
   const lower = id.toLowerCase();
   const isVision = /(gpt-4o|gpt-4\.1|gpt-5|gpt-6|claude-3|claude-4|claude-5|claude-sonnet|claude-opus|claude-haiku|gemini|qwen-vl|qwen2\.5-vl|qwen3-vl|glm-4v|glm-4\.5v|grok-2-vision|grok-3|grok-4|vision|vl)/i.test(lower);
-  const isReason = /(o1|o3|o4|r1|reasoner|thinking|gpt-5|gpt-6|deepseek-v4|claude-3-7|claude-sonnet-4|claude-opus-4|claude-haiku-4|claude-haiku-5|claude-4|claude-5|gemini-2\.5|gemini-3|gemini-4|qwen3|qwq|glm-z1|glm-5|omen)/i.test(lower);
+  const isReason = /(o1|o3|o4|r1|reasoner|thinking|gpt-5|gpt-6|deepseek-(?:v4|flash|chat)|gpt-oss|grok-3-mini|kimi-k2[.-][5-8]|kimi-k3|kimi-for-coding|glm-4[.-][567]|doubao.*(?:thinking|seed)|intern-s1|claude-(?:mythos|fable)|claude-3-7|claude-(?:sonnet|opus|haiku)-[45]|claude-4|claude-5|gemini-2\.5|gemini-3|gemini-4|qwen3|qwq|glm-z1|glm-5|omen)/i.test(lower);
   const isImageGen = /(dall-e|gpt-image|imagen|flux|stable-diffusion|image-generation|gemini-2\.0-flash-exp-image|gemini-2\.5-flash-image)/i.test(lower);
   const isTools = !/(reasoner|r1|image|tts|whisper|embedding)/i.test(lower);
   return {
@@ -825,7 +825,6 @@ export function defaultGenerationParams(): GenerationParams {
     topP: 1.0,
     maxTokens: 4096,
     reasoningEffort: 'off',
-    reasoningBudget: 8192,
     responseSpeed: 'standard',
     contextLimit: 24,
     autoRetryCount: 2,

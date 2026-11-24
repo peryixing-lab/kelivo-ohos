@@ -1015,6 +1015,8 @@ function parseMemoryTimestamp(raw?: string | number): number {
 function parseAndroidReasoningEffort(level?: string): ReasoningEffort | undefined {
   switch (level) {
     case 'off':
+    case 'minimal':
+    case 'xhigh':
     case 'low':
     case 'medium':
     case 'high':

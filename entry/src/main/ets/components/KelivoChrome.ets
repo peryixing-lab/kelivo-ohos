@@ -338,6 +338,7 @@ export struct KelivoAvatarBadge {
   @Prop avatarText: string = '';
   @Prop fallbackLetter: string = 'K';
   @Prop badgeSize: number = 32;
+  @Prop plain: boolean = false;
 
   private resolvedRes(): Resource | undefined {
     return brandIconResource(this.brandId);
@@ -359,19 +360,21 @@ export struct KelivoAvatarBadge {
       if (this.resolvedRes() !== undefined) {
         if (this.isMono()) {
           Image(this.resolvedRes() as Resource)
-            .width(Math.round(this.badgeSize * 0.62))
-            .height(Math.round(this.badgeSize * 0.62))
+            .width(this.plain ? this.badgeSize : Math.round(this.badgeSize * 0.62))
+            .height(this.plain ? this.badgeSize : Math.round(this.badgeSize * 0.62))
             .objectFit(ImageFit.Contain)
             .fillColor($r('app.color.ink'))
         } else {
           Image(this.resolvedRes() as Resource)
-            .width(Math.round(this.badgeSize * 0.66))
-            .height(Math.round(this.badgeSize * 0.66))
+            .width(this.plain ? this.badgeSize : Math.round(this.badgeSize * 0.66))
+            .height(this.plain ? this.badgeSize : Math.round(this.badgeSize * 0.66))
             .objectFit(ImageFit.Contain)
         }
       } else {
         Text(this.displayText())
-          .fontSize(Math.max(12, Math.round(this.badgeSize * 0.45)))
+          .fontSize(this.plain
+            ? Math.max(12, Math.round(this.badgeSize * 0.72))
+            : Math.max(12, Math.round(this.badgeSize * 0.45)))
           .fontWeight(FontWeight.Medium)
           .fontColor($r('app.color.accent'))
           .textAlign(TextAlign.Center)
@@ -380,10 +383,12 @@ export struct KelivoAvatarBadge {
     }
     .width(this.badgeSize)
     .height(this.badgeSize)
-    .borderRadius(this.badgeSize / 2)
-    .backgroundColor(this.resolvedRes() !== undefined ? $r('app.color.panel') : $r('app.color.tint'))
+    .borderRadius(this.plain ? 0 : this.badgeSize / 2)
+    .backgroundColor(this.plain
+      ? Color.Transparent
+      : (this.resolvedRes() !== undefined ? $r('app.color.panel') : $r('app.color.tint')))
     .alignContent(Alignment.Center)
-    .clip(true)
+    .clip(!this.plain)
   }
 }
 

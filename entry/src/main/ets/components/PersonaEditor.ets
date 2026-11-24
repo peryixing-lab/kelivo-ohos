@@ -154,8 +154,8 @@ export struct PersonaEditor {
   private readonly smartAddModes: MemorySmartAddMode[] = ['batched', 'perItem'];
   private readonly emojiChoices: string[] = ['🤖', '💻', '✍️', '🔬', '🎓', '🌐', '🎨', '⚡', '🧭', '📚'];
   private readonly bgChoices: string[] = ['', '#F0F6FC', '#F3F7F2', '#FDF6EC', '#F6F0FC', '#F4F4F6'];
-  private readonly reasoningOptions: string[] = ['', 'off', 'low', 'medium', 'high', 'max'];
-  private readonly reasoningLabels: string[] = ['跟随模型默认', '关闭', '低 (low)', '中 (medium)', '高 (high)', '最大 (max)'];
+  private readonly reasoningOptions: string[] = ['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  private readonly reasoningLabels: string[] = ['跟随全局设置', '关闭', '最低 (minimal)', '低 (low)', '中 (medium)', '高 (high)', '极高 (xhigh)', '最大 (max)'];
   private readonly promptVars: string[] = [
     '{cur_date}', '{cur_time}', '{cur_datetime}', '{model_id}', '{model_name}',
     '{locale}', '{timezone}', '{nickname}', '{assistant_name}'
@@ -251,7 +251,7 @@ export struct PersonaEditor {
 
   private normalizeReasoningEffort(raw: string): ReasoningEffort | undefined {
     const v = raw.trim().toLowerCase();
-    if (v === 'off' || v === 'low' || v === 'medium' || v === 'high' || v === 'max') {
+    if (v === 'off' || v === 'minimal' || v === 'xhigh' || v === 'low' || v === 'medium' || v === 'high' || v === 'max') {
       return v as ReasoningEffort;
     }
     return undefined;
@@ -320,7 +320,11 @@ export struct PersonaEditor {
     const cb = parseInt(this.editContextBudget, 10);
     if (!Number.isNaN(cb) && cb > 0) params.contextLimit = cb;
     const effort = this.normalizeReasoningEffort(this.editReasoning);
-    if (effort) params.reasoningEffort = effort;
+    if (effort) {
+      params.reasoningEffort = effort;
+      const previous = this.findPersonaById(this.selectedId)?.params;
+      if (previous?.reasoningEffort === effort) params.reasoningBudget = previous.reasoningBudget;
+    }
 
     const baseName = nameOverride ? nameOverride : (this.editName.trim().length > 0 ? this.editName.trim() : '未命名助手');
     return {
@@ -478,7 +482,7 @@ export struct PersonaEditor {
 
   private reasoningDisplayText(): string {
     const idx = this.reasoningOptions.indexOf(this.editReasoning);
-    return idx >= 0 ? this.reasoningLabels[idx] : '跟随模型默认';
+    return idx >= 0 ? this.reasoningLabels[idx] : '跟随全局设置';
   }
 
   private workspaceDisplayText(): string {
@@ -785,10 +789,7 @@ export struct PersonaEditor {
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
 
-          Select([
-            { value: '跟随模型默认' }, { value: '关闭' }, { value: '低 (low)' },
-            { value: '中 (medium)' }, { value: '高 (high)' }, { value: '最大 (max)' }
-          ])
+          Select(this.reasoningLabels.map((label: string): SelectOption => { return { value: label }; }))
             .selected(Math.max(0, this.reasoningOptions.indexOf(this.editReasoning)))
             .value(this.reasoningDisplayText())
             .onSelect((idx: number) => {

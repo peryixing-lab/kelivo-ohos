@@ -14,6 +14,7 @@ import {
   estimateTokens,
   findProviderModelSpec
 } from '../core/Models';
+import { ReasoningControl, effectiveEffort, reasoningControl, reasoningTokens } from '../core/Reasoning';
 import { sliceContextMessages } from '../core/ContextUtils';
 
 @Component
@@ -21,6 +22,7 @@ export struct ContextSheet {
   @Prop chat?: Conversation = undefined;
   @Prop providers: Provider[] = [];
   @Prop activeProviderId: string = '';
+  @Prop activeModelId: string = '';
   @Prop systemPrompt: string = '';
   @Prop params: GenerationParams = defaultGenerationParams();
   @Prop sysSettings: SystemSettings = {
@@ -55,8 +57,8 @@ export struct ContextSheet {
   @State tempVal: number = 0.7;
   @State topPVal: number = 1.0;
   @State maxTokensVal: number = 4096;
-  @State effortVal: ReasoningEffort = 'medium';
-  @State budgetVal: number = 8192;
+  @State effortVal: ReasoningEffort = 'off';
+  @State budgetVal: number = 0;
   @State speedVal: ResponseSpeedMode = 'standard';
   @State ctxLimitVal: number = 24;
   @State retryVal: number = 2;
@@ -74,8 +76,8 @@ export struct ContextSheet {
     this.tempVal = this.params.temperature ?? 0.7;
     this.topPVal = this.params.topP ?? 1.0;
     this.maxTokensVal = this.params.maxTokens ?? 4096;
-    this.effortVal = this.params.reasoningEffort || 'medium';
-    this.budgetVal = this.params.reasoningBudget ?? 8192;
+    this.effortVal = this.params.reasoningEffort || 'off';
+    this.budgetVal = this.params.reasoningBudget ?? 0;
     this.speedVal = this.params.responseSpeed || 'standard';
     this.ctxLimitVal = this.params.contextLimit ?? 24;
     this.retryVal = this.params.autoRetryCount ?? 2;
@@ -91,6 +93,20 @@ export struct ContextSheet {
   private effectiveProvider(): Provider {
     const id = this.chatProvId || this.activeProviderId;
     return this.providers.find((p: Provider): boolean => p.id === id) || this.providers[0];
+  }
+
+  private reasoningOptions(): ReasoningControl {
+    const p = this.effectiveProvider();
+    const id = this.chatModelVal || (p.id === this.activeProviderId ? this.activeModelId : p.model) || p.model;
+    return reasoningControl(p, id, findProviderModelSpec(p, id));
+  }
+
+  private selectedEffort(): ReasoningEffort {
+    return effectiveEffort(this.reasoningOptions(), this.effortVal);
+  }
+
+  private displayedBudget(): number {
+    return reasoningTokens(this.reasoningOptions(), this.selectedEffort(), this.budgetVal);
   }
 
   private contextWindowLimit(): number {
@@ -146,6 +162,9 @@ export struct ContextSheet {
 
   private effortLabel(e: ReasoningEffort): string {
     if (e === 'off') return '关闭';
+    if (this.reasoningOptions().levels.length === 2 && this.reasoningOptions().levels.includes('off')) return '开启';
+    if (e === 'minimal') return '最低';
+    if (e === 'xhigh') return '极高';
     if (e === 'low') return '低';
     if (e === 'medium') return '中';
     if (e === 'high') return '高';
@@ -164,7 +183,7 @@ export struct ContextSheet {
       topP: Number(this.topPVal.toFixed(2)),
       maxTokens: this.maxTokensVal,
       reasoningEffort: this.effortVal,
-      reasoningBudget: this.budgetVal,
+      reasoningBudget: this.budgetVal || undefined,
       responseSpeed: this.speedVal,
       contextLimit: this.ctxLimitVal,
       autoRetryCount: this.retryVal,
@@ -237,11 +256,11 @@ export struct ContextSheet {
           Column({ space: 8 }) {
             Text('思维链与响应控制').fontSize(15).fontWeight(FontWeight.Bold).fontColor($r('app.color.ink'))
             Row({ space: 6 }) {
-              ForEach(['off', 'low', 'medium', 'high', 'max'] as ReasoningEffort[], (eff: ReasoningEffort) => {
+              ForEach(this.reasoningOptions().levels, (eff: ReasoningEffort) => {
                 Button(this.effortLabel(eff)).height(30).fontSize(12).layoutWeight(1)
-                  .backgroundColor(this.effortVal === eff ? $r('app.color.accent') : $r('app.color.panel'))
-                  .fontColor(this.effortVal === eff ? $r('app.color.on_accent') : $r('app.color.ink'))
-                  .onClick(() => { this.effortVal = eff; })
+                  .backgroundColor(this.selectedEffort() === eff ? $r('app.color.accent') : $r('app.color.panel'))
+                  .fontColor(this.selectedEffort() === eff ? $r('app.color.on_accent') : $r('app.color.ink'))
+                  .onClick(() => { this.effortVal = eff; this.budgetVal = 0; })
               }, (eff: ReasoningEffort) => eff)
             }.width('100%')
 
@@ -255,13 +274,15 @@ export struct ContextSheet {
               }, (sp: ResponseSpeedMode) => sp)
             }.width('100%')
 
-            Row() {
-              Text('思考 Token 预算: ' + this.budgetVal).fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
-            }.width('100%')
-            Slider({ value: this.budgetVal, min: 1024, max: 32768, step: 1024 })
-              .selectedColor($r('app.color.accent'))
-              .onChange((v: number) => { this.budgetVal = Math.round(v); })
-              .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+            if (this.selectedEffort() !== 'off' && this.reasoningOptions().budgetLimit > 0) {
+              Row() {
+                Text('思考 Token 预算: ' + this.displayedBudget()).fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
+              }.width('100%')
+              Slider({ value: this.displayedBudget(), min: 1024, max: this.reasoningOptions().budgetLimit, step: 1024 })
+                .selectedColor($r('app.color.accent'))
+                .onChange((v: number) => { this.budgetVal = Math.round(v); })
+                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+            }
 
             Row() {
               Text('温度 (Temperature): ' + this.tempVal.toFixed(2)).fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)

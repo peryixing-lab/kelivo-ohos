@@ -30,6 +30,7 @@ export class ChatGenerationJob {
   stopped: boolean = false;
   deleted: boolean = false;
   flushTimer: number = -1;
+  frameStop?: () => void;
 
   constructor(
     chatId: string,
@@ -77,6 +78,11 @@ export class ChatGenerationJob {
     if (this.flushTimer >= 0) {
       clearTimeout(this.flushTimer);
       this.flushTimer = -1;
+    }
+    if (this.frameStop) {
+      const stopFn = this.frameStop;
+      this.frameStop = undefined;
+      stopFn();
     }
   }
 

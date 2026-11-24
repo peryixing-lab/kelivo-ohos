@@ -1,4 +1,5 @@
 import { ConfigurationConstant, common } from '@kit.AbilityKit';
+import { displaySync } from '@kit.ArkGraphics2D';
 import { KeyboardAvoidMode } from '@kit.ArkUI';
 import { pasteboard } from '@kit.BasicServicesKit';
 import { motion } from '@kit.MultimodalAwarenessKit';
@@ -67,6 +68,7 @@ import {
   normalizeWorldBooks,
   resolveActiveModel
 } from '../core/Models';
+import { ReasoningControl, effectiveEffort, reasoningBulbRayCount, reasoningControl, reasoningTokens, withReasoning } from '../core/Reasoning';
 import { ChatCall, ChatCallOptions, ReplyReasoningTimer, RichFragment, makeAdvancedChatCall } from '../core/Protocol';
 import { ChatStream, completeOnce, generateImages, setGlobalHttpProxy } from '../core/ChatClient';
 import { WorkspaceStore, exportChats, forgetKey, importChats, newId, readKey, storeKey } from '../core/Storage';
@@ -122,6 +124,7 @@ import {
   sharePlainText,
   triggerHapticFeedback
 } from '../core/SystemBridge';
+import { StreamTextSmoother } from '../core/StreamSmoother';
 import { MessageBody } from '../components/MessageBody';
 import { PersonaEditor } from '../components/PersonaEditor';
 import { ProviderEditor } from '../components/ProviderEditor';
@@ -145,7 +148,7 @@ import { KelivoAvatarBadge, KelivoNavTitleBar } from '../components/KelivoChrome
 import { BottomToolsSheet } from '../components/BottomToolsSheet';
 import { ChatListSheet } from '../components/ChatListSheet';
 import { ModelSelectSheet } from '../components/ModelSelectSheet';
-import { ChatToolsSheet, ReasoningLevelSheet, SearchQuickSheet } from '../components/ChatQuickSheets';
+import { ChatToolsSheet, ReasoningLevelSheet, SearchQuickSheet, reasoningBulbResource } from '../components/ChatQuickSheets';
 import { OAuthLoginSheet } from '../components/OAuthLoginSheet';
 import { WorkspacePanel } from '../components/WorkspacePanel';
 import { SkillsPanel } from '../components/SkillsPanel';
@@ -330,6 +333,8 @@ struct Index {
   private drafts: Map<string, ComposerDraftData> = new Map<string, ComposerDraftData>();
   private speaker: Narration = new Narration();
   private followBottom: boolean = true;
+  private lastLiveBodyHeight: number = 0;
+  private scrollFollowTimer: number = -1;
   private chatScrollNavHideTimer: number = -1;
   private chatFirstVisibleIdx: number = 0;
   private chatLastVisibleIdx: number = 0;
@@ -413,6 +418,10 @@ struct Index {
   aboutToDisappear(): void {
     this.stopHoldingHandMonitor();
     this.hideChatScrollNavImmediate();
+    if (this.scrollFollowTimer >= 0) {
+      clearTimeout(this.scrollFollowTimer);
+      this.scrollFollowTimer = -1;
+    }
     this.stopAllGenerations(false);
     backgroundGenerationManager.stopAll();
     this.scheduler.stop();
@@ -1013,7 +1022,10 @@ struct Index {
 
   effectiveParams(): GenerationParams {
     const tick = this.modelConfigTick;
-    const params = this.persona().params || this.workspace.generationParams || defaultGenerationParams();
+    const global = this.workspace.generationParams || defaultGenerationParams();
+    const local = this.persona().params;
+    const source = local?.reasoningEffort ? local : global;
+    const params = withReasoning(local || global, source.reasoningEffort, source.reasoningBudget);
     return tick >= 0 ? params : params;
   }
 
@@ -1292,6 +1304,7 @@ struct Index {
     this.multiSelectMode = false;
     this.selectedMsgIds = [];
     this.notice = '';
+    this.lastLiveBodyHeight = 0;
     this.syncActiveGenerationView();
     this.hideChatScrollNavImmediate();
     this.navigateTo('chat');
@@ -1323,6 +1336,10 @@ struct Index {
 
   scrollDown(force: boolean = false): void {
     if (force) {
+      if (this.scrollFollowTimer >= 0) {
+        clearTimeout(this.scrollFollowTimer);
+        this.scrollFollowTimer = -1;
+      }
       this.followBottom = true;
       const jumpToLatest = () => {
         const count = this.activeChat()?.messages.length || 0;
@@ -1338,11 +1355,29 @@ struct Index {
       return;
     }
     if (this.followBottom) {
-      setTimeout(() => {
+      if (this.scrollFollowTimer >= 0) {
+        return;
+      }
+      this.scrollFollowTimer = setTimeout(() => {
+        this.scrollFollowTimer = -1;
         if (this.followBottom) {
           this.scrollView.scrollEdge(Edge.Bottom);
         }
       }, 30);
+    }
+  }
+
+  private onLiveStreamAreaChanged(nextHeight: number): void {
+    if (this.regeneratingMsgId) {
+      return;
+    }
+    if (nextHeight > this.lastLiveBodyHeight + 1) {
+      this.lastLiveBodyHeight = nextHeight;
+      if (this.followBottom && this.working && this.activeRoute === 'chat' && !this.appInBackground) {
+        this.scrollView.scrollEdge(Edge.Bottom);
+      }
+    } else if (nextHeight < this.lastLiveBodyHeight) {
+      this.lastLiveBodyHeight = nextHeight;
     }
   }
 
@@ -1541,39 +1576,39 @@ struct Index {
     return resolveBrandIconId(`${this.activeModelId()} ${this.provider().name}`, this.provider().family);
   }
 
-  private activeModelSupportsReasoning(): boolean {
+  private activeReasoningControl(): ReasoningControl {
     const p = this.provider();
-    const mid = this.activeModelId();
-    if (!mid) return false;
-    return findProviderModelSpec(p, mid).reasoning;
+    const model = this.activeModelId();
+    return reasoningControl(p, model, findProviderModelSpec(p, model));
+  }
+
+  private activeReasoningEffort(): ReasoningEffort {
+    return effectiveEffort(this.activeReasoningControl(), this.effectiveParams().reasoningEffort || 'off');
+  }
+
+  private isActiveReasoningToggleOnly(): boolean {
+    const ctrl = this.activeReasoningControl();
+    return ctrl.levels.length === 2 && ctrl.levels.includes('off');
   }
 
   private reasoningLabelShort(): string {
-    const eff = this.effectiveParams().reasoningEffort || 'off';
+    const eff = this.activeReasoningEffort();
+    if (eff !== 'off' && this.isActiveReasoningToggleOnly()) return '开启';
     if (eff === 'off') return '关闭';
+    if (eff === 'minimal') return '最低';
+    if (eff === 'xhigh') return '极高';
     if (eff === 'low') return '低';
     if (eff === 'high') return '高';
-    if (eff === 'max') return '极高';
+    if (eff === 'max') return '最高';
     return '中';
   }
 
   private updateReasoningConfig(effort: ReasoningEffort, budget?: number): void {
     const cur = this.workspace.generationParams || defaultGenerationParams();
-    this.workspace.generationParams = {
-      temperature: cur.temperature,
-      topP: cur.topP,
-      maxTokens: cur.maxTokens,
-      reasoningEffort: effort,
-      reasoningBudget: budget !== undefined ? budget : (cur.reasoningBudget || 8192),
-      responseSpeed: cur.responseSpeed,
-      contextLimit: cur.contextLimit,
-      autoRetryCount: cur.autoRetryCount,
-      retryBaseMs: cur.retryBaseMs
-    };
+    this.workspace.generationParams = withReasoning(cur, effort, budget);
     const p = this.persona();
-    if (p.params) {
-      p.params.reasoningEffort = effort;
-      if (budget !== undefined) p.params.reasoningBudget = budget;
+    if (p.params?.reasoningEffort) {
+      p.params = withReasoning(p.params, effort, budget);
       this.workspace.personas = this.workspace.personas.slice();
     }
     this.modelConfigTick += 1;
@@ -2476,6 +2511,7 @@ struct Index {
     if (this.expandedReasoning === job.liveMessageId) {
       this.expandedReasoning = '';
     }
+    this.lastLiveBodyHeight = 0;
     this.syncActiveGenerationView();
     this.refreshKeepScreenOn();
     backgroundGenerationManager.beginTask(target.id, target.title, this.host());
@@ -2493,6 +2529,13 @@ struct Index {
     let hasUsage = false;
     let isImageTask = useImageGen;
     const reasoningTimer = new ReplyReasoningTimer();
+    const smoother = new StreamTextSmoother(params.responseSpeed || 'standard', this.reduceMotion);
+    let toolCallsDirty = false;
+    let lastBgNotifyAt = 0;
+    let pacerRunning = false;
+    let pacerSync: displaySync.DisplaySync | undefined = undefined;
+    let pacerTimer: number = -1;
+    let lastFrameTsMs = 0;
 
     const resolveCurrentPhase = (): GenerationPhase => {
       if (isImageTask) return 'image';
@@ -2511,7 +2554,9 @@ struct Index {
       if (!isViewingThisChat()) {
         return;
       }
-      this.liveReasoningMs = job.liveReasoningMs;
+      if (activeChanged || !job.liveThinking) {
+        this.liveReasoningMs = job.liveReasoningMs;
+      }
       if (!activeChanged && this.liveThinking === job.liveThinking) {
         return;
       }
@@ -2530,28 +2575,116 @@ struct Index {
       reasoningTimer.finish(Date.now());
       syncReasoningPhase();
     };
-    const scheduleLiveUpdate = (): void => {
-      if (job.flushTimer >= 0) return;
-      job.flushTimer = setTimeout(() => {
-        job.flushTimer = -1;
-        job.liveText = answer;
-        job.liveReasoning = thoughts;
-        job.liveToolCalls = toolCallsUsed.slice();
-        backgroundGenerationManager.updateTask(
-          target.id,
-          latestChatTitle(),
-          resolveCurrentPhase(),
-          answer.length + thoughts.length
-        );
-        if (isViewingThisChat()) {
-          this.liveText = job.liveText;
-          this.liveReasoning = job.liveReasoning;
-          this.liveToolCalls = job.liveToolCalls.slice();
-          if (this.activeRoute === 'chat' && !this.appInBackground) {
-            this.scrollDown();
-          }
+    const stopFramePacer = (): void => {
+      pacerRunning = false;
+      lastFrameTsMs = 0;
+      if (pacerSync) {
+        try { pacerSync.stop(); } catch (_) {}
+        try { pacerSync.off('frame'); } catch (_) {}
+        pacerSync = undefined;
+      }
+      if (pacerTimer >= 0) {
+        clearInterval(pacerTimer);
+        pacerTimer = -1;
+      }
+    };
+    job.frameStop = stopFramePacer;
+
+    const flushBgProgress = (force: boolean): void => {
+      const now = Date.now();
+      if (!force && now - lastBgNotifyAt < 500) {
+        return;
+      }
+      lastBgNotifyAt = now;
+      backgroundGenerationManager.updateTask(
+        target.id,
+        latestChatTitle(),
+        resolveCurrentPhase(),
+        answer.length + thoughts.length
+      );
+    };
+
+    const applyFrame = (dtMs: number): void => {
+      if (job.stopped || job.deleted) {
+        stopFramePacer();
+        return;
+      }
+      if (!isViewingThisChat() || this.appInBackground) {
+        const snapped = smoother.snapToTarget();
+        job.liveText = snapped.text;
+        job.liveReasoning = snapped.reasoning;
+        if (toolCallsDirty) {
+          job.liveToolCalls = toolCallsUsed.slice();
+          toolCallsDirty = false;
         }
-      }, 80);
+        flushBgProgress(false);
+        stopFramePacer();
+        return;
+      }
+      const res = smoother.step(dtMs);
+      if (res.textChanged) {
+        job.liveText = res.text;
+        this.liveText = res.text;
+      }
+      if (res.reasoningChanged) {
+        job.liveReasoning = res.reasoning;
+        this.liveReasoning = res.reasoning;
+      }
+      if (toolCallsDirty) {
+        job.liveToolCalls = toolCallsUsed.slice();
+        this.liveToolCalls = job.liveToolCalls.slice();
+        toolCallsDirty = false;
+      }
+      flushBgProgress(false);
+      if (!res.hasMore && !toolCallsDirty) {
+        stopFramePacer();
+      }
+    };
+
+    const ensureFramePacer = (): void => {
+      if (pacerRunning || job.stopped || job.deleted) return;
+      pacerRunning = true;
+      lastFrameTsMs = 0;
+      try {
+        const ds = displaySync.create();
+        ds.setExpectedFrameRateRange({ min: 30, max: 60, expected: 60 });
+        ds.on('frame', (info: displaySync.IntervalInfo) => {
+          const nowMs = info.timestamp > 0 ? info.timestamp / 1000000 : Date.now();
+          const dt = lastFrameTsMs > 0 ? Math.max(8, nowMs - lastFrameTsMs) : 16;
+          lastFrameTsMs = nowMs;
+          applyFrame(dt);
+        });
+        ds.start();
+        pacerSync = ds;
+      } catch (_) {
+        pacerSync = undefined;
+        lastFrameTsMs = Date.now();
+        pacerTimer = setInterval(() => {
+          const nowMs = Date.now();
+          const dt = lastFrameTsMs > 0 ? Math.max(8, nowMs - lastFrameTsMs) : 16;
+          lastFrameTsMs = nowMs;
+          applyFrame(dt);
+        }, 16);
+      }
+    };
+
+    const scheduleLiveUpdate = (): void => {
+      smoother.setTarget(answer, thoughts);
+      if (!isViewingThisChat() || this.appInBackground) {
+        const snapped = smoother.snapToTarget();
+        job.liveText = snapped.text;
+        job.liveReasoning = snapped.reasoning;
+        if (toolCallsDirty) {
+          job.liveToolCalls = toolCallsUsed.slice();
+          toolCallsDirty = false;
+        }
+        flushBgProgress(false);
+        stopFramePacer();
+        return;
+      }
+      if (smoother.hasPending() || toolCallsDirty) {
+        ensureFramePacer();
+      }
     };
     let completed = false;
     const startTs = Date.now();
@@ -2755,7 +2888,11 @@ struct Index {
             onUpdate: (lText: string, lReason: string, recs: ToolCallRecord[]) => {
               answer = lText;
               thoughts = lReason;
+              const prevCount = toolCallsUsed.length;
               toolCallsUsed = recs;
+              if (recs.length > 0 || prevCount > 0) {
+                toolCallsDirty = true;
+              }
               if (recs.some((r: ToolCallRecord): boolean => r.status === 'pending')) {
                 job.liveToolCalls = recs.slice();
                 if (isViewingThisChat()) {
@@ -3558,6 +3695,7 @@ struct Index {
           codeFontSize: this.codeTextSize(),
           enableMarkdown: this.appearanceCfg().enableAssistantMarkdown !== false,
           enableMathLatex: this.appearanceCfg().enableMathLatex !== false,
+          streaming: true,
           onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
           onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
           onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
@@ -3575,7 +3713,12 @@ struct Index {
           }.padding({ top: 6, bottom: 6 })
         }
       }
-    }.width('100%').alignItems(HorizontalAlign.Start)
+    }
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .onAreaChange((_oldArea: Area, newArea: Area) => {
+      this.onLiveStreamAreaChanged(Number(newArea.height) || 0);
+    })
   }
 
   @Builder
@@ -4688,58 +4831,63 @@ struct Index {
       .onChange((v: string) => { this.draft = v; })
 
     Row({ space: 4 }) {
-      Button({ type: ButtonType.Circle }) {
+      Button({ type: ButtonType.Normal, buttonStyle: ButtonStyleMode.TEXTUAL }) {
         KelivoAvatarBadge({
           brandId: this.activeBrandId(),
           avatarText: '',
           fallbackLetter: this.provider().name,
-          badgeSize: 22
+          badgeSize: 20,
+          plain: true
         })
       }
       .id('currentModel')
       .width(36)
       .height(36)
       .padding(0)
+      .borderRadius(10)
       .accessibilityText('选择模型')
       .enabled(!this.working && !this.picking)
-      .backgroundColor(this.composerPillBg())
+      .backgroundColor(Color.Transparent)
       .onClick(() => { this.showModelQuickSheet = true; })
 
-      Button({ type: ButtonType.Circle }) {
+      Button({ type: ButtonType.Normal, buttonStyle: ButtonStyleMode.TEXTUAL }) {
         SymbolGlyph($r('sys.symbol.globe_badge_message'))
-          .fontSize(17)
+          .fontSize(19)
           .fontColor([this.searchOn ? $r('app.color.accent') : this.composerInactiveIconColor()])
       }
       .id('webSearch')
       .width(36)
       .height(36)
       .padding(0)
+      .borderRadius(10)
       .accessibilityText(this.searchOn ? '联网搜索已开启' : '联网搜索')
       .enabled(!this.working && !this.picking)
-      .backgroundColor(this.searchOn ? $r('app.color.tint') : Color.Transparent)
+      .backgroundColor(Color.Transparent)
       .onClick(() => { this.showSearchQuickSheet = true; })
 
-      if (this.activeModelSupportsReasoning() || (this.effectiveParams().reasoningEffort || 'off') !== 'off') {
-        Button({ type: this.chatDisplayCfg().showReasoningLevelOnButton ? ButtonType.Normal : ButtonType.Circle }) {
+      if (this.activeReasoningControl().levels.length > 1) {
+        Button({ type: ButtonType.Normal, buttonStyle: ButtonStyleMode.TEXTUAL }) {
           Row({ space: 4 }) {
-            SymbolGlyph($r('sys.symbol.lightbulb'))
-              .fontSize(this.chatDisplayCfg().showReasoningLevelOnButton ? 15 : 17)
-              .fontColor([(this.effectiveParams().reasoningEffort || 'off') !== 'off' ? $r('app.color.accent') : this.composerInactiveIconColor()])
+            Image(reasoningBulbResource(reasoningBulbRayCount(this.activeReasoningControl(), this.activeReasoningEffort())))
+              .width(this.chatDisplayCfg().showReasoningLevelOnButton ? 18 : 20)
+              .height(this.chatDisplayCfg().showReasoningLevelOnButton ? 18 : 20)
+              .objectFit(ImageFit.Contain)
+              .fillColor(this.activeReasoningEffort() !== 'off' ? $r('app.color.accent') : this.composerInactiveIconColor())
             if (this.chatDisplayCfg().showReasoningLevelOnButton) {
               Text(this.reasoningLabelShort())
                 .fontSize(11)
-                .fontColor((this.effectiveParams().reasoningEffort || 'off') !== 'off' ? $r('app.color.accent') : this.composerInactiveIconColor())
+                .fontColor(this.activeReasoningEffort() !== 'off' ? $r('app.color.accent') : this.composerInactiveIconColor())
             }
           }
         }
         .id('reasoningToggle')
         .height(36)
         .constraintSize({ minWidth: 36 })
-        .padding(this.chatDisplayCfg().showReasoningLevelOnButton ? { left: 9, right: 9 } : 0)
-        .borderRadius(18)
+        .padding(this.chatDisplayCfg().showReasoningLevelOnButton ? { left: 6, right: 6 } : 0)
+        .borderRadius(10)
         .accessibilityText(`思考深度: ${this.reasoningLabelShort()}`)
         .enabled(!this.working && !this.picking)
-        .backgroundColor((this.effectiveParams().reasoningEffort || 'off') !== 'off' ? $r('app.color.tint') : Color.Transparent)
+        .backgroundColor(Color.Transparent)
         .onClick(() => { this.showReasoningSheet = true; })
       }
 
@@ -5440,14 +5588,15 @@ struct Index {
   reasoningQuickOverlay() {
     Column() {
       ReasoningLevelSheet({
-        currentEffort: this.effectiveParams().reasoningEffort || 'off',
-        budgetTokens: this.effectiveParams().reasoningBudget || 8192,
+        control: this.activeReasoningControl(),
+        currentEffort: this.activeReasoningEffort(),
+        budgetTokens: reasoningTokens(this.activeReasoningControl(), this.activeReasoningEffort(), this.effectiveParams().reasoningBudget),
         immersiveLightEnabled: this.immersiveLightOn(),
         onSelectEffort: (effort: ReasoningEffort) => {
           this.updateReasoningConfig(effort);
         },
         onChangeBudget: (tokens: number) => {
-          this.updateReasoningConfig(this.effectiveParams().reasoningEffort || 'off', tokens);
+          this.updateReasoningConfig(this.activeReasoningEffort(), tokens);
         }
       })
     }
@@ -5803,12 +5952,19 @@ struct Index {
       ContextSheet({
         chat: this.activeChat(),
         providers: this.workspace.providers,
-        activeProviderId: this.workspace.activeProvider,
+        activeProviderId: this.provider().id,
+        activeModelId: this.activeModelId(),
         systemPrompt: this.persona().prompt,
         params: this.effectiveParams(),
         sysSettings: this.workspace.systemSettings || defaultSystemSettings(),
         onSaveParams: (p: GenerationParams, autoCompact: boolean, threshold: number, template: string) => {
           this.workspace.generationParams = p;
+          const persona = this.persona();
+          if (persona.params?.reasoningEffort) {
+            persona.params.reasoningEffort = p.reasoningEffort;
+            persona.params.reasoningBudget = p.reasoningBudget;
+          }
+          this.modelConfigTick += 1;
           const sys = this.workspace.systemSettings || defaultSystemSettings();
           sys.autoCompactEnabled = autoCompact;
           sys.autoCompactThreshold = threshold;

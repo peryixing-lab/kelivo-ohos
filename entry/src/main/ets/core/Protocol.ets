@@ -15,6 +15,7 @@ import {
   isLocalOrCustomHost,
   messageText
 } from './Models';
+import { applyReasoning, reasoningControl, usesResponsesApi } from './Reasoning';
 
 interface WireMessage {
   role: string;
@@ -375,7 +376,13 @@ function mergeCustomBody(target: Record<string, Object>, rawJson?: string): void
     const extra = JSON.parse(rawJson) as Record<string, Object>;
     if (extra && typeof extra === 'object') {
       Object.keys(extra).forEach((k: string) => {
-        target[k] = extra[k];
+        if (k === 'generationConfig' && target[k] && extra[k] && typeof extra[k] === 'object' && !Array.isArray(extra[k])) {
+          const config = target[k] as Record<string, Object>;
+          const additions = extra[k] as Record<string, Object>;
+          Object.keys(additions).forEach((field: string) => { config[field] = additions[field]; });
+        } else {
+          target[k] = extra[k];
+        }
       });
     }
   } catch (_) {}
@@ -485,118 +492,6 @@ function pushAnthropicMessage(list: WireMessage[], role: string, content: string
   list.push({ role, content });
 }
 
-export function canDisableModelThinking(modelName: string): boolean {
-  return !/(deepseek-r1|deepseek-reasoner|\bqwq\b|qwen3[^\s]*thinking|\bo1\b|\bo3\b|\bo4\b|gemini-2\.5-pro)/i.test(modelName);
-}
-
-export function applyOpenAIChatReasoning(
-  body: Record<string, Object>,
-  provider: Provider,
-  modelName: string,
-  spec: ModelSpec,
-  params?: GenerationParams
-): void {
-  if (!spec.reasoning || !params || !params.reasoningEffort) return;
-  const effort = params.reasoningEffort;
-  const isOff = effort === 'off';
-  const canDisable = canDisableModelThinking(modelName);
-  const host = (provider.baseUrl || '').toLowerCase();
-  const lower = modelName.toLowerCase();
-
-  if (host.includes('openrouter.ai')) {
-    if (isOff && canDisable) {
-      const r: Record<string, Object> = {};
-      r['enabled'] = false;
-      body['reasoning'] = r;
-    } else if (!isOff) {
-      const r: Record<string, Object> = {};
-      r['effort'] = effort === 'max' ? 'high' : effort;
-      body['reasoning'] = r;
-    }
-    return;
-  }
-
-  if (host.includes('siliconflow')) {
-    if (isOff && canDisable) {
-      body['enable_thinking'] = false;
-    } else if (!isOff) {
-      body['enable_thinking'] = true;
-      if (params.reasoningBudget && params.reasoningBudget > 0) {
-        body['thinking_budget'] = params.reasoningBudget;
-      }
-    }
-    return;
-  }
-
-  if (host.includes('dashscope') || /(qwen3|qwq)/i.test(lower)) {
-    if (!canDisable) {
-      if (!isOff && params.reasoningBudget && params.reasoningBudget > 0) {
-        body['thinking_budget'] = params.reasoningBudget;
-      }
-    } else if (isOff) {
-      body['enable_thinking'] = false;
-    } else {
-      body['enable_thinking'] = true;
-      if (params.reasoningBudget && params.reasoningBudget > 0) {
-        body['thinking_budget'] = params.reasoningBudget;
-      }
-    }
-    return;
-  }
-
-  if (
-    /(deepseek|glm-4\.[5-9]|glm-5|glm-z1|doubao.*thinking|seed-1)/i.test(lower) ||
-    host.includes('deepseek.com') ||
-    host.includes('bigmodel.cn') ||
-    host.includes('volces.com')
-  ) {
-    if (isOff) {
-      if (canDisable) {
-        const t: Record<string, Object> = {};
-        t['type'] = 'disabled';
-        body['thinking'] = t;
-      }
-    } else {
-      const t: Record<string, Object> = {};
-      t['type'] = 'enabled';
-      body['thinking'] = t;
-      if (lower.includes('deepseek')) {
-        body['reasoning_effort'] = effort === 'medium' ? 'low' : effort;
-      }
-    }
-    return;
-  }
-
-  if (/(kimi-k2|moonshot)/i.test(lower) || host.includes('moonshot')) {
-    if (isOff && canDisable) {
-      const t: Record<string, Object> = {};
-      t['type'] = 'disabled';
-      body['thinking'] = t;
-    } else if (!isOff) {
-      const t: Record<string, Object> = {};
-      t['type'] = 'enabled';
-      t['effort'] = effort === 'max' ? 'high' : effort;
-      body['thinking'] = t;
-    }
-    return;
-  }
-
-  if (/(internlm|intern-s1)/i.test(lower)) {
-    body['thinking_mode'] = !isOff;
-    return;
-  }
-
-  if (/(o1|o3|o4|gpt-5|gpt-6|gpt-oss|grok-3-mini)/i.test(lower)) {
-    if (isOff) {
-      if (canDisable) {
-        body['reasoning_effort'] = 'none';
-      }
-    } else {
-      body['reasoning_effort'] = effort === 'max' ? 'high' : effort;
-    }
-  }
-}
-
 export function makeAdvancedChatCall(
   provider: Provider,
   key: string,
@@ -613,7 +508,7 @@ export function makeAdvancedChatCall(
   const params = opts.params;
   const spec = opts.modelSpec || findProviderModelSpec(provider, modelName);
   const useStream = opts.stream !== false;
-  const wantReason = Boolean(params?.reasoningEffort && params.reasoningEffort !== 'off');
+  const control = reasoningControl(provider, modelName, spec);
 
   const tools = opts.tools || [];
   const toolTurns = opts.toolTurns || [];
@@ -665,20 +560,8 @@ export function makeAdvancedChatCall(
     if (params?.temperature !== undefined) genCfg['temperature'] = params.temperature;
     if (params?.topP !== undefined) genCfg['topP'] = params.topP;
     if (params?.maxTokens !== undefined && params.maxTokens > 0) genCfg['maxOutputTokens'] = params.maxTokens;
-    if (wantReason && spec.reasoning) {
-      const thinkCfg: Record<string, Object> = {};
-      const budget = params!.reasoningBudget && params!.reasoningBudget > 0 ? params!.reasoningBudget :
-        (params!.reasoningEffort === 'low' ? 1024 : params!.reasoningEffort === 'high' ? 16384 : params!.reasoningEffort === 'max' ? 24576 : 4096);
-      thinkCfg['thinkingBudget'] = budget;
-      thinkCfg['includeThoughts'] = true;
-      genCfg['thinkingConfig'] = thinkCfg;
-    } else if (spec.reasoning && params?.reasoningEffort === 'off' && canDisableModelThinking(modelName)) {
-      const thinkCfg: Record<string, Object> = {};
-      thinkCfg['thinkingBudget'] = 0;
-      thinkCfg['includeThoughts'] = false;
-      genCfg['thinkingConfig'] = thinkCfg;
-    }
     if (Object.keys(genCfg).length > 0) body['generationConfig'] = genCfg;
+    applyReasoning(body, provider, modelName, control, params);
 
     const gTools: Array<Record<string, Object>> = [];
     if (tools.length > 0) {
@@ -727,10 +610,7 @@ export function makeAdvancedChatCall(
     };
   }
 
-  const chatPath = (provider.chatPath || '').trim().replace(/^\/+|\/+$/g, '');
-  const forcesChatCompletionsPath = /^(?:v1\/)?chat\/completions$/i.test(chatPath);
-  // Any provider pointing explicitly to /chat/completions must use Chat Completions wire format.
-  if (provider.family === 'openai-responses' && !forcesChatCompletionsPath) {
+  if (usesResponsesApi(provider)) {
     const inputItems: Array<Record<string, Object>> = [];
     for (let i = 0; i < presets.length; i++) {
       if (!presets[i].content.trim()) continue;
@@ -814,15 +694,7 @@ export function makeAdvancedChatCall(
     if (params?.maxTokens !== undefined && params.maxTokens > 0 && !host.includes('chatgpt.com')) {
       body['max_output_tokens'] = params.maxTokens;
     }
-    if (wantReason && spec.reasoning && params) {
-      const reas: Record<string, Object> = {};
-      reas['effort'] = params.reasoningEffort === 'max' ? 'high' : (params.reasoningEffort || 'medium');
-      body['reasoning'] = reas;
-    } else if (spec.reasoning && params?.reasoningEffort === 'off' && canDisableModelThinking(modelName)) {
-      const reas: Record<string, Object> = {};
-      reas['effort'] = 'none';
-      body['reasoning'] = reas;
-    }
+    applyReasoning(body, provider, modelName, control, params);
     if (provider.sendConversationCacheKey && opts.conversationId) {
       body['prompt_cache_key'] = opts.conversationId;
     }
@@ -899,16 +771,9 @@ export function makeAdvancedChatCall(
         body['system'] = prompt;
       }
     }
-    const enableThinking = wantReason && spec.reasoning;
-    if (enableThinking && params) {
-      const budget = params.reasoningBudget && params.reasoningBudget > 1024 ? params.reasoningBudget :
-        (params.reasoningEffort === 'low' ? 2048 : params.reasoningEffort === 'high' ? 12000 : params.reasoningEffort === 'max' ? 20000 : 4096);
-      const thinkObj: Record<string, Object> = {};
-      thinkObj['type'] = 'enabled';
-      thinkObj['budget_tokens'] = budget;
-      body['thinking'] = thinkObj;
-      if ((body['max_tokens'] as number) <= budget) body['max_tokens'] = budget + 4096;
-    } else {
+    applyReasoning(body, provider, modelName, control, params);
+    if ((!spec.reasoning || !params?.reasoningEffort || params.reasoningEffort === 'off') &&
+      control.dialect !== 'adaptive') {
       if (params?.temperature !== undefined) {
         body['temperature'] = params.temperature;
       } else if (params?.topP !== undefined) {
@@ -985,10 +850,15 @@ export function makeAdvancedChatCall(
     streamOpts['include_usage'] = true;
     body['stream_options'] = streamOpts;
   }
-  if (params?.temperature !== undefined) body['temperature'] = params.temperature;
-  if (params?.topP !== undefined) body['top_p'] = params.topP;
-  if (params?.maxTokens !== undefined && params.maxTokens > 0) body['max_tokens'] = params.maxTokens;
-  applyOpenAIChatReasoning(body, provider, modelName, spec, params);
+  const openAIReasoner = spec.reasoning && /(?:gpt-[56]|\bo[134]\b)/i.test(modelName);
+  if (!openAIReasoner || (params?.reasoningEffort === 'off' && control.levels.includes('off'))) {
+    if (params?.temperature !== undefined) body['temperature'] = params.temperature;
+    if (params?.topP !== undefined) body['top_p'] = params.topP;
+  }
+  if (params?.maxTokens !== undefined && params.maxTokens > 0) {
+    body[openAIReasoner ? 'max_completion_tokens' : 'max_tokens'] = params.maxTokens;
+  }
+  applyReasoning(body, provider, modelName, control, params);
   if (provider.sendConversationCacheKey && opts.conversationId) {
     body['prompt_cache_key'] = opts.conversationId;
   }

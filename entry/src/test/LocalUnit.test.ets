@@ -9,6 +9,8 @@ import {
   MemoryEntry,
   MemorySettings,
   Persona,
+  Provider,
+  ReasoningEffort,
   QuickPhrase,
   RegexRule,
   ScheduledTask,
@@ -29,6 +31,7 @@ import {
   preset,
   resolveActiveModel
 } from '../main/ets/core/Models';
+import { reasoningBulbRayCount, reasoningControl, withReasoning } from '../main/ets/core/Reasoning';
 import {
   activateWorldBooks,
   applyRegexRules,
@@ -88,7 +91,14 @@ import {
 import { decodeArchive, encodeArchive } from '../main/ets/core/ChatArchive';
 import { fromProviderLink, fromProviderText, toProviderLink } from '../main/ets/core/ProviderLink';
 import { markKeyError, markKeySuccess, selectApiKey } from '../main/ets/core/KeyPool';
-import { highlightCode, parseMarkdownBlocks, parseMdInlines } from '../main/ets/core/MarkdownParser';
+import {
+  findStableMarkdownPrefixEnd,
+  highlightCode,
+  parseMarkdownBlocks,
+  parseMdInlines,
+  splitInlineTail
+} from '../main/ets/core/MarkdownParser';
+import { StreamTextSmoother } from '../main/ets/core/StreamSmoother';
 import { evalGenUiExpr, interpolateGenUi, parseGenUiDocument } from '../main/ets/core/GenUiParser';
 import {
   appendMessageVersion,
@@ -411,12 +421,12 @@ export default function localUnitTest() {
     it('AgentToolLoopMultiStepMock', 0, async () => {
       let round = 0;
       const out = await runAgentToolLoop({
-        provider: preset('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', 'gpt-4o-mini'),
+        provider: preset('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', 'gpt-5.4'),
         apiKey: 'k',
-        modelId: 'gpt-4o-mini',
+        modelId: 'gpt-5.4',
         systemPrompt: '',
         history: [{ id: 'u1', role: 'user', text: '查一下', model: '' }],
-        genParams: defaultGenerationParams(),
+        genParams: withReasoning(defaultGenerationParams(), 'xhigh'),
         tools: [{
           declaration: { name: 'web_search', description: 'search', parametersJson: '{"type":"object"}' },
           source: 'builtin',
@@ -424,7 +434,8 @@ export default function localUnitTest() {
         }],
         permissionMode: 'ask',
         maxSteps: 4,
-        runStream: async (_call: ChatCall, onFrag: (f: RichFragment) => void): Promise<void> => {
+        runStream: async (call: ChatCall, onFrag: (f: RichFragment) => void): Promise<void> => {
+          expect(call.body).assertContain('"reasoning_effort":"xhigh"');
           round++;
           if (round === 1) {
             onFrag({
@@ -1284,7 +1295,7 @@ export default function localUnitTest() {
       expect(dsCall.body.includes('"reasoning":{')).assertFalse();
 
       // 2. Anthropic must not send both temperature and top_p, and merges consecutive same-role turns
-      const cl = preset('cl2', 'Claude', 'anthropic', 'https://api.anthropic.com/v1', 'claude-haiku-5-5');
+      const cl = preset('cl2', 'Claude', 'anthropic', 'https://api.anthropic.com/v1', 'claude-haiku-4-5');
       const u1: ChatMessage = { id: 'u1', role: 'user', text: 'first', model: '' };
       const u2: ChatMessage = { id: 'u2', role: 'user', text: 'second', model: '' };
       const clCall = makeAdvancedChatCall(cl, 'sk-cl', 'sys', [u1, u2], {
@@ -1600,12 +1611,77 @@ export default function localUnitTest() {
         modelId: 'claude-haiku-5-5',
         params: { reasoningEffort: 'medium' }
       });
-      expect(claudeCall.body).assertContain('"max_tokens":8192');
+      expect(claudeCall.body).assertContain('"max_tokens":4096');
+      expect(claudeCall.body).assertContain('"output_config":{"effort":"medium"}');
 
       const xmlBlock = buildExistingMemoryXmlBlock(pool, { autoExtract: true, injectGlobal: true, maxInjectCount: 10 }, undefined, 'zh');
       expect(xmlBlock).assertContain('<user_memory type="identity">');
       const recallRules = buildMemoryRulesSystemPrompt({ autoExtract: true, injectGlobal: true, maxInjectCount: 10, promptLanguage: 'zh' }, 'zh-Hans', true);
       expect(recallRules).assertContain('chat_search');
+    });
+
+    it('ReasoningPresetsReplaceCustomBudgetInOutgoingRequests', 0, () => {
+      const legacy = withReasoning(defaultGenerationParams(), 'medium', 8192);
+      const options = (p: Provider, effort: ReasoningEffort, budget?: number): string => {
+        return makeAdvancedChatCall(p, 'test', '', [user], {
+          params: withReasoning(legacy, effort, budget)
+        }).body;
+      };
+      const claude = preset('cl', 'Claude', 'anthropic', 'https://api.anthropic.com/v1', 'claude-sonnet-4');
+      expect(options(claude, 'low')).assertContain('"budget_tokens":1024');
+      expect(options(claude, 'medium')).assertContain('"budget_tokens":4096');
+      expect(options(claude, 'high')).assertContain('"budget_tokens":8192');
+      expect(options(claude, 'high', 6144)).assertContain('"budget_tokens":6144');
+      expect(options(claude, 'off')).assertContain('"thinking":{"type":"disabled"}');
+      const gem = preset('gem', 'Gemini', 'gemini', 'https://model.test', 'gemini-2.5-flash');
+      expect(options(gem, 'low')).assertContain('"thinkingBudget":1024');
+      expect(options(gem, 'max', 32768)).assertContain('"thinkingBudget":24576');
+      gem.customBodyJson = '{"generationConfig":{"responseMimeType":"application/json"}}';
+      expect(options(gem, 'high')).assertContain('"thinkingBudget":8192');
+      const qwen = preset('qw', 'Qwen', 'openai', 'https://dashscope.aliyuncs.com/v1', 'qwen3-32b');
+      expect(options(qwen, 'low')).assertContain('"thinking_budget":1024');
+      expect(options(qwen, 'high')).assertContain('"thinking_budget":8192');
+      expect(options(qwen, 'off').includes('"thinking_budget"')).assertFalse();
+    });
+
+    it('ModelReasoningControlsMatchWireProtocol', 0, () => {
+      const request = (p: Provider, effort: ReasoningEffort): string => makeAdvancedChatCall(p, 'test', '', [user], {
+        params: withReasoning(defaultGenerationParams(), effort, 8192), stream: false
+      }).body;
+      const gpt = preset('oa', 'OpenAI', 'openai', 'https://api.openai.com/v1', 'gpt-5.4');
+      const chat = request(gpt, 'max');
+      expect(chat).assertContain('"reasoning_effort":"xhigh"');
+      expect(chat).assertContain('"max_completion_tokens":4096');
+      expect(chat.includes('"temperature"')).assertFalse();
+      gpt.family = 'openai-responses';
+      expect(request(gpt, 'max')).assertContain('"reasoning":{"effort":"xhigh"}');
+      expect(request(gpt, 'off')).assertContain('"reasoning":{"effort":"none"}');
+      const cl = preset('cl', 'Claude', 'anthropic', 'https://api.anthropic.com/v1', 'claude-sonnet-4-6');
+      expect(request(cl, 'max')).assertContain('"output_config":{"effort":"max"}');
+      expect(request(cl, 'low')).assertContain('"thinking":{"type":"adaptive"}');
+      expect(request(cl, 'high').includes('budget_tokens')).assertFalse();
+      const gem = preset('g', 'Gemini', 'vertex', 'https://model.test', 'gemini-3-flash-preview');
+      expect(request(gem, 'low')).assertContain('"thinkingLevel":"LOW"');
+      expect(request(gem, 'high')).assertContain('"thinkingLevel":"HIGH"');
+      expect(request(gem, 'off')).assertContain('"thinkingLevel":"MINIMAL"');
+      expect(request(gem, 'max').includes('thinkingBudget')).assertFalse();
+      const ds = preset('ds', 'DeepSeek', 'openai-responses', 'https://api.deepseek.com/v1', 'deepseek-v4-pro');
+      expect(request(ds, 'max')).assertContain('"reasoning":{"effort":"max"}');
+      ds.family = 'anthropic';
+      expect(request(ds, 'max')).assertContain('"output_config":{"effort":"max"}');
+      const glm = preset('z', 'GLM', 'openai', 'https://model.test', 'glm-4.7');
+      const control = reasoningControl(glm, glm.model, defaultModelSpec(glm.model));
+      expect(control.levels.join(',')).assertEqual('off,high');
+      expect(control.budgetLimit).assertEqual(0);
+      expect(request(glm, 'low')).assertContain('"thinking":{"type":"enabled"}');
+      expect(request(glm, 'low').includes('reasoning_effort')).assertFalse();
+      const ollama = preset('ollama', 'Ollama', 'openai', 'http://localhost:11434/v1', 'qwen3:8b');
+      expect(request(ollama, 'off')).assertContain('"reasoning_effort":"none"');
+      expect(request(ollama, 'high')).assertContain('"reasoning_effort":"high"');
+      const alias = preset('alias', 'Custom', 'openai', 'https://model.test', 'private-model');
+      expect(request(alias, 'high').includes('reasoning_effort')).assertFalse();
+      alias.models![0].reasoning = true;
+      expect(request(alias, 'high')).assertContain('"reasoning_effort":"high"');
     });
 
     it('ReasoningDialectsAndMemorySpeedOptimization', 0, () => {
@@ -1633,7 +1709,7 @@ export default function localUnitTest() {
         params: { reasoningEffort: 'medium' }
       });
       expect(dsMedium.body).assertContain('"thinking":{"type":"enabled"}');
-      expect(dsMedium.body).assertContain('"reasoning_effort":"low"');
+      expect(dsMedium.body).assertContain('"reasoning_effort":"high"');
 
       const r1Off = makeAdvancedChatCall(dsProv, 'k-oc', '', [msg], {
         modelId: 'deepseek-r1',
@@ -1678,7 +1754,7 @@ export default function localUnitTest() {
         modelId: 'gpt-5',
         params: { reasoningEffort: 'off' }
       });
-      expect(respOff.body).assertContain('"reasoning":{"effort":"none"}');
+      expect(respOff.body).assertContain('"reasoning":{"effort":"minimal"}');
 
       // 4. Compact batch caps: <=10 msgs / 6000 chars initial auto, <=4 msgs / 4000 chars manual fallback
       const manyMsgs: ChatMessage[] = [];
@@ -2012,6 +2088,211 @@ export default function localUnitTest() {
 
       // Clear module-level global proxy state
       setGlobalHttpProxy(undefined, '');
+    });
+
+    it('reasoning_bulb_ray_count_scales_by_supported_levels', 0, () => {
+      const toggleCtrl = reasoningControl(
+        preset('zhipu', 'Zhipu', 'openai', 'https://open.bigmodel.cn/api/paas/v4', 'glm-4.5'),
+        'glm-4.5',
+        defaultModelSpec('glm-4.5')
+      );
+      expect(reasoningBulbRayCount(toggleCtrl, 'off')).assertEqual(0);
+      expect(reasoningBulbRayCount(toggleCtrl, 'high')).assertEqual(3);
+
+      const standardCtrl = reasoningControl(
+        preset('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', 'gpt-4o'),
+        'custom-reasoner',
+        {
+          id: 'custom-reasoner',
+          displayName: 'custom-reasoner',
+          vision: false,
+          tools: true,
+          reasoning: true,
+          imageGen: false,
+          contextWindow: 128000,
+          maxOutputTokens: 8192,
+          enabled: true
+        }
+      );
+      expect(reasoningBulbRayCount(standardCtrl, 'off')).assertEqual(0);
+      expect(reasoningBulbRayCount(standardCtrl, 'low')).assertEqual(1);
+      expect(reasoningBulbRayCount(standardCtrl, 'medium')).assertEqual(2);
+      expect(reasoningBulbRayCount(standardCtrl, 'high')).assertEqual(3);
+
+      const extendedCtrl = reasoningControl(
+        preset('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', 'gpt-5.2'),
+        'gpt-5.2',
+        defaultModelSpec('gpt-5.2')
+      );
+      expect(reasoningBulbRayCount(extendedCtrl, 'off')).assertEqual(0);
+      expect(reasoningBulbRayCount(extendedCtrl, 'low')).assertEqual(1);
+      expect(reasoningBulbRayCount(extendedCtrl, 'medium')).assertEqual(2);
+      expect(reasoningBulbRayCount(extendedCtrl, 'high')).assertEqual(3);
+      expect(reasoningBulbRayCount(extendedCtrl, 'xhigh')).assertEqual(4);
+
+      const sixLevelCtrl = reasoningControl(
+        preset('anthropic', 'Anthropic', 'anthropic', 'https://api.anthropic.com/v1', 'claude-opus-5'),
+        'claude-opus-5',
+        defaultModelSpec('claude-opus-5')
+      );
+      expect(reasoningBulbRayCount(sixLevelCtrl, 'off')).assertEqual(0);
+      expect(reasoningBulbRayCount(sixLevelCtrl, 'low')).assertEqual(1);
+      expect(reasoningBulbRayCount(sixLevelCtrl, 'medium')).assertEqual(2);
+      expect(reasoningBulbRayCount(sixLevelCtrl, 'high')).assertEqual(3);
+      expect(reasoningBulbRayCount(sixLevelCtrl, 'xhigh')).assertEqual(4);
+      expect(reasoningBulbRayCount(sixLevelCtrl, 'max')).assertEqual(5);
+
+      const gpt56Ctrl = reasoningControl(
+        preset('openai', 'OpenAI', 'openai', 'https://api.openai.com/v1', 'gpt-5.6'),
+        'gpt-5.6',
+        defaultModelSpec('gpt-5.6')
+      );
+      expect(reasoningBulbRayCount(gpt56Ctrl, 'off')).assertEqual(0);
+      expect(reasoningBulbRayCount(gpt56Ctrl, 'low')).assertEqual(1);
+      expect(reasoningBulbRayCount(gpt56Ctrl, 'medium')).assertEqual(2);
+      expect(reasoningBulbRayCount(gpt56Ctrl, 'high')).assertEqual(3);
+      expect(reasoningBulbRayCount(gpt56Ctrl, 'xhigh')).assertEqual(4);
+      expect(reasoningBulbRayCount(gpt56Ctrl, 'max')).assertEqual(5);
+
+      const geminiFlashCtrl = reasoningControl(
+        preset('gemini', 'Gemini', 'gemini', 'https://generativelanguage.googleapis.com/v1beta', 'gemini-3-flash'),
+        'gemini-3-flash',
+        defaultModelSpec('gemini-3-flash')
+      );
+      expect(reasoningBulbRayCount(geminiFlashCtrl, 'minimal')).assertEqual(1);
+      expect(reasoningBulbRayCount(geminiFlashCtrl, 'low')).assertEqual(2);
+      expect(reasoningBulbRayCount(geminiFlashCtrl, 'medium')).assertEqual(3);
+      expect(reasoningBulbRayCount(geminiFlashCtrl, 'high')).assertEqual(4);
+    });
+
+    it('stream_text_smoother_adaptive_pacing_and_safe_cut', 0, () => {
+      // Standard mode paces smoothly and wakes up with >= 1 char immediately
+      const std = new StreamTextSmoother('standard', false);
+      std.setTarget('Hello streaming world!', '');
+      const f1 = std.step(16);
+      expect(f1.textChanged).assertTrue();
+      expect(f1.text.length >= 1 && f1.text.length < 'Hello streaming world!'.length).assertTrue();
+      expect(f1.hasMore).assertTrue();
+
+      let guard = 0;
+      let prevLen = f1.text.length;
+      while (std.hasPending() && guard < 120) {
+        const next = std.step(16);
+        expect(next.text.length >= prevLen).assertTrue();
+        prevLen = next.text.length;
+        guard += 1;
+      }
+      expect(std.hasPending()).assertFalse();
+      expect(prevLen).assertEqual('Hello streaming world!'.length);
+
+      // Large burst adapts pace faster than minimum rate
+      const burstText = 'A'.repeat(400);
+      const fast = new StreamTextSmoother('fast', false);
+      const slowBurst = new StreamTextSmoother('standard', false);
+      fast.setTarget(burstText, '');
+      slowBurst.setTarget(burstText, '');
+      const fastStep = fast.step(16);
+      const slowStep = slowBurst.step(16);
+      expect(fastStep.text.length > slowStep.text.length).assertTrue();
+      expect(slowStep.text.length > 20).assertTrue();
+
+      // UTF-16 surrogate pair safety: never leave trailing high surrogate
+      const emojiSample = 'A😀B😀C😀D😀E😀F😀G';
+      const emojiSmoother = new StreamTextSmoother('standard', false);
+      emojiSmoother.setTarget(emojiSample, '');
+      while (emojiSmoother.hasPending()) {
+        const st = emojiSmoother.step(16);
+        if (st.text.length > 0) {
+          const tailCode = st.text.charCodeAt(st.text.length - 1);
+          expect(tailCode >= 0xD800 && tailCode <= 0xDBFF).assertFalse();
+        }
+      }
+
+      // Markdown double-marker pair safety: avoid stopping mid-marker '**'
+      const mdPairSmoother = new StreamTextSmoother('standard', false);
+      mdPairSmoother.setTarget('**bold**', '');
+      const mdFirst = mdPairSmoother.step(16);
+      expect(mdFirst.text === '*').assertFalse();
+
+      // Ultrafast and reduceMotion snap immediately
+      const ultra = new StreamTextSmoother('ultrafast', false);
+      ultra.setTarget('Instant output', 'Instant thoughts');
+      const ultraRes = ultra.step(16);
+      expect(ultraRes.text).assertEqual('Instant output');
+      expect(ultraRes.reasoning).assertEqual('Instant thoughts');
+      expect(ultraRes.hasMore).assertFalse();
+
+      const reduced = new StreamTextSmoother('standard', true);
+      reduced.setTarget('Reduced motion text', '');
+      const reducedRes = reduced.step(16);
+      expect(reducedRes.text).assertEqual('Reduced motion text');
+      expect(reducedRes.hasMore).assertFalse();
+
+      // snapToTarget immediately flushes remainder
+      const snapper = new StreamTextSmoother('standard', false);
+      snapper.setTarget('Pending tail', 'Pending reasoning');
+      snapper.step(16);
+      const snapped = snapper.snapToTarget();
+      expect(snapped.text).assertEqual('Pending tail');
+      expect(snapped.reasoning).assertEqual('Pending reasoning');
+      expect(snapped.hasMore).assertFalse();
+      expect(snapper.hasPending()).assertFalse();
+    });
+
+    it('markdown_incremental_stable_prefix_and_inline_tail_equivalence', 0, () => {
+      // Must NOT split inside an open fenced code block even across blank lines
+      const openFenceDoc = '# Title\n\n```ts\nconst a = 1;\n\nconst b = 2;';
+      const openCut = findStableMarkdownPrefixEnd(openFenceDoc);
+      expect(openCut).assertEqual('# Title\n\n'.length);
+
+      // Once fence closes and another block follows after a blank line, whole code block freezes
+      const fullDoc = [
+        '# Title',
+        '',
+        'Intro paragraph with **bold**.',
+        '',
+        '```ts',
+        'const a = 1;',
+        '',
+        'const b = 2;',
+        '```',
+        '',
+        '$$',
+        'x = 1',
+        '',
+        'y = 2',
+        '$$',
+        '',
+        '- item one',
+        '- item two',
+        '',
+        '| A | B |',
+        '|---|---|',
+        '| 1 | 2 |',
+        '',
+        'Tail **styled** plain suffix'
+      ].join('\n');
+
+      const cut = findStableMarkdownPrefixEnd(fullDoc);
+      expect(cut > 0 && cut < fullDoc.length).assertTrue();
+      const prefixBlocks = parseMarkdownBlocks(fullDoc.slice(0, cut));
+      const tailBlocks = parseMarkdownBlocks(fullDoc.slice(cut));
+      const combinedJson = JSON.stringify([...prefixBlocks, ...tailBlocks]);
+      const expectedJson = JSON.stringify(parseMarkdownBlocks(fullDoc));
+      expect(combinedJson).assertEqual(expectedJson);
+      expect(tailBlocks.length).assertEqual(1);
+      expect(tailBlocks[0].kind).assertEqual('paragraph');
+
+      // Inline tail splitting isolates changing trailing plain text
+      const split1 = splitInlineTail('Hello **world** and trailing text');
+      expect(split1.prefix.length).assertEqual(2);
+      expect(split1.prefix[1].kind).assertEqual('bold');
+      expect(split1.prefix[1].text).assertEqual('world');
+      expect(split1.suffix).assertEqual(' and trailing text');
+
+      const split2 = splitInlineTail('**onlyBold**');
+      expect(split2.prefix.length).assertEqual(1);
+      expect(split2.suffix).assertEqual('');
     });
   });
 }
