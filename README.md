@@ -4,11 +4,12 @@ Kelivo 是基于 HarmonyOS NEXT（ArkTS、ArkUI 与 Stage 模型）打造的原�
 
 ## 核心特性总览
 
-### 1. 多协议模型服务与订阅认证
+### 1. 多协议模型服务与供应商配置
 - **全协议族支持**：OpenAI Chat Completions、OpenAI Responses API (`/responses`)、Anthropic Messages（含 Prompt Caching）、Google Gemini、Vertex AI（含生图模式 `generateImages`）。
 - **多模型与多密钥池**：单服务商多模型管理（视觉/工具/推理/生图能力标注与自动识别）、Ollama 本地能力探测；多 API Key 轮询池（轮询 / 优先级 / 最少使用 / 随机 + 429 自动冷却退避）。
 - **企业网络与自定义**：HTTP Proxy 代理配置、自定义请求头 / Body JSON、自动指数退避重试、API 余额查询、服务商 `ai-provider:v1:` 二维码扫码/生成。
-- **订阅 OAuth 登录（PKCE S256）**：内置 ArkWeb 回调拦截与手动授权码/Token 绑定，支持 ChatGPT、Claude、Grok、Kimi 订阅账号一键创建服务商。
+- **ChatGPT 订阅登录**位于「供应商 → OpenAI → 配置」，也可从新增供应商的「配置」页进入。选择「使用 ChatGPT 登录」，在系统浏览器授权套餐用量后返回应用。Kelivo 按账号读取模型列表，使用官方 Responses API 发送请求。在已连接的供应商中可重新授权或打开「管理用量」。[OpenAI 接入说明](https://developers.openai.com/siwc/token-sharing-open-source)
+- **OpenCode Go 订阅额度**可在供应商的「配置」页查看。绑定主 API 密钥后，页面显示 5 小时、周、月额度的剩余百分比与重置时间。「模型」页用于获取和编辑模型。
 
 ### 2. 对话工作台与富交互渲染
 - **SQLite 持久化架构**：基于 `@kit.ArkData` `relationalStore` 存储会话、消息、HTTP 请求日志、上下文发送快照及每日 Token 统计，首次启动自动迁移旧版 JSON 数据；敏感密钥全程托管于 `@kit.AssetStoreKit`。

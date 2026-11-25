@@ -1,3 +1,5 @@
+import { parsePlanCallback } from '../main/ets/core/ChatGptLogin';
+import { checkPlanClaims, encodeRsaPublicKeySpki, PlanClaims } from '../main/ets/core/ChatGptSession';
 import { describe, expect, it } from '@ohos/hypium';
 import {
   ApiFamily,
@@ -11,6 +13,7 @@ import {
   MemoryEntry,
   MemorySettings,
   ModelSpec,
+  OPENCODE_GO_OAUTH_PREFIX,
   Persona,
   Provider,
   ReasoningEffort,
@@ -30,15 +33,23 @@ import {
   defaultModelSpec,
   estimateTokens,
   initialWorkspace,
+  isOpenCodeGoEndpoint,
   isProviderConfigured,
   messageText,
   normalizeAppearanceConfig,
   normalizeInstructionCards,
   normalizeQuickPhrases,
   normalizeWorldBooks,
+  openCodeGoSessionId,
   preset,
   resolveActiveModel
 } from '../main/ets/core/Models';
+import {
+  OpenCodeGoAuthError,
+  parseOpenCodeDeviceCodeResponse,
+  parseOpenCodeTokenResponse,
+  resolveOpenCodeVerificationUrl
+} from '../main/ets/core/OpenCodeGoSession';
 import { reasoningBulbRayCount, reasoningControl, withReasoning } from '../main/ets/core/Reasoning';
 import {
   activateWorldBooks,
@@ -49,6 +60,7 @@ import {
   parseWorldBookImportJson
 } from '../main/ets/core/PromptEngine';
 import {
+  parseOpenCodeGoUsage,
   resolveEffectiveProxy,
   setGlobalHttpProxy,
   shouldBypassProxy
@@ -208,6 +220,269 @@ function callFor(family: ApiFamily) {
 
 export default function localUnitTest() {
   describe('KelivoProtocolAndMigration', () => {
+    it('ChatGptPlanAuthorizationBindsStateAndRegistration', 0, () => {
+      const target = '/auth/callback?code=abc%2B123&state=expected&client_id=oaiapp_local';
+      expect(parsePlanCallback(target, 'expected', '')?.code).assertEqual('abc+123');
+      expect(parsePlanCallback(target, 'different', '') === undefined).assertTrue();
+      expect(parsePlanCallback(target + '&state=expected', 'expected', '') === undefined).assertTrue();
+      expect(parsePlanCallback('/auth/callback?code=new&state=s', 's', 'oaiapp_local')?.clientId).assertEqual('oaiapp_local');
+      for (const invalid of [target, '/auth/callback?error=access_denied&state=expected']) {
+        let refused = false;
+        try { parsePlanCallback(invalid, 'expected', 'oaiapp_other'); } catch (_) { refused = true; }
+        expect(refused).assertTrue();
+      }
+      const claims: PlanClaims = { sub: 'user', iss: 'https://auth.openai.com', aud: 'client', exp: Date.now() / 1000 + 120, nonce: 'nonce' };
+      checkPlanClaims(claims, 'client', 'nonce');
+      let refused = false;
+      try { checkPlanClaims(claims, 'other', 'nonce'); } catch (_) { refused = true; }
+      expect(refused).assertTrue();
+      refused = false;
+      try { checkPlanClaims(claims, 'client', 'wrong'); } catch (_) { refused = true; }
+      expect(refused).assertTrue();
+    });
+
+    it('ChatGptPlanEncodesRsaSpkiDerFromJwk', 0, () => {
+      const exp = new Uint8Array([0x01, 0x00, 0x01]);
+      const mod1024 = new Uint8Array(128);
+      mod1024.fill(0x11);
+      mod1024[0] = 0xae;
+      const spki1024 = encodeRsaPublicKeySpki(mod1024, exp);
+      expect(spki1024.length).assertEqual(162);
+      expect(spki1024[0]).assertEqual(0x30);
+      expect(spki1024[1]).assertEqual(0x81);
+      expect(spki1024[2]).assertEqual(0x9f);
+      const algo = [0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00];
+      for (let i = 0; i < algo.length; i++) {
+        expect(spki1024[3 + i]).assertEqual(algo[i]);
+      }
+      expect(spki1024[18]).assertEqual(0x03);
+      expect(spki1024[19]).assertEqual(0x81);
+      expect(spki1024[20]).assertEqual(0x8d);
+      expect(spki1024[21]).assertEqual(0x00);
+      expect(spki1024[22]).assertEqual(0x30);
+      expect(spki1024[23]).assertEqual(0x81);
+      expect(spki1024[24]).assertEqual(0x89);
+      expect(spki1024[25]).assertEqual(0x02);
+      expect(spki1024[26]).assertEqual(0x81);
+      expect(spki1024[27]).assertEqual(0x81);
+      expect(spki1024[28]).assertEqual(0x00);
+      expect(spki1024[29]).assertEqual(0xae);
+      expect(spki1024[157]).assertEqual(0x02);
+      expect(spki1024[158]).assertEqual(0x03);
+      expect(spki1024[159]).assertEqual(0x01);
+      expect(spki1024[160]).assertEqual(0x00);
+      expect(spki1024[161]).assertEqual(0x01);
+
+      const mod2048Hi = new Uint8Array(256);
+      mod2048Hi.fill(0x22);
+      mod2048Hi[0] = 0xc1;
+      const spki2048Hi = encodeRsaPublicKeySpki(mod2048Hi, exp);
+      expect(spki2048Hi.length).assertEqual(294);
+      expect(spki2048Hi[0]).assertEqual(0x30);
+      expect(spki2048Hi[1]).assertEqual(0x82);
+      expect(spki2048Hi[2]).assertEqual(0x01);
+      expect(spki2048Hi[3]).assertEqual(0x22);
+      expect(spki2048Hi[28]).assertEqual(0x02);
+      expect(spki2048Hi[29]).assertEqual(0x82);
+      expect(spki2048Hi[30]).assertEqual(0x01);
+      expect(spki2048Hi[31]).assertEqual(0x01);
+      expect(spki2048Hi[32]).assertEqual(0x00);
+      expect(spki2048Hi[33]).assertEqual(0xc1);
+
+      const padded2048 = new Uint8Array(257);
+      padded2048.set(mod2048Hi, 1);
+      const spkiPadded = encodeRsaPublicKeySpki(padded2048, exp);
+      expect(spkiPadded.length).assertEqual(spki2048Hi.length);
+      for (let i = 0; i < spki2048Hi.length; i++) {
+        expect(spkiPadded[i]).assertEqual(spki2048Hi[i]);
+      }
+
+      const mod2048Lo = new Uint8Array(256);
+      mod2048Lo.fill(0x33);
+      mod2048Lo[0] = 0x7a;
+      const spki2048Lo = encodeRsaPublicKeySpki(mod2048Lo, exp);
+      expect(spki2048Lo.length).assertEqual(293);
+      expect(spki2048Lo[28]).assertEqual(0x02);
+      expect(spki2048Lo[29]).assertEqual(0x82);
+      expect(spki2048Lo[30]).assertEqual(0x01);
+      expect(spki2048Lo[31]).assertEqual(0x00);
+      expect(spki2048Lo[32]).assertEqual(0x7a);
+    });
+
+    it('ChatGptPlanUsesOfficialStreamingResponses', 0, () => {
+      const p = preset('chatgpt-plan-oaiapp_local', 'ChatGPT', 'openai-responses', 'https://api.openai.com/v1', 'selected-model');
+      p.oauth = { kind: 'chatgpt', accountEmail: '', accessTokenRef: '', refreshTokenRef: '', expiresAt: 0, quotaSummary: '' };
+      p.customBodyJson = '{"store":true,"max_output_tokens":800}';
+      const history: ChatMessage[] = [{ id: 'm', role: 'user', text: 'Hello', model: '' }];
+      const call = makeAdvancedChatCall(p, '', 'A system instruction', history, { stream: false, params: defaultGenerationParams() });
+      const body = JSON.parse(call.body) as Record<string, Object>;
+      expect(call.address).assertEqual('https://api.openai.com/v1/responses');
+      expect(call.planClient).assertEqual('oaiapp_local');
+      expect(body['store']).assertEqual(false);
+      expect(body['stream']).assertEqual(true);
+      expect(body['instructions']).assertEqual('A system instruction');
+      expect(body['max_output_tokens'] === undefined).assertTrue();
+      expect(body['temperature'] === undefined).assertTrue();
+      p.baseUrl = 'https://other.example/v1';
+      let refused = false;
+      try { makeAdvancedChatCall(p, '', '', history); } catch (_) { refused = true; }
+      expect(refused).assertTrue();
+      refused = false;
+      try { parseRichReply('{"type":"response.failed","response":{"error":{"message":"plan usage limit"}}}'); }
+      catch (e) { refused = (e as Error).message === 'plan usage limit'; }
+      expect(refused).assertTrue();
+    });
+
+    it('OpenCodeGoPresetAndQuotaWindows', 0, () => {
+      const provider = initialWorkspace().providers.find((p: Provider): boolean => p.id === 'opencode-go')!;
+      expect(isOpenCodeGoEndpoint(provider.baseUrl)).assertTrue();
+      expect(isOpenCodeGoEndpoint('https://opencode.ai/zen/go/v1/')).assertTrue();
+      expect(isOpenCodeGoEndpoint('https://opencode.ai/zen/v1')).assertFalse();
+      expect(isOpenCodeGoEndpoint('https://opencode.ai.example.org/inference/go/v1')).assertFalse();
+      const call = makeChatCall(provider, 'test', '', [], 'go-session');
+      expect(call.address).assertEqual('https://opencode.ai/inference/go/openai/v1/chat/completions');
+      expect(call.headers['x-opencode-session']).assertEqual('go-session');
+
+      const resetsAt = '2026-11-30T00:00:00.000Z';
+      const body = `{"usage":{
+        "rolling":{"status":"ok","percent":0,"resetsAt":"2026-11-30T00:00:00.000Z"},
+        "weekly":{"status":"ok","percent":27,"resetsAt":"2026-11-30T00:00:00.000Z"},
+        "monthly":{"status":"rate-limited","percent":100,"resetsAt":"2026-12-01T00:00:00.000Z"}
+      }}`;
+      const rows = parseOpenCodeGoUsage(body);
+      expect(rows.map((r) => r.label).join(',')).assertEqual('5 小时额度,周额度,月额度');
+      expect(rows.map((r) => r.remaining).join(',')).assertEqual('100,73,0');
+      expect(rows[0].resetTime).assertEqual(Date.parse(resetsAt));
+      for (const bad of ['{}', 'null', 'invalid', body.replace('"weekly"', '"other"'),
+        body.replace('27', '101'), body.replace(resetsAt, 'invalid')]) {
+        let rejected = false;
+        try { parseOpenCodeGoUsage(bad); } catch (_) { rejected = true; }
+        expect(rejected).assertTrue();
+      }
+    });
+
+    it('OpenCodeGoOAuthDeviceAndTokenParsing', 0, () => {
+      expect(resolveOpenCodeVerificationUrl('/console/device?user_code=ABCD'))
+        .assertEqual('https://opencode.ai/console/device?user_code=ABCD');
+      expect(resolveOpenCodeVerificationUrl('https://opencode.ai/console/device'))
+        .assertEqual('https://opencode.ai/console/device');
+      for (const badUrl of [
+        '',
+        '//evil.example/auth',
+        'http://opencode.ai/console/device',
+        'https://opencode.ai.evil.com/console/device',
+        'https://opencode.ai@evil.com/console/device',
+        'https://evil.com/console/device',
+        'https://opencode.ai/console/device with-space'
+      ]) {
+        let rejected = false;
+        try { resolveOpenCodeVerificationUrl(badUrl); } catch (_) { rejected = true; }
+        expect(rejected).assertTrue();
+      }
+
+      const devJson = JSON.stringify({
+        device_code: 'dev_123',
+        user_code: 'GSDL-LXPH',
+        verification_uri: '/console/device',
+        verification_uri_complete: '/console/device?user_code=GSDL-LXPH&client_id=kelivo',
+        expires_in: 600,
+        interval: 5
+      });
+      const challenge = parseOpenCodeDeviceCodeResponse(devJson, 1000);
+      expect(challenge.deviceCode).assertEqual('dev_123');
+      expect(challenge.userCode).assertEqual('GSDL-LXPH');
+      expect(challenge.verificationUrl)
+        .assertEqual('https://opencode.ai/console/device?user_code=GSDL-LXPH&client_id=kelivo');
+      expect(challenge.expiresAt).assertEqual(601000);
+      expect(challenge.intervalMs).assertEqual(5000);
+
+      let badDeviceRejected = false;
+      try {
+        parseOpenCodeDeviceCodeResponse(JSON.stringify({
+          device_code: 'd',
+          user_code: 'U',
+          verification_uri: 'https://evil.example/device',
+          expires_in: 600
+        }), 1000);
+      } catch (_) {
+        badDeviceRejected = true;
+      }
+      expect(badDeviceRejected).assertTrue();
+
+      const tok = parseOpenCodeTokenResponse(JSON.stringify({
+        access_token: 'acc_tok',
+        refresh_token: 'ref_tok',
+        expires_in: 3600,
+        org_id: 'org_99'
+      }), 2000);
+      expect(tok.accessToken).assertEqual('acc_tok');
+      expect(tok.refreshToken).assertEqual('ref_tok');
+      expect(tok.expires).assertEqual(3602000);
+      expect(tok.orgId).assertEqual('org_99');
+
+      for (const errCode of ['authorization_pending', 'slow_down', 'access_denied', 'expired_token', 'invalid_grant']) {
+        let caughtCode = '';
+        try {
+          parseOpenCodeTokenResponse(JSON.stringify({ error: errCode }));
+        } catch (e) {
+          if (e instanceof OpenCodeGoAuthError) {
+            caughtCode = e.code;
+          }
+        }
+        expect(caughtCode).assertEqual(errCode);
+      }
+    });
+
+    it('OpenCodeGoOAuthProtocolAndEndpointGuard', 0, () => {
+      const oauthProv = preset(
+        OPENCODE_GO_OAUTH_PREFIX + 'sess_1',
+        'OpenCode Go',
+        'openai',
+        'https://opencode.ai/inference/go/openai/v1',
+        'kimi-k3'
+      );
+      oauthProv.oauth = {
+        kind: 'opencode-go',
+        accountEmail: 'user@example.com',
+        accessTokenRef: '',
+        refreshTokenRef: '',
+        expiresAt: 0,
+        quotaSummary: 'Team'
+      };
+      expect(openCodeGoSessionId(oauthProv)).assertEqual('sess_1');
+      expect(isProviderConfigured(oauthProv)).assertTrue();
+
+      const simpleCall = makeChatCall(oauthProv, '', '', [{ id: 'u1', role: 'user', text: 'hi', model: '' }], 'conv-1');
+      expect(simpleCall.openCodeGoSession).assertEqual('sess_1');
+      expect(simpleCall.headers['x-opencode-session']).assertEqual('conv-1');
+      expect(simpleCall.address).assertEqual('https://opencode.ai/inference/go/openai/v1/chat/completions');
+
+      const advCall = makeAdvancedChatCall(oauthProv, '', '', [{ id: 'u2', role: 'user', text: 'hi', model: '' }], {
+        conversationId: 'conv-2'
+      });
+      expect(advCall.openCodeGoSession).assertEqual('sess_1');
+      expect(advCall.headers['x-opencode-session']).assertEqual('conv-2');
+
+      oauthProv.baseUrl = 'https://evil.example/v1';
+      let simpleRejected = false;
+      try {
+        makeChatCall(oauthProv, '', '', [{ id: 'u3', role: 'user', text: 'hi', model: '' }], 'conv-3');
+      } catch (_) {
+        simpleRejected = true;
+      }
+      expect(simpleRejected).assertTrue();
+
+      let advRejected = false;
+      try {
+        makeAdvancedChatCall(oauthProv, '', '', [{ id: 'u4', role: 'user', text: 'hi', model: '' }], {
+          conversationId: 'conv-4'
+        });
+      } catch (_) {
+        advRejected = true;
+      }
+      expect(advRejected).assertTrue();
+    });
+
     it('OpenAICompatibleVision', 0, () => {
       const call = callFor('openai');
       expect(call.address).assertEqual('https://example.com/v1/chat/completions');

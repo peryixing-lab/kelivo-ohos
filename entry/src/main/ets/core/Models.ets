@@ -10,7 +10,7 @@ export type ToolPermissionMode = 'ask' | 'full';
 
 export type AttachmentKind = 'text' | 'image' | 'pdf' | 'docx' | 'audio';
 
-export type OAuthProviderKind = 'chatgpt' | 'grok' | 'kimi' | 'claude';
+export type OAuthProviderKind = 'chatgpt' | 'grok' | 'kimi' | 'claude' | 'opencode-go';
 
 export type ModelKindType = 'chat' | 'embedding' | 'image';
 
@@ -841,6 +841,12 @@ export function providerEnabledModels(p: Provider): ModelSpec[] {
   return [];
 }
 
+export const CHATGPT_PLAN_PREFIX = 'chatgpt-plan-';
+export const CHATGPT_PLAN_API = 'https://api.openai.com/v1';
+export function planClientId(p: Provider): string {
+  return p.oauth?.kind === 'chatgpt' && p.id.startsWith(CHATGPT_PLAN_PREFIX) ? p.id.slice(CHATGPT_PLAN_PREFIX.length) : '';
+}
+
 export function isProviderConfigured(p: Provider): boolean {
   if (p.secretRef || p.oauth || (p.apiKeys && p.apiKeys.length > 0)) {
     return true;
@@ -1409,6 +1415,26 @@ export function defaultSearchServices(): SearchServiceConfig[] {
   ];
 }
 
+export const OPEN_CODE_GO_API = 'https://opencode.ai/inference/go';
+
+export function isOpenCodeGoEndpoint(baseUrl: string): boolean {
+  return /^https:\/\/opencode\.ai(?::443)?\/(?:inference|zen)\/go(?:\/(?:openai|anthropic|google))?(?:\/v1(?:beta)?)?\/*$/i.test(baseUrl.trim());
+}
+
+export function openCodeGoPreset(id: string): Provider {
+  return preset(id, 'OpenCode Go', 'openai', OPEN_CODE_GO_API + '/openai/v1', 'kimi-k3');
+}
+
+export const OPENCODE_GO_OAUTH_PREFIX = 'opencode-go-oauth-';
+export const OPENCODE_GO_CONSOLE_ORIGIN = 'https://opencode.ai';
+export const OPENCODE_GO_CONSOLE_URL = 'https://opencode.ai/console';
+
+export function openCodeGoSessionId(p: Provider): string {
+  return p.oauth?.kind === 'opencode-go' && p.id.startsWith(OPENCODE_GO_OAUTH_PREFIX)
+    ? p.id.slice(OPENCODE_GO_OAUTH_PREFIX.length)
+    : '';
+}
+
 export function initialWorkspace(): Workspace {
   return {
     version: 2,
@@ -1419,6 +1445,7 @@ export function initialWorkspace(): Workspace {
       preset('claude', 'Anthropic', 'anthropic', 'https://api.anthropic.com/v1', ''),
       preset('siliconflow', '硅基流动', 'openai', 'https://api.siliconflow.cn/v1', ''),
       preset('openrouter', 'OpenRouter', 'openai', 'https://openrouter.ai/api/v1', ''),
+      openCodeGoPreset('opencode-go'),
       preset('qwen', '阿里云百炼', 'openai', 'https://dashscope.aliyuncs.com/compatible-mode/v1', ''),
       preset('zhipu', '智谱 GLM', 'openai', 'https://open.bigmodel.cn/api/paas/v4', ''),
       preset('xai', 'xAI Grok', 'openai', 'https://api.x.ai/v1', ''),

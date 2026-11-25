@@ -208,6 +208,9 @@ function normalizeOAuthKind(raw: string): OAuthProviderKind | undefined {
   if (norm === 'claude' || norm === 'anthropic') {
     return 'claude';
   }
+  if (norm === 'opencode-go' || norm === 'opencode' || norm === 'opencode_go') {
+    return 'opencode-go';
+  }
   return undefined;
 }
 

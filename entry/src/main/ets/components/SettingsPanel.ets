@@ -105,7 +105,7 @@ export struct SettingsPanel {
         title: '供应商',
         symbolRes: $r('sys.symbol.square_grid_2x2'),
         route: 'providers',
-        keywords: 'provider model api key oauth openai claude gemini ollama 供应商 服务商 导入'
+        keywords: 'provider model api key opencode go openai claude gemini ollama 供应商 服务商 导入'
       },
       {
         id: 'search',

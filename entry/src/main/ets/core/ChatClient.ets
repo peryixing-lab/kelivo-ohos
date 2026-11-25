@@ -1,8 +1,14 @@
+import { planAccessToken } from './ChatGptSession';
+import { openCodeGoAccessToken } from './OpenCodeGoSession';
 import { http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import {
   Attachment,
+  CHATGPT_PLAN_API,
+  planClientId,
   ModelSpec,
+  OPEN_CODE_GO_API,
+  openCodeGoSessionId,
   Provider,
   ProxyConfig,
   ReasoningEffort,
@@ -11,6 +17,7 @@ import {
   defaultModelSpec,
   extractUrlHost,
   findProviderModelSpec,
+  isOpenCodeGoEndpoint,
   normalizeProxyConfig
 } from './Models';
 import {
@@ -26,7 +33,7 @@ import {
   parseRichReply
 } from './Protocol';
 
-interface ModelEntry { id?: string; name?: string; supportedGenerationMethods?: string[] }
+interface ModelEntry { slug?: string; visibility?: string; display_name?: string; id?: string; name?: string; type?: string; supportedGenerationMethods?: string[] }
 interface ModelPage { data?: ModelEntry[]; models?: ModelEntry[]; nextPageToken?: string; has_more?: boolean; last_id?: string }
 interface ApiErrorEnvelope { error?: ApiErrorDetail }
 interface ApiErrorDetail { message?: string }
@@ -346,7 +353,32 @@ function waitMs(ms: number): Promise<void> {
 }
 
 export async function fetchModels(provider: Provider, key: string, proxyPassword?: string): Promise<string[]> {
-  const base = checkEndpoint(provider.baseUrl) + '/models';
+  const plan = planClientId(provider);
+  if (plan) {
+    const token = await planAccessToken(plan);
+    const req = http.createHttp();
+    try {
+      const url = CHATGPT_PLAN_API + '/models';
+      const opts: http.HttpRequestOptions = { method: http.RequestMethod.GET, header: { 'Authorization': 'Bearer ' + token },
+        expectDataType: http.HttpDataType.STRING, usingCache: false, maxRedirects: 0, connectTimeout: 15000, readTimeout: 25000 };
+      applyProxyToHttpOptions(opts, url, provider.proxy, proxyPassword);
+      const response = await req.request(url, opts);
+      if (response.responseCode !== 200) throw new Error('ChatGPT 模型列表请求失败（HTTP ' + response.responseCode + '）');
+      const page = JSON.parse(response.result as string) as ModelPage;
+      if (!Array.isArray(page.models)) throw new Error('ChatGPT 模型列表格式异常');
+      return page.models.filter((m: ModelEntry): boolean => !!m.slug && m.visibility === 'list')
+        .map((m: ModelEntry): string => m.slug!);
+    } finally { req.destroy(); }
+  }
+  const goSession = openCodeGoSessionId(provider);
+  const go = isOpenCodeGoEndpoint(provider.baseUrl);
+  if (goSession && !go) {
+    throw new Error('OpenCode Go 账号登录仅支持官方 OpenCode Go 接口地址');
+  }
+  const effectiveKey = goSession && !key.trim()
+    ? await openCodeGoAccessToken(goSession, provider.proxy, proxyPassword)
+    : key;
+  const base = go ? OPEN_CODE_GO_API + '/v1/models' : checkEndpoint(provider.baseUrl) + '/models';
   const names: string[] = [];
   let next = base;
   const seen = new Set<string>();
@@ -356,7 +388,7 @@ export async function fetchModels(provider: Provider, key: string, proxyPassword
     try {
       const opts: http.HttpRequestOptions = {
         method: http.RequestMethod.GET,
-        header: buildProviderHeaders(provider, key),
+        header: buildProviderHeaders(provider, effectiveKey),
         expectDataType: http.HttpDataType.STRING,
         connectTimeout: 15000,
         readTimeout: 25000,
@@ -371,6 +403,7 @@ export async function fetchModels(provider: Provider, key: string, proxyPassword
       const items = page.data ?? page.models;
       if (!Array.isArray(items)) throw new Error('服务商没有返回模型列表，可手动填写模型 ID。');
       items.forEach((entry: ModelEntry) => {
+        if (go && entry.type && entry.type !== 'chat') return;
         if (entry.supportedGenerationMethods && !entry.supportedGenerationMethods.includes('generateContent')) return;
         const name = (entry.id || entry.name || '').replace(/^models\//, '');
         if (name) names.push(name);
@@ -412,15 +445,80 @@ export async function fetchOllamaCapabilities(baseUrl: string, modelId: string, 
   return spec;
 }
 
-export async function fetchProviderBalance(provider: Provider, key: string, proxyPassword?: string): Promise<string> {
-  const base = checkEndpoint(provider.baseUrl);
-  let url = provider.balanceUrl?.trim() || '';
-  if (!url) {
-    if (base.includes('api.deepseek.com')) url = 'https://api.deepseek.com/user/balance';
-    else if (base.includes('api.siliconflow.cn')) url = 'https://api.siliconflow.cn/v1/user/info';
-    else if (base.includes('openrouter.ai')) url = 'https://openrouter.ai/api/v1/credits';
-    else throw new Error('该服务商未配置余额查询地址');
+interface GoUsageMeter { percent: number; resetsAt: string }
+interface GoUsageWindows { rolling: GoUsageMeter; weekly: GoUsageMeter; monthly: GoUsageMeter }
+interface GoUsageResponse { usage?: GoUsageWindows }
+
+export interface GoQuotaRow {
+  label: string;
+  remaining: number;
+  resetTime: number;
+}
+
+export function parseOpenCodeGoUsage(raw: string): GoQuotaRow[] {
+  const error = 'OpenCode Go 返回的额度数据不完整或格式异常';
+  let data: GoUsageResponse;
+  try {
+    data = JSON.parse(raw) as GoUsageResponse;
+  } catch (_) {
+    throw new Error(error);
   }
+  const usage = data?.usage;
+  if (!usage) throw new Error(error);
+  const row = (label: string, meter: GoUsageMeter): GoQuotaRow => {
+    if (!meter || !Number.isInteger(meter.percent) || meter.percent < 0 || meter.percent > 100 ||
+      typeof meter.resetsAt !== 'string' || !Number.isFinite(Date.parse(meter.resetsAt))) {
+      throw new Error(error);
+    }
+    return { label, remaining: 100 - meter.percent, resetTime: Date.parse(meter.resetsAt) };
+  };
+  return [row('5 小时额度', usage.rolling), row('周额度', usage.weekly), row('月额度', usage.monthly)];
+}
+
+export async function fetchOpenCodeGoUsage(key: string, proxy?: ProxyConfig, password?: string): Promise<GoQuotaRow[]> {
+  if (!key.trim()) throw new Error('请先填写主 API 密钥');
+  const url = OPEN_CODE_GO_API + '/v1/usage';
+  const req = http.createHttp();
+  try {
+    const opts: http.HttpRequestOptions = {
+      method: http.RequestMethod.GET,
+      header: { 'Authorization': 'Bearer ' + key.trim(), 'Accept': 'application/json' },
+      expectDataType: http.HttpDataType.STRING,
+      connectTimeout: 10000,
+      readTimeout: 15000,
+      maxRedirects: 0,
+      usingCache: false
+    };
+    applyProxyToHttpOptions(opts, url, proxy, password);
+    let response: http.HttpResponse;
+    try {
+      response = await req.request(url, opts);
+    } catch (_) {
+      throw new Error('无法连接 OpenCode Go，请检查网络或代理后刷新');
+    }
+    const status = response.responseCode;
+    if (status === 401) throw new Error('API 密钥无效或已失效，请检查主 API 密钥');
+    if (status === 403) throw new Error('此密钥无权查看额度，请检查 Go 订阅和工作区权限');
+    if (status === 429) throw new Error('额度查询过于频繁，请稍后刷新');
+    if (status !== 200) throw new Error('额度查询失败（HTTP ' + status + '）');
+    return parseOpenCodeGoUsage(response.result as string);
+  } finally {
+    req.destroy();
+  }
+}
+
+export function providerBalanceUrl(baseUrl: string, customUrl?: string): string {
+  if (customUrl?.trim()) return customUrl.trim();
+  const host = extractUrlHost(baseUrl);
+  if (host === 'api.deepseek.com') return 'https://api.deepseek.com/user/balance';
+  if (host === 'api.siliconflow.cn') return 'https://api.siliconflow.cn/v1/user/info';
+  if (host === 'openrouter.ai') return 'https://openrouter.ai/api/v1/credits';
+  return '';
+}
+
+export async function fetchProviderBalance(provider: Provider, key: string, proxyPassword?: string): Promise<string> {
+  const url = providerBalanceUrl(checkEndpoint(provider.baseUrl), provider.balanceUrl);
+  if (!url) throw new Error('该服务商未配置余额查询地址');
   const req = http.createHttp();
   try {
     const headers = buildProviderHeaders(provider, key);
@@ -558,6 +656,30 @@ export class ChatStream {
     onStatus: (status: number) => void,
     options?: StreamRunOptions
   ): Promise<void> {
+    let headers = call.headers;
+    if (call.planClient) {
+      if (call.address !== CHATGPT_PLAN_API + '/responses') throw new Error('ChatGPT 订阅请求地址无效');
+      headers = { 'Authorization': 'Bearer ' + await planAccessToken(call.planClient), 'Content-Type': 'application/json' };
+      if (this.cancelled) throw new Error('已停止生成');
+    }
+    if (call.openCodeGoSession) {
+      if (!call.address.startsWith(OPEN_CODE_GO_API + '/') && !call.address.startsWith('https://opencode.ai/zen/go/')) {
+        throw new Error('OpenCode Go 订阅请求地址无效');
+      }
+      const goToken = await openCodeGoAccessToken(call.openCodeGoSession, options?.proxy, options?.proxyPassword);
+      if (this.cancelled) throw new Error('已停止生成');
+      const nextHeaders: Record<string, string> = {};
+      const headerKeys = Object.keys(headers);
+      for (let i = 0; i < headerKeys.length; i++) {
+        const hk = headerKeys[i];
+        if (hk.toLowerCase() !== 'authorization') {
+          nextHeaders[hk] = headers[hk];
+        }
+      }
+      nextHeaders['Authorization'] = 'Bearer ' + goToken;
+      headers = nextHeaders;
+    }
+    let planCompleted = false;
     const req = http.createHttp();
     const decoder = util.TextDecoder.create('utf-8');
     const thinkParser = new ThinkTagStreamParser();
@@ -570,6 +692,10 @@ export class ChatStream {
 
     const emitParsed = (data: string): void => {
       const part = parseRichReply(data);
+      if (call.planClient && data !== '[DONE]' && part.done) {
+        const terminal = JSON.parse(data) as Record<string, Object>;
+        if (terminal['type'] === 'response.completed') planCompleted = true;
+      }
       if (part.text) {
         const split = thinkParser.push(part.text);
         part.text = split.text;
@@ -605,6 +731,7 @@ export class ChatStream {
             if (!sawEvent && raw.trim()) {
               emitParsed(raw);
             }
+            if (call.planClient && !planCompleted) throw new Error('ChatGPT 回复连接提前结束，请重试');
             const flushed = thinkParser.flush();
             if (flushed.text || flushed.reasoning) {
               onFragment({
@@ -645,12 +772,12 @@ export class ChatStream {
         });
         const reqOpts: http.HttpRequestOptions = {
           method: http.RequestMethod.POST,
-          header: call.headers,
+          header: headers,
           extraData: call.body,
           connectTimeout: 20000,
           readTimeout: 120000,
           usingCache: false,
-          maxRedirects: 5
+          maxRedirects: (call.planClient || call.openCodeGoSession) ? 0 : 5
         };
         applyProxyToHttpOptions(reqOpts, call.address, options?.proxy, options?.proxyPassword);
         req.requestInStream(call.address, reqOpts)
@@ -738,7 +865,15 @@ export async function generateImages(
   proxyPassword?: string,
   conversationId?: string
 ): Promise<Attachment[]> {
-  const call = makeImageGenCall(provider, key, prompt, modelId, conversationId);
+  const goSession = openCodeGoSessionId(provider);
+  let effectiveKey = key;
+  if (goSession && !effectiveKey.trim()) {
+    if (!isOpenCodeGoEndpoint(provider.baseUrl)) {
+      throw new Error('OpenCode Go 账号登录仅支持官方 OpenCode Go 接口地址');
+    }
+    effectiveKey = await openCodeGoAccessToken(goSession, provider.proxy, proxyPassword);
+  }
+  const call = makeImageGenCall(provider, effectiveKey, prompt, modelId, conversationId);
   const req = http.createHttp();
   try {
     const opts: http.HttpRequestOptions = {

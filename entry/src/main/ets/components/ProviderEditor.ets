@@ -7,25 +7,34 @@ import { ImmersiveMaterialStyle } from '../core/ImmersiveMaterialStyle';
 import { SystemMotion } from '../core/SystemMotion';
 import {
   ApiFamily,
-  ApiKeyEntry,
-  HeaderEntry,
-  KeyRotationStrategy,
+  CHATGPT_PLAN_API,
+  CHATGPT_PLAN_PREFIX,
+  planClientId,
   ModelDefaults,
   ModelModality,
   ModelOutputModality,
   ModelSpec,
-  OAuthProviderKind,
+  OPENCODE_GO_OAUTH_PREFIX,
   Provider,
-  ProxyConfig,
   checkEndpoint,
   cloneModelSpec,
+  cloneProvider,
   defaultModelSpec,
   extractUrlHost,
+  isOpenCodeGoEndpoint,
   isProviderConfigured,
+  openCodeGoPreset,
+  openCodeGoSessionId,
   preset
 } from '../core/Models';
-import { checkProviderHealth, fetchModels, fetchOllamaCapabilities, fetchProviderBalance } from '../core/ChatClient';
-import { forgetKey, newId, readKey, storeKey } from '../core/Storage';
+import { checkProviderHealth, fetchModels, fetchOllamaCapabilities, fetchProviderBalance, providerBalanceUrl } from '../core/ChatClient';
+import { newId, readKey } from '../core/Storage';
+import { AddProviderSheet } from './AddProviderSheet';
+import { ChatGptPlanLogin } from './ChatGptPlanLogin';
+import { PlanSession } from '../core/ChatGptSession';
+import { OpenCodeGoPlanLogin } from './OpenCodeGoPlanLogin';
+import { OpenCodeGoSession } from '../core/OpenCodeGoSession';
+import { OpenCodeGoQuota } from './OpenCodeGoQuota';
 import { KelivoAvatarBadge, KelivoNavTitleBar, KelivoSectionHeader, KelivoStatusPill } from './KelivoChrome';
 
 @Component
@@ -34,7 +43,6 @@ export struct ProviderEditor {
   @Prop @Watch('onProvidersPropChange') activeId: string = '';
   pageMode: 'list' | 'detail' = 'list';
   initialProviderId: string = '';
-  initialTab: number = 0;
   @Prop modelDefaults: ModelDefaults = {
     chatProviderId: '', chatModelId: '', titleProviderId: '', titleModelId: '',
     translateProviderId: '', translateModelId: '', ocrProviderId: '', ocrModelId: '',
@@ -43,8 +51,7 @@ export struct ProviderEditor {
   onApply: (provider: Provider, key: string, reuseKey: boolean, setActive: boolean) => Promise<Provider[]> = async () => [];
   onImportProviders: (items: ImportedProvider[]) => Promise<Provider[]> = async () => [];
   onDeleteProvider: (id: string) => Promise<Provider[]> = async () => [];
-  onStartOAuth: (kind: OAuthProviderKind) => void = () => {};
-  onOpenDetail: (providerId: string, tab: number) => void = () => {};
+  onOpenDetail: (providerId: string) => void = () => {};
   onOpenModelEditor: (
     provider: Provider,
     spec: ModelSpec,
@@ -70,6 +77,7 @@ export struct ProviderEditor {
   @StorageProp('themeCanvasHex') themeCanvasHex: string = '#F7F7F7';
   @StorageProp('reduceMotionEnabled') reduceMotion: boolean = false;
   @State showImportSheet: boolean = false;
+  @State showAddSheet: boolean = false;
   @State importText: string = '';
   @State importError: string = '';
   @State labelText: string = '';
@@ -81,36 +89,15 @@ export struct ProviderEditor {
   @State modelId: string = '';
   @State modelChoices: string[] = [];
   @State savedModels: ModelSpec[] = [];
-  @State extraKeys: ApiKeyEntry[] = [];
-  @State keyStrategy: KeyRotationStrategy = 'round_robin';
-  @State extraKeyLabel: string = '';
-  @State extraKeySecret: string = '';
-  @State proxyEnabled: boolean = false;
-  @State proxyHost: string = '';
-  @State proxyPortText: string = '7890';
-  @State proxyUser: string = '';
-  @State proxyPass: string = '';
-  @State customHeaders: HeaderEntry[] = [];
-  @State newHeaderKey: string = '';
-  @State newHeaderVal: string = '';
-  @State customBodyJson: string = '';
-  @State promptCaching: boolean = false;
   @State sendConvCacheKey: boolean = false;
-  @State builtinSearch: boolean = false;
-  @State builtinUrlContext: boolean = false;
-  @State builtinCodeExec: boolean = false;
-  @State balanceUrl: string = '';
   @State balanceResult: string = '';
   @State healthResult: string = '';
-  @State activeTab: number = 0; // 0: 配置, 1: 模型列表, 2: 网络与高级
-  @State moreOptions: boolean = false;
-  @State linkInput: string = '';
+  @State activeTab: 'config' | 'models' = 'config';
   @State shareCode: string = '';
   @State notice: string = '';
   @State busy: boolean = false;
   @State clearSecret: boolean = false;
   private original: Provider = preset('', '', 'openai', '', '');
-  private existingProxyPassRef: string = '';
   private detailScroller: Scroller = new Scroller();
 
   private onProvidersPropChange(): void {
@@ -121,7 +108,6 @@ export struct ProviderEditor {
   aboutToAppear(): void {
     this.localProviders = this.providers.slice();
     this.localActiveId = this.activeId;
-    this.activeTab = this.initialTab;
     if (this.pageMode === 'detail') {
       if (this.initialProviderId.length > 0) {
         const target = this.localProviders.find((p: Provider): boolean => p.id === this.initialProviderId) ||
@@ -141,7 +127,6 @@ export struct ProviderEditor {
   selectProvider(provider: Provider): void {
     this.original = provider;
     this.shareCode = '';
-    this.linkInput = '';
     this.healthResult = '';
     this.selectedId = provider.id;
     this.provEnabled = provider.enabled !== false;
@@ -157,26 +142,72 @@ export struct ProviderEditor {
     this.savedModels = provider.models
       ? provider.models.map((m: ModelSpec): ModelSpec => cloneModelSpec(m))
       : (provider.model ? [defaultModelSpec(provider.model)] : []);
-    this.extraKeys = provider.apiKeys ? provider.apiKeys.slice() : [];
-    this.keyStrategy = provider.keyStrategy || 'round_robin';
-    this.proxyEnabled = provider.proxy?.enabled || false;
-    this.proxyHost = provider.proxy?.host || '';
-    this.proxyPortText = String(provider.proxy?.port || 7890);
-    this.proxyUser = provider.proxy?.username || '';
-    this.existingProxyPassRef = provider.proxy?.passwordRef || '';
-    this.proxyPass = '';
-    this.customHeaders = provider.customHeaders ? provider.customHeaders.slice() : [];
-    this.newHeaderKey = '';
-    this.newHeaderVal = '';
-    this.customBodyJson = provider.customBodyJson || '';
-    this.promptCaching = provider.promptCaching || false;
     this.sendConvCacheKey = provider.sendConversationCacheKey === true;
-    this.builtinSearch = provider.builtinSearch || false;
-    this.builtinUrlContext = provider.builtinUrlContext || false;
-    this.builtinCodeExec = provider.builtinCodeExec || false;
-    this.balanceUrl = provider.balanceUrl || '';
     this.balanceResult = provider.lastBalance || '';
     this.notice = '';
+  }
+
+  private async connectChatGpt(session: PlanSession): Promise<Provider> {
+    const id = CHATGPT_PLAN_PREFIX + session.clientId;
+    const previous = this.localProviders.find((p: Provider): boolean => p.id === id);
+    const provider = previous ? cloneProvider(previous) : preset(id, 'ChatGPT 订阅', 'openai-responses', CHATGPT_PLAN_API, '');
+    provider.oauth = { kind: 'chatgpt', accountEmail: session.email || session.subject, accessTokenRef: '',
+      refreshTokenRef: '', expiresAt: session.expires, quotaSummary: '' };
+    let modelNotice = '';
+    try {
+      const list = await fetchModels(provider, '');
+      if (!list.includes(provider.model)) provider.model = list[0] || '';
+      provider.models = list.map((mid: string): ModelSpec =>
+        provider.models?.find((m: ModelSpec): boolean => m.id === mid) || defaultModelSpec(mid));
+      if (!list.length) modelNotice = '账号没有返回可用模型';
+    } catch (_) { modelNotice = '可在「模型」中重试获取账号模型'; }
+    const updated = await this.onApply(provider, '', false, true);
+    this.localProviders = updated.slice();
+    this.localActiveId = provider.id;
+    if (this.pageMode === 'detail') {
+      this.selectProvider(provider);
+      this.notice = modelNotice || '已选用 ChatGPT 订阅';
+    }
+    return provider;
+  }
+
+  private async connectOpenCodeGo(session: OpenCodeGoSession): Promise<Provider> {
+    const id = OPENCODE_GO_OAUTH_PREFIX + session.sessionId;
+    const previous = this.localProviders.find((p: Provider): boolean => p.id === id);
+    const provider = previous ? cloneProvider(previous) : openCodeGoPreset(id);
+    if (!previous && session.orgName) {
+      provider.name = 'OpenCode Go · ' + session.orgName;
+    }
+    provider.oauth = {
+      kind: 'opencode-go',
+      accountEmail: session.email || session.orgName || session.accountId || 'OpenCode Go',
+      accessTokenRef: '',
+      refreshTokenRef: '',
+      expiresAt: session.expires,
+      quotaSummary: session.orgName || ''
+    };
+    let modelNotice = '';
+    try {
+      const list = await fetchModels(provider, '');
+      if (!list.includes(provider.model)) provider.model = list[0] || '';
+      provider.models = list.map((mid: string): ModelSpec =>
+        provider.models?.find((m: ModelSpec): boolean => m.id === mid) || defaultModelSpec(mid));
+      if (!list.length) modelNotice = '账号没有返回可用模型';
+    } catch (_) { modelNotice = '可在「模型」中重试获取账号模型'; }
+    const updated = await this.onApply(provider, '', false, true);
+    this.localProviders = updated.slice();
+    this.localActiveId = provider.id;
+    if (this.pageMode === 'detail') {
+      this.selectProvider(provider);
+      this.notice = modelNotice || '已连接 OpenCode Go 账号';
+    }
+    return provider;
+  }
+
+  private async createProviderFromSheet(provider: Provider, apiKey: string): Promise<void> {
+    const updated = await this.onApply(provider, apiKey, false, false);
+    this.localProviders = updated.slice();
+    this.notice = `已添加 ${provider.name}`;
   }
 
   private reuseSecret(): boolean {
@@ -226,113 +257,24 @@ export struct ProviderEditor {
     return 'vertex';
   }
 
-  private strategyLabel(s: KeyRotationStrategy): string {
-    if (s === 'priority') return '优先级';
-    if (s === 'least_used') return '最少使用';
-    if (s === 'random') return '随机';
-    return '轮询';
-  }
-
-  private async formProvider(): Promise<Provider> {
+  private formProvider(): Provider {
     if (!this.labelText.trim()) throw new Error('请填写服务商名称');
-    const cleanBody = this.customBodyJson.trim();
-    if (cleanBody.length > 0) {
-      try {
-        const parsed = JSON.parse(cleanBody) as Object;
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          throw new Error('自定义 JSON 请求体必须是 JSON 对象，例如 {"seed": 42}');
-        }
-      } catch (err) {
-        throw new Error('自定义 JSON 请求体格式无效，请检查语法');
-      }
-    }
-    const headersToSave = this.customHeaders.slice();
-    if (this.newHeaderKey.trim()) {
-      headersToSave.push({ key: this.newHeaderKey.trim(), value: this.newHeaderVal });
-      this.customHeaders = headersToSave;
-      this.newHeaderKey = '';
-      this.newHeaderVal = '';
-    }
-    let passRef = this.existingProxyPassRef;
-    if (this.proxyPass.trim()) {
-      passRef = newId();
-      await storeKey(passRef, this.proxyPass.trim());
-    }
-    const proxyCfg: ProxyConfig | undefined = this.proxyHost.trim() ? {
-      enabled: this.proxyEnabled,
-      host: this.proxyHost.trim(),
-      port: Number(this.proxyPortText) || 7890,
-      username: this.proxyUser.trim() || undefined,
-      passwordRef: passRef || undefined
-    } : undefined;
-
     const models = this.savedModels.map((m: ModelSpec): ModelSpec => cloneModelSpec(m));
     if (this.modelId.trim() && !models.some((m: ModelSpec): boolean => m.id === this.modelId.trim())) {
       models.unshift(defaultModelSpec(this.modelId.trim()));
     }
-    return {
-      id: this.selectedId,
-      name: this.labelText.trim(),
-      family: this.family,
-      baseUrl: checkEndpoint(this.endpoint),
-      chatPath: this.chatPath.trim(),
-      model: this.modelId.trim(),
-      secretRef: this.original.secretRef,
-      models,
-      apiKeys: this.extraKeys.slice(),
-      keyStrategy: this.keyStrategy,
-      groupName: this.groupName.trim(),
-      proxy: proxyCfg,
-      customHeaders: headersToSave,
-      customBodyJson: cleanBody,
-      promptCaching: this.promptCaching,
-      sendConversationCacheKey: this.sendConvCacheKey,
-      balanceUrl: this.balanceUrl.trim(),
-      lastBalance: this.balanceResult,
-      builtinSearch: this.builtinSearch,
-      builtinUrlContext: this.builtinUrlContext,
-      builtinCodeExec: this.builtinCodeExec,
-      oauth: this.original.oauth,
-      enabled: this.provEnabled
-    };
-  }
-
-  private async addExtraKey(): Promise<void> {
-    if (!this.extraKeySecret.trim()) return;
-    const ref = newId();
-    await storeKey(ref, this.extraKeySecret.trim());
-    const item: ApiKeyEntry = {
-      id: newId(),
-      label: this.extraKeyLabel.trim() || ('Key ' + (this.extraKeys.length + 1)),
-      secretRef: ref,
-      priority: this.extraKeys.length,
-      usageCount: 0,
-      errorCount: 0,
-      disabledUntil: 0
-    };
-    this.extraKeys = [...this.extraKeys, item];
-    this.extraKeyLabel = '';
-    this.extraKeySecret = '';
-  }
-
-  private async removeExtraKey(item: ApiKeyEntry): Promise<void> {
-    await forgetKey(item.secretRef).catch(() => {});
-    this.extraKeys = this.extraKeys.filter((k: ApiKeyEntry): boolean => k.id !== item.id);
-  }
-
-  private resetKeyCooldowns(): void {
-    this.extraKeys = this.extraKeys.map((k: ApiKeyEntry): ApiKeyEntry => {
-      return {
-        id: k.id,
-        label: k.label,
-        secretRef: k.secretRef,
-        priority: k.priority,
-        usageCount: k.usageCount,
-        errorCount: 0,
-        disabledUntil: 0
-      };
-    });
-    this.notice = '已重置备用密钥冷却状态';
+    const provider = cloneProvider(this.original);
+    provider.name = this.labelText.trim();
+    provider.family = this.family;
+    provider.baseUrl = checkEndpoint(this.endpoint);
+    provider.chatPath = this.chatPath.trim();
+    provider.model = this.modelId.trim();
+    provider.models = models;
+    provider.groupName = this.groupName.trim();
+    provider.sendConversationCacheKey = this.sendConvCacheKey;
+    provider.lastBalance = this.balanceResult;
+    provider.enabled = this.provEnabled;
+    return provider;
   }
 
   private toggleSavedModel(id: string): void {
@@ -485,7 +427,7 @@ export struct ProviderEditor {
     }
     this.savedModels = next;
     this.modelsRev += 1;
-    this.activeTab = 1;
+    this.activeTab = 'models';
     if (this.labelText.trim().length > 0 && this.endpoint.trim().length > 0) {
       this.submitForm(false);
     }
@@ -510,9 +452,9 @@ export struct ProviderEditor {
     if (this.busy) return;
     this.busy = true;
     try {
-      const form = await this.formProvider();
+      const form = this.formProvider();
       const key = this.reuseSecret() ? await readKey(this.original.secretRef) : this.keyInput.trim();
-      const pass = this.proxyPass.trim() || (this.existingProxyPassRef ? await readKey(this.existingProxyPassRef) : '');
+      const pass = form.proxy?.passwordRef ? await readKey(form.proxy.passwordRef) : '';
       this.balanceResult = await fetchProviderBalance(form, key, pass);
       this.notice = '余额已更新: ' + this.balanceResult;
     } catch (e) {
@@ -537,12 +479,12 @@ export struct ProviderEditor {
     }
   }
 
-  async importProvider(scan: boolean, rawText?: string): Promise<void> {
+  async importProvider(scan: boolean): Promise<void> {
     if (this.busy) return;
     this.busy = true;
     this.importError = '';
     try {
-      let link = rawText !== undefined ? rawText : this.linkInput;
+      let link = this.importText;
       if (scan) {
         const result = await scanBarcode.startScanForResult(this.getUIContext().getHostContext() as common.UIAbilityContext,
           { scanTypes: [scanCore.ScanType.QR_CODE], enableAlbum: true });
@@ -557,12 +499,6 @@ export struct ProviderEditor {
       this.showImportSheet = false;
       this.importText = '';
       this.importError = '';
-      this.linkInput = '';
-      this.moreOptions = false;
-      this.activeTab = 0;
-      if (this.pageMode === 'detail') {
-        this.onClose();
-      }
       this.notice = `已导入 ${imported.length} 个供应商并保存`;
     } catch (e) {
       const msg = (e as Error).message || '读取配置码失败';
@@ -577,7 +513,7 @@ export struct ProviderEditor {
     if (this.shareCode) { this.shareCode = ''; return; }
     this.busy = true;
     try {
-      const form = await this.formProvider();
+      const form = this.formProvider();
       const key = this.reuseSecret() ? await readKey(this.original.secretRef) : this.keyInput.trim();
       this.shareCode = toProviderLink(form, key);
     } catch (e) { this.notice = (e as Error).message || '无法生成配置码'; }
@@ -589,9 +525,9 @@ export struct ProviderEditor {
     this.busy = true;
     this.notice = '';
     try {
-      const form = await this.formProvider();
+      const form = this.formProvider();
       const key = this.reuseSecret() ? await readKey(this.original.secretRef) : this.keyInput.trim();
-      const pass = this.proxyPass.trim() || (this.existingProxyPassRef ? await readKey(this.existingProxyPassRef) : '');
+      const pass = form.proxy?.passwordRef ? await readKey(form.proxy.passwordRef) : '';
       this.modelChoices = await fetchModels(form, key, pass);
       this.notice = this.modelChoices.length ? '已获取 ' + this.modelChoices.length + ' 个模型' : '列表为空，可手动填写模型 ID';
     } catch (e) { this.notice = (e as Error).message || '无法获取模型列表'; }
@@ -604,10 +540,10 @@ export struct ProviderEditor {
     this.healthResult = '正在检测连通性...';
     this.notice = '';
     try {
-      const form = await this.formProvider();
+      const form = this.formProvider();
       const reuse = this.reuseSecret();
       const key = reuse ? await readKey(this.original.secretRef) : this.keyInput.trim();
-      const pass = this.proxyPass.trim() || (this.existingProxyPassRef ? await readKey(this.existingProxyPassRef) : '');
+      const pass = form.proxy?.passwordRef ? await readKey(form.proxy.passwordRef) : '';
       const ms = await checkProviderHealth(form, key, form.model, pass);
       this.healthResult = `连接正常 · ${ms}ms`;
       this.notice = this.healthResult;
@@ -625,7 +561,7 @@ export struct ProviderEditor {
     this.busy = true;
     this.notice = '';
     try {
-      const form = await this.formProvider();
+      const form = this.formProvider();
       const reuse = this.reuseSecret();
       const updated = await this.onApply(form, this.keyInput.trim(), reuse, setActive);
       this.localProviders = updated.slice();
@@ -633,8 +569,6 @@ export struct ProviderEditor {
       if (saved) {
         this.original = saved;
         this.clearSecret = false;
-        this.existingProxyPassRef = saved.proxy?.passwordRef || '';
-        this.proxyPass = '';
       }
       if (setActive) {
         this.localActiveId = form.id;
@@ -690,7 +624,7 @@ export struct ProviderEditor {
     Text(name).fontSize(13).fontWeight(FontWeight.Medium).fontColor($r('app.color.muted'))
   }
 
-  private setActiveTab(tab: number): void {
+  private setActiveTab(tab: 'config' | 'models'): void {
     this.activeTab = tab;
     try {
       this.detailScroller.scrollTo({ xOffset: 0, yOffset: 0 });
@@ -717,7 +651,7 @@ export struct ProviderEditor {
             this.onDeleteProvider(this.selectedId).then((updated: Provider[]) => {
               this.localProviders = updated.slice();
               this.onClose();
-            });
+            }).catch((e: Error) => { this.notice = e.message; });
           }
         },
         onRightAction: () => {
@@ -745,7 +679,7 @@ export struct ProviderEditor {
           this.showImportSheet = true;
         },
         onRightAction: () => {
-          this.onOpenDetail('', 0);
+          this.showAddSheet = true;
         }
       })
     }
@@ -823,7 +757,7 @@ export struct ProviderEditor {
                           .borderRadius(8)
                       }
                     }
-                    Text(`${this.familyLabel(p.family)} · ${this.providerModelCount(p)} 个模型${p.secretRef ? ' · 已配密钥' : ''}`)
+                    Text(`${this.familyLabel(p.family)} · ${this.providerModelCount(p)} 个模型${p.secretRef ? ' · 已配密钥' : (p.oauth ? ' · 已登录' : '')}`)
                       .fontSize(11)
                       .fontColor($r('app.color.muted'))
                       .maxLines(1)
@@ -841,7 +775,7 @@ export struct ProviderEditor {
                 .width('100%')
                 .padding({ left: 14, right: 14, top: 12, bottom: 12 })
                 .onClick(() => {
-                  this.onOpenDetail(p.id, 0);
+                  this.onOpenDetail(p.id);
                 })
 
                 if (idx < this.filteredProviders().length - 1) {
@@ -870,18 +804,6 @@ export struct ProviderEditor {
                 this.importError = '';
                 this.showImportSheet = true;
               })
-            Button('OAuth 登录')
-              .type(ButtonType.Normal)
-              .layoutWeight(1)
-              .height(40)
-              .fontSize(13)
-              .borderRadius(12)
-              .backgroundColor($r('app.color.tint'))
-              .fontColor($r('app.color.accent'))
-              .onClick(() => {
-                const targetId = this.localActiveId || (this.localProviders.length > 0 ? this.localProviders[0].id : '');
-                this.onOpenDetail(targetId, 2);
-              })
           }
           .width('100%')
         }
@@ -903,22 +825,23 @@ export struct ProviderEditor {
         Column({ space: 10 }) {
           Row({ space: 6 }) {
             Button('配置').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
-              .backgroundColor(this.activeTab === 0 ? $r('app.color.accent') : $r('app.color.surface'))
-              .fontColor(this.activeTab === 0 ? $r('app.color.on_accent') : $r('app.color.ink'))
-              .onClick(() => { this.setActiveTab(0); })
+              .backgroundColor(this.activeTab === 'config' ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.activeTab === 'config' ? $r('app.color.on_accent') : $r('app.color.ink'))
+              .onClick(() => { this.setActiveTab('config'); })
             Button('模型').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
-              .backgroundColor(this.activeTab === 1 ? $r('app.color.accent') : $r('app.color.surface'))
-              .fontColor(this.activeTab === 1 ? $r('app.color.on_accent') : $r('app.color.ink'))
-              .onClick(() => { this.setActiveTab(1); })
-            Button('高级与OAuth').layoutWeight(1).height(34).fontSize(12).borderRadius(17)
-              .backgroundColor(this.activeTab === 2 ? $r('app.color.accent') : $r('app.color.surface'))
-              .fontColor(this.activeTab === 2 ? $r('app.color.on_accent') : $r('app.color.ink'))
-              .onClick(() => { this.setActiveTab(2); })
+              .backgroundColor(this.activeTab === 'models' ? $r('app.color.accent') : $r('app.color.surface'))
+              .fontColor(this.activeTab === 'models' ? $r('app.color.on_accent') : $r('app.color.ink'))
+              .onClick(() => { this.setActiveTab('models'); })
           }
           .padding({ bottom: 4 })
           .width('100%')
 
-          if (this.activeTab === 0) {
+          if (this.activeTab === 'config') {
+            if (!this.initialProviderId && !this.labelText && !this.endpoint && !this.keyInput) {
+              Button('使用 OpenCode Go 预设').height(36).fontSize(13)
+                .backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
+                .onClick(() => { this.selectProvider(openCodeGoPreset(this.selectedId)); })
+            }
             Row({ space: 12 }) {
               KelivoAvatarBadge({
                 brandId: resolveBrandIconId(this.labelText, this.family),
@@ -946,6 +869,42 @@ export struct ProviderEditor {
             .borderRadius(14)
             .backgroundColor($r('app.color.surface'))
 
+            if (planClientId(this.original) || this.endpoint === CHATGPT_PLAN_API || (!this.endpoint && !this.initialProviderId)) {
+              ChatGptPlanLogin({
+                clientId: planClientId(this.original),
+                accountLabel: planClientId(this.original) ? this.original.oauth?.accountEmail || '' : '',
+                onConnected: async (session: PlanSession): Promise<void> => {
+                  await this.connectChatGpt(session);
+                }
+              })
+            }
+            if (openCodeGoSessionId(this.original) || isOpenCodeGoEndpoint(this.endpoint)) {
+              OpenCodeGoPlanLogin({
+                sessionId: openCodeGoSessionId(this.original),
+                accountLabel: openCodeGoSessionId(this.original) ? this.original.oauth?.accountEmail || '' : '',
+                workspaceLabel: openCodeGoSessionId(this.original) ? this.original.oauth?.quotaSummary || '' : '',
+                onConnected: async (session: OpenCodeGoSession): Promise<void> => {
+                  await this.connectOpenCodeGo(session);
+                }
+              })
+            }
+            if (isOpenCodeGoEndpoint(this.endpoint)) {
+              OpenCodeGoQuota({
+                oauthSessionId: openCodeGoSessionId(this.original),
+                savedKeyRef: !this.clearSecret && isOpenCodeGoEndpoint(this.original.baseUrl) ? this.original.secretRef : '',
+                draftKey: this.keyInput,
+                proxy: this.original.proxy
+              })
+            } else if (providerBalanceUrl(this.endpoint, this.original.balanceUrl)) {
+              Row({ space: 8 }) {
+                Text(this.balanceResult ? '最近余额  ' + this.balanceResult : '账户余额')
+                  .layoutWeight(1).fontSize(14).fontColor($r('app.color.ink'))
+                Button('查余额').height(32).fontSize(12)
+                  .backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
+                  .onClick(() => { this.queryBalance(); })
+              }.width('100%').padding(12).borderRadius(14).backgroundColor($r('app.color.surface'))
+            }
+
             Row({ space: 8 }) {
               Column({ space: 4 }) {
                 this.caption('名称')
@@ -961,77 +920,79 @@ export struct ProviderEditor {
               }.layoutWeight(1).alignItems(HorizontalAlign.Start)
             }.width('100%')
 
-            this.caption('接口协议')
-            Select([
-              { value: 'OpenAI Chat' },
-              { value: 'OpenAI Responses' },
-              { value: 'Anthropic Messages' },
-              { value: 'Google Gemini' },
-              { value: 'Google Vertex AI' }
-            ]).value(this.familyLabel(this.family))
-              .onSelect((i: number) => { this.family = this.familyFromIndex(i); this.modelChoices = []; })
-              .menuSystemMaterial(ImmersiveMaterialStyle.selectMenuMaterial(this.immersiveLightEnabled))
-              .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+            if (!planClientId(this.original) && !openCodeGoSessionId(this.original)) {
+              this.caption('接口协议')
+              Select([
+                { value: 'OpenAI Chat' },
+                { value: 'OpenAI Responses' },
+                { value: 'Anthropic Messages' },
+                { value: 'Google Gemini' },
+                { value: 'Google Vertex AI' }
+              ]).value(this.familyLabel(this.family))
+                .onSelect((i: number) => { this.family = this.familyFromIndex(i); this.modelChoices = []; })
+                .menuSystemMaterial(ImmersiveMaterialStyle.selectMenuMaterial(this.immersiveLightEnabled))
+                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
 
-            if (this.family === 'openai' || this.family === 'openai-responses') {
-              Row() {
-                Column({ space: 2 }) {
-                  Text('Response API (/responses)').fontSize(14).fontColor($r('app.color.ink'))
-                  Text('开启后改用 OpenAI Responses 协议端点').fontSize(11).fontColor($r('app.color.muted'))
-                }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-                Toggle({ type: ToggleType.Switch, isOn: this.family === 'openai-responses' })
-                  .selectedColor($r('app.color.accent'))
-                  .onChange((v: boolean) => {
-                    this.family = v ? 'openai-responses' : 'openai';
-                  })
-                  .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-              }
-              .width('100%')
-              .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-              .borderRadius(12)
-              .backgroundColor($r('app.color.surface'))
-
-              Row() {
-                Column({ space: 2 }) {
-                  Text('发送会话缓存键 (prompt_cache_key)').fontSize(14).fontColor($r('app.color.ink'))
-                  Text('附带当前会话 ID，提高上下文缓存命中率').fontSize(11).fontColor($r('app.color.muted'))
-                }.alignItems(HorizontalAlign.Start).layoutWeight(1)
-                Toggle({ type: ToggleType.Switch, isOn: this.sendConvCacheKey })
-                  .selectedColor($r('app.color.accent'))
-                  .onChange((v: boolean) => { this.sendConvCacheKey = v; })
-                  .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-              }
-              .width('100%')
-              .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-              .borderRadius(12)
-              .backgroundColor($r('app.color.surface'))
-            }
-
-            this.caption('API 基础地址')
-            TextInput({ text: this.endpoint, placeholder: 'https://example.com/v1' }).id('baseUrl')
-              .backgroundColor($r('app.color.surface'))
-              .onChange((v: string) => { this.endpoint = v; this.modelChoices = []; })
-            if (this.requestUrlPreview()) {
-              Text('Request URL: ' + this.requestUrlPreview())
-                .fontSize(11)
-                .fontColor($r('app.color.muted'))
-                .copyOption(CopyOptions.LocalDevice)
-            }
-
-            if (this.family !== 'gemini' && this.family !== 'vertex') {
-              this.caption('API Path（可留空使用默认路径）')
-              TextInput({ text: this.chatPath, placeholder: this.defaultChatPath() })
+              if (this.family === 'openai' || this.family === 'openai-responses') {
+                Row() {
+                  Column({ space: 2 }) {
+                    Text('Response API (/responses)').fontSize(14).fontColor($r('app.color.ink'))
+                    Text('开启后改用 OpenAI Responses 协议端点').fontSize(11).fontColor($r('app.color.muted'))
+                  }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                  Toggle({ type: ToggleType.Switch, isOn: this.family === 'openai-responses' })
+                    .selectedColor($r('app.color.accent'))
+                    .onChange((v: boolean) => {
+                      this.family = v ? 'openai-responses' : 'openai';
+                    })
+                    .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+                }
+                .width('100%')
+                .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+                .borderRadius(12)
                 .backgroundColor($r('app.color.surface'))
-                .onChange((v: string) => { this.chatPath = v; })
-            }
 
-            this.caption('主 API 密钥')
-            TextInput({ text: this.keyInput, placeholder: this.original.secretRef && !this.clearSecret ? '已安全保存，输入可替换' : '输入密钥，本地服务可留空' })
-              .id('apiKey').type(InputType.Password).backgroundColor($r('app.color.surface'))
-              .onChange((v: string) => { this.keyInput = v; })
-            if (this.original.secretRef) {
-              Button(this.clearSecret ? '撤销移除密钥' : '移除已存密钥').backgroundColor(Color.Transparent)
-                .fontColor($r('app.color.muted')).onClick(() => { this.clearSecret = !this.clearSecret; this.keyInput = ''; })
+                Row() {
+                  Column({ space: 2 }) {
+                    Text('发送会话缓存键 (prompt_cache_key)').fontSize(14).fontColor($r('app.color.ink'))
+                    Text('附带当前会话 ID，提高上下文缓存命中率').fontSize(11).fontColor($r('app.color.muted'))
+                  }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                  Toggle({ type: ToggleType.Switch, isOn: this.sendConvCacheKey })
+                    .selectedColor($r('app.color.accent'))
+                    .onChange((v: boolean) => { this.sendConvCacheKey = v; })
+                    .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
+                }
+                .width('100%')
+                .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+                .borderRadius(12)
+                .backgroundColor($r('app.color.surface'))
+              }
+
+              this.caption('API 基础地址')
+              TextInput({ text: this.endpoint, placeholder: 'https://example.com/v1' }).id('baseUrl')
+                .backgroundColor($r('app.color.surface'))
+                .onChange((v: string) => { this.endpoint = v; this.modelChoices = []; })
+              if (this.requestUrlPreview()) {
+                Text('Request URL: ' + this.requestUrlPreview())
+                  .fontSize(11)
+                  .fontColor($r('app.color.muted'))
+                  .copyOption(CopyOptions.LocalDevice)
+              }
+
+              if (this.family !== 'gemini' && this.family !== 'vertex') {
+                this.caption('API Path（可留空使用默认路径）')
+                TextInput({ text: this.chatPath, placeholder: this.defaultChatPath() })
+                  .backgroundColor($r('app.color.surface'))
+                  .onChange((v: string) => { this.chatPath = v; })
+              }
+
+              this.caption('主 API 密钥')
+              TextInput({ text: this.keyInput, placeholder: this.original.secretRef && !this.clearSecret ? '已安全保存，输入可替换' : '输入密钥，本地服务可留空' })
+                .id('apiKey').type(InputType.Password).backgroundColor($r('app.color.surface'))
+                .onChange((v: string) => { this.keyInput = v; })
+              if (this.original.secretRef) {
+                Button(this.clearSecret ? '撤销移除密钥' : '移除已存密钥').backgroundColor(Color.Transparent)
+                  .fontColor($r('app.color.muted')).onClick(() => { this.clearSecret = !this.clearSecret; this.keyInput = ''; })
+              }
             }
 
             Row({ space: 8 }) {
@@ -1044,15 +1005,17 @@ export struct ProviderEditor {
                 .fontColor($r('app.color.accent'))
                 .layoutWeight(1)
                 .onClick(() => { this.testHealth(); })
-              Button(this.shareCode ? '收起分享码' : '分享配置码')
-                .type(ButtonType.Normal)
-                .height(36)
-                .fontSize(13)
-                .borderRadius(10)
-                .backgroundColor($r('app.color.surface'))
-                .fontColor($r('app.color.ink'))
-                .layoutWeight(1)
-                .onClick(() => { this.showCode(); })
+              if (!planClientId(this.original) && !openCodeGoSessionId(this.original)) {
+                Button(this.shareCode ? '收起分享码' : '分享配置码')
+                  .type(ButtonType.Normal)
+                  .height(36)
+                  .fontSize(13)
+                  .borderRadius(10)
+                  .backgroundColor($r('app.color.surface'))
+                  .fontColor($r('app.color.ink'))
+                  .layoutWeight(1)
+                  .onClick(() => { this.showCode(); })
+              }
             }.width('100%')
 
             if (this.healthResult) {
@@ -1071,7 +1034,7 @@ export struct ProviderEditor {
               .backgroundColor($r('app.color.surface'))
               .alignItems(HorizontalAlign.Center)
             }
-          } else if (this.activeTab === 1) {
+          } else {
             this.caption('当前使用模型 ID')
             TextInput({ text: this.modelId, placeholder: '输入服务商提供的模型 ID' }).id('modelId')
               .backgroundColor($r('app.color.surface'))
@@ -1166,164 +1129,7 @@ export struct ProviderEditor {
                 }.width('100%').padding(10).borderRadius(12).backgroundColor($r('app.color.surface'))
               }, (ms: ModelSpec, idx: number) => this.modelsRev + '-' + ms.id + '-' + ms.displayName + '-' + idx + '-' + ms.vision + '-' + ms.tools + '-' + ms.reasoning + '-' + ms.imageGen)
             }
-          } else {
-            this.caption('多 API Key 负载均衡池')
-            Row({ space: 8 }) {
-              Text('轮换策略').fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
-              Select([{ value: '轮询' }, { value: '优先级' }, { value: '最少使用' }, { value: '随机' }])
-                .value(this.strategyLabel(this.keyStrategy))
-                .onSelect((idx: number) => {
-                  const arr: KeyRotationStrategy[] = ['round_robin', 'priority', 'least_used', 'random'];
-                  this.keyStrategy = arr[idx] || 'round_robin';
-                })
-                .menuSystemMaterial(ImmersiveMaterialStyle.selectMenuMaterial(this.immersiveLightEnabled))
-                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-            }.width('100%')
-            Row({ space: 6 }) {
-              TextInput({ text: this.extraKeyLabel, placeholder: '备注名称' }).layoutWeight(1)
-                .backgroundColor($r('app.color.surface'))
-                .onChange((v: string) => { this.extraKeyLabel = v; })
-              TextInput({ text: this.extraKeySecret, placeholder: '备用 API Key' }).type(InputType.Password).layoutWeight(2)
-                .backgroundColor($r('app.color.surface'))
-                .onChange((v: string) => { this.extraKeySecret = v; })
-              Button('添加').height(36).backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-                .onClick(() => { this.addExtraKey(); })
-            }.width('100%')
-            ForEach(this.extraKeys, (ak: ApiKeyEntry) => {
-              Row({ space: 8 }) {
-                Column({ space: 2 }) {
-                  Text(ak.label).fontSize(13).fontWeight(FontWeight.Medium).fontColor($r('app.color.ink'))
-                  Text('已用 ' + ak.usageCount + ' 次 · 错误 ' + ak.errorCount + (ak.disabledUntil > Date.now() ? ' · 冷却中' : ''))
-                    .fontSize(11).fontColor($r('app.color.muted'))
-                }.layoutWeight(1).alignItems(HorizontalAlign.Start)
-                Button('删除').height(28).fontSize(11).backgroundColor(Color.Transparent).fontColor($r('app.color.warning'))
-                  .onClick(() => { this.removeExtraKey(ak); })
-              }.width('100%').padding(10).borderRadius(10).backgroundColor($r('app.color.surface'))
-            }, (ak: ApiKeyEntry) => ak.id + '-' + ak.errorCount + '-' + ak.disabledUntil)
-            if (this.extraKeys.length) {
-              Button('重置异常冷却').height(30).fontSize(12).backgroundColor($r('app.color.panel')).fontColor($r('app.color.ink'))
-                .onClick(() => this.resetKeyCooldowns())
-            }
 
-            Divider().color($r('app.color.line'))
-            this.caption('HTTP 代理（按服务商独立生效）')
-            Row() {
-              Text('启用代理').fontSize(14).fontColor($r('app.color.ink')).layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.proxyEnabled }).selectedColor($r('app.color.accent'))
-                .onChange((v: boolean) => { this.proxyEnabled = v; })
-                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-            }.width('100%')
-            if (this.proxyEnabled) {
-              Row({ space: 8 }) {
-                TextInput({ text: this.proxyHost, placeholder: '主机如 127.0.0.1' }).layoutWeight(2)
-                  .backgroundColor($r('app.color.surface'))
-                  .onChange((v: string) => { this.proxyHost = v; })
-                TextInput({ text: this.proxyPortText, placeholder: '端口' }).type(InputType.Number).layoutWeight(1)
-                  .backgroundColor($r('app.color.surface'))
-                  .onChange((v: string) => { this.proxyPortText = v; })
-              }.width('100%')
-              Row({ space: 8 }) {
-                TextInput({ text: this.proxyUser, placeholder: '用户名（可选）' }).layoutWeight(1)
-                  .backgroundColor($r('app.color.surface'))
-                  .onChange((v: string) => { this.proxyUser = v; })
-                TextInput({ text: this.proxyPass, placeholder: '密码（可选）' }).type(InputType.Password).layoutWeight(1)
-                  .backgroundColor($r('app.color.surface'))
-                  .onChange((v: string) => { this.proxyPass = v; })
-              }.width('100%')
-            }
-
-            Divider().color($r('app.color.line'))
-            this.caption('供应商内置功能与自定义请求')
-            Row() {
-              Text('Claude 提示词缓存').fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.promptCaching }).selectedColor($r('app.color.accent'))
-                .onChange((v: boolean) => { this.promptCaching = v; })
-                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-            }.width('100%')
-            Row() {
-              Text('默认启用模型内置搜索（支持主流服务商）').fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.builtinSearch }).selectedColor($r('app.color.accent'))
-                .onChange((v: boolean) => { this.builtinSearch = v; })
-                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-            }.width('100%')
-            Row() {
-              Text('内置 URL 上下文（Gemini）').fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.builtinUrlContext }).selectedColor($r('app.color.accent'))
-                .onChange((v: boolean) => { this.builtinUrlContext = v; })
-                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-            }.width('100%')
-            Row() {
-              Text('内置代码执行（Gemini）').fontSize(13).fontColor($r('app.color.ink')).layoutWeight(1)
-              Toggle({ type: ToggleType.Switch, isOn: this.builtinCodeExec }).selectedColor($r('app.color.accent'))
-                .onChange((v: boolean) => { this.builtinCodeExec = v; })
-                .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-            }.width('100%')
-
-            Row({ space: 6 }) {
-              TextInput({ text: this.newHeaderKey, placeholder: 'Header 名' }).layoutWeight(1)
-                .backgroundColor($r('app.color.surface'))
-                .onChange((v: string) => { this.newHeaderKey = v; })
-              TextInput({ text: this.newHeaderVal, placeholder: 'Header 值' }).layoutWeight(1)
-                .backgroundColor($r('app.color.surface'))
-                .onChange((v: string) => { this.newHeaderVal = v; })
-              Button('+').height(36).backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-                .onClick(() => {
-                  if (this.newHeaderKey.trim()) {
-                    this.customHeaders = [...this.customHeaders, { key: this.newHeaderKey.trim(), value: this.newHeaderVal }];
-                    this.newHeaderKey = ''; this.newHeaderVal = '';
-                  }
-                })
-            }.width('100%')
-            ForEach(this.customHeaders, (hd: HeaderEntry, hi: number) => {
-              Row() {
-                Text(hd.key + ': ' + hd.value).fontSize(12).fontColor($r('app.color.muted')).layoutWeight(1)
-                Button('删').height(24).fontSize(11).backgroundColor(Color.Transparent).fontColor($r('app.color.warning'))
-                  .onClick(() => { this.customHeaders = this.customHeaders.filter((_h: HeaderEntry, idx: number): boolean => idx !== hi); })
-              }.width('100%')
-            }, (hd: HeaderEntry, hi: number) => hi + hd.key)
-
-            TextArea({ text: this.customBodyJson, placeholder: '自定义 JSON 请求体覆写（例如 {"seed": 42}）' })
-              .height(72).backgroundColor($r('app.color.surface')).onChange((v: string) => { this.customBodyJson = v; })
-
-            Row({ space: 8 }) {
-              TextInput({ text: this.balanceUrl, placeholder: '余额查询地址（DeepSeek/SiliconFlow/OpenRouter 可留空）' })
-                .layoutWeight(1).backgroundColor($r('app.color.surface')).onChange((v: string) => { this.balanceUrl = v; })
-              Button('查余额').height(36).backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-                .onClick(() => { this.queryBalance(); })
-            }.width('100%')
-            if (this.balanceResult) {
-              Text('最近查询: ' + this.balanceResult).fontSize(12).fontColor($r('app.color.accent'))
-            }
-
-            Divider().color($r('app.color.line'))
-            this.caption('订阅账号登录（OAuth）')
-            Row({ space: 6 }) {
-              ForEach(['chatgpt', 'grok', 'kimi', 'claude'] as OAuthProviderKind[], (okind: OAuthProviderKind) => {
-                Button(okind.toUpperCase()).layoutWeight(1).height(34).fontSize(11)
-                  .backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-                  .onClick(() => this.onStartOAuth(okind))
-              }, (okind: OAuthProviderKind) => okind)
-            }.width('100%')
-
-            Button(this.moreOptions ? '收起配置码' : '导入或分享 Kelivo 配置码').backgroundColor(Color.Transparent)
-              .fontSize(14).fontColor($r('app.color.accent')).onClick(() => {
-                this.moreOptions = !this.moreOptions; this.shareCode = ''; this.linkInput = '';
-              })
-            if (this.moreOptions) {
-              TextInput({ text: this.linkInput, placeholder: '粘贴 ai-provider:v1: 配置码或 ChatBox JSON' })
-                .backgroundColor($r('app.color.surface'))
-                .onChange((v: string) => { this.linkInput = v; })
-              Row({ space: 8 }) {
-                Button('读取并导入').enabled(!!this.linkInput.trim()).onClick(() => { this.importProvider(false); })
-                Button('扫码导入').onClick(() => { this.importProvider(true); })
-              }
-              Button(this.shareCode ? '隐藏分享码' : '显示分享码（含密钥）').fontSize(14)
-                .backgroundColor($r('app.color.panel')).fontColor($r('app.color.ink')).onClick(() => { this.showCode(); })
-              if (this.shareCode) {
-                QRCode(this.shareCode).width(180).height(180).padding(8).backgroundColor(Color.White)
-                Text(this.shareCode).maxLines(2).fontSize(12).fontColor($r('app.color.muted')).copyOption(CopyOptions.LocalDevice)
-              }
-            }
           }
 
           if (this.notice) { Text(this.notice).fontSize(13).fontColor($r('app.color.accent')) }
@@ -1437,7 +1243,7 @@ export struct ProviderEditor {
           .fontColor($r('app.color.on_accent'))
           .enabled(!this.busy && this.importText.trim().length > 0)
           .onClick(() => {
-            this.importProvider(false, this.importText);
+            this.importProvider(false);
           })
       }
       .width('100%')
@@ -1446,29 +1252,64 @@ export struct ProviderEditor {
     .padding({ left: 16, right: 16, top: 4, bottom: 24 })
   }
 
+  @Builder
+  private addProviderSheetBuilder() {
+    AddProviderSheet({
+      onCreateProvider: (provider: Provider, apiKey: string) => this.createProviderFromSheet(provider, apiKey),
+      onConnectChatGpt: (session: PlanSession) => this.connectChatGpt(session),
+      onConnectOpenCodeGo: (session: OpenCodeGoSession) => this.connectOpenCodeGo(session),
+      onViewProviderDetail: (pid: string) => {
+        this.showAddSheet = false;
+        this.onOpenDetail(pid);
+      },
+      onClose: () => { this.showAddSheet = false; }
+    })
+  }
+
   build() {
     NavDestination() {
-      Column() {
-        if (this.pageMode === 'detail') {
-          this.detailView()
-        } else {
-          this.listView()
+      Stack() {
+        Column() {
+          if (this.pageMode === 'detail') {
+            this.detailView()
+          } else {
+            this.listView()
+          }
         }
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Color.Transparent)
+
+        Column()
+          .width(0)
+          .height(0)
+          .bindSheet(
+            $$this.showImportSheet,
+            this.importProviderSheet(),
+            ImmersiveMaterialStyle.sheetOptions(
+              this.immersiveLightEnabled,
+              this.themeSurfaceHex,
+              '导入供应商',
+              () => { this.showImportSheet = false; },
+              true
+            )
+          )
+
+        Column()
+          .width(0)
+          .height(0)
+          .bindSheet(
+            $$this.showAddSheet,
+            this.addProviderSheetBuilder(),
+            ImmersiveMaterialStyle.addProviderSheetOptions(
+              this.immersiveLightEnabled,
+              this.themeCanvasHex,
+              () => { this.showAddSheet = false; }
+            )
+          )
       }
       .width('100%')
       .height('100%')
-      .backgroundColor(Color.Transparent)
-      .bindSheet(
-        $$this.showImportSheet,
-        this.importProviderSheet(),
-        ImmersiveMaterialStyle.sheetOptions(
-          this.immersiveLightEnabled,
-          this.themeSurfaceHex,
-          '导入供应商',
-          () => { this.showImportSheet = false; },
-          true
-        )
-      )
     }
     .hideBackButton(true)
     .backgroundColor(this.themeCanvasHex)

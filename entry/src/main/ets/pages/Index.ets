@@ -22,7 +22,6 @@ import {
   MemorySettings,
   ModelDefaults,
   ModelSpec,
-  OAuthProviderKind,
   Persona,
   Provider,
   ProxyConfig,
@@ -68,7 +67,9 @@ import {
   normalizeProxyConfig,
   normalizeQuickPhrases,
   normalizeWorldBooks,
+  openCodeGoSessionId,
   preset,
+  planClientId,
   resolveActiveModel
 } from '../core/Models';
 import { ReasoningControl, effectiveEffort, reasoningBulbRayCount, reasoningControl, reasoningTokens, withReasoning } from '../core/Reasoning';
@@ -140,6 +141,8 @@ import {
 } from '../core/BuiltinSearch';
 import { MessageBody } from '../components/MessageBody';
 import { PersonaEditor } from '../components/PersonaEditor';
+import { disconnectPlan } from '../core/ChatGptSession';
+import { disconnectOpenCodeGo } from '../core/OpenCodeGoSession';
 import { ProviderEditor } from '../components/ProviderEditor';
 import { ModelSpecEditor } from '../components/ModelSpecEditor';
 import { SearchEditor } from '../components/SearchEditor';
@@ -163,7 +166,6 @@ import { BottomToolsSheet } from '../components/BottomToolsSheet';
 import { ChatListSheet } from '../components/ChatListSheet';
 import { ModelSelectSheet } from '../components/ModelSelectSheet';
 import { ChatToolsSheet, ReasoningLevelSheet, SearchQuickSheet, reasoningBulbResource } from '../components/ChatQuickSheets';
-import { OAuthLoginSheet } from '../components/OAuthLoginSheet';
 import { WorkspacePanel } from '../components/WorkspacePanel';
 import { SkillsPanel } from '../components/SkillsPanel';
 import { NetworkProxyPanel } from '../components/NetworkProxyPanel';
@@ -283,8 +285,6 @@ struct Index {
   @State isSystemDark: boolean = false;
   @State filesDirPath: string = '';
   @State dbDirPath: string = '';
-  @State oauthModalVisible: boolean = false;
-  @State oauthKind: OAuthProviderKind = 'chatgpt';
   @State sidePanelMode: '' | 'browser' | 'workspace' = '';
   @State wideSide: boolean = false;
   @State askQuestionText: string = '';
@@ -298,9 +298,7 @@ struct Index {
   @State drawerUserNameDraft: string = '';
   @State promptTabInit: number = 0;
   @State diagTabInit: number = 0;
-  @State providerOpenProxy: boolean = false;
   @State providerDetailId: string = '';
-  @State providerDetailTab: number = 0;
   @State modelEditProvider: Provider = preset('', '', 'openai', '', '');
   @State modelEditSpec: ModelSpec = defaultModelSpec('');
   @State modelEditIsNew: boolean = false;
@@ -687,12 +685,6 @@ struct Index {
   }
 
   private dismissTopOverlay(): boolean {
-    if (this.oauthModalVisible) {
-      SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-        this.oauthModalVisible = false;
-      });
-      return true;
-    }
     if (this.previewVisible) {
       SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
         this.previewVisible = false;
@@ -1533,6 +1525,8 @@ struct Index {
   async deleteProvider(id: string): Promise<Provider[]> {
     if (this.workspace.providers.length <= 1) return this.workspace.providers.slice();
     const target = this.workspace.providers.find((p: Provider): boolean => p.id === id);
+    if (target && planClientId(target)) await disconnectPlan(planClientId(target));
+    if (target && openCodeGoSessionId(target)) await disconnectOpenCodeGo(openCodeGoSessionId(target));
     if (target?.secretRef) await forgetKey(target.secretRef).catch(() => {});
     this.workspace.providers = this.workspace.providers.filter((p: Provider): boolean => p.id !== id);
     if (this.workspace.activeProvider === id) this.workspace.activeProvider = this.workspace.providers[0].id;
@@ -2461,7 +2455,6 @@ struct Index {
     const p = this.provider();
     const modelId = this.activeModelId();
     if (!modelId || !isProviderConfigured(p)) {
-      this.providerOpenProxy = false;
       this.navigateTo('providers');
       this.toast('请先配置模型服务和可用模型');
       return;
@@ -5439,7 +5432,6 @@ struct Index {
                     .backgroundColor($r('app.color.accent'))
                     .fontColor($r('app.color.on_accent'))
                     .onClick(() => {
-                      this.providerOpenProxy = false;
                       this.navigateTo('providers');
                     })
                   Button('选择模型')
@@ -5670,7 +5662,6 @@ struct Index {
       },
       onOpenProviders: () => {
         this.showModelQuickSheet = false;
-        this.providerOpenProxy = false;
         this.navigateTo('providers');
       }
     })
@@ -5773,7 +5764,6 @@ struct Index {
         },
         onOpenProviderSettings: () => {
           this.showSearchQuickSheet = false;
-          this.providerOpenProxy = false;
           this.navigateTo('providers');
         }
       })
@@ -6122,13 +6112,12 @@ struct Index {
   }
 
   @Builder
-  providerNavPage(pageMode: 'list' | 'detail', initialProviderId: string, initialTab: number) {
+  providerNavPage(pageMode: 'list' | 'detail', initialProviderId: string) {
     ProviderEditor({
       providers: this.workspace.providers,
       activeId: this.workspace.activeProvider,
       pageMode,
       initialProviderId,
-      initialTab,
       modelDefaults: this.workspace.modelDefaults || {
         chatProviderId: '', chatModelId: '', titleProviderId: '', titleModelId: '',
         translateProviderId: '', translateModelId: '', ocrProviderId: '', ocrModelId: '',
@@ -6137,15 +6126,8 @@ struct Index {
       onApply: (p: Provider, key: string, reuse: boolean, setActive: boolean) => this.applyProvider(p, key, reuse, setActive),
       onImportProviders: (items: ImportedProvider[]) => this.importProviders(items),
       onDeleteProvider: (id: string) => this.deleteProvider(id),
-      onStartOAuth: (kind: OAuthProviderKind) => {
-        this.oauthKind = kind;
-        SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-          this.oauthModalVisible = true;
-        });
-      },
-      onOpenDetail: (pid: string, tab: number) => {
+      onOpenDetail: (pid: string) => {
         this.providerDetailId = pid;
-        this.providerDetailTab = tab;
         this.navigateTo('provider_detail');
       },
       onOpenModelEditor: (
@@ -6206,9 +6188,9 @@ struct Index {
   @Builder
   routeDestination(name: string, _param: Object) {
     if (name === 'providers') {
-      this.providerNavPage(this.providerOpenProxy ? 'detail' : 'list', '', this.providerOpenProxy ? 2 : 0)
+      this.providerNavPage('list', '')
     } else if (name === 'provider_detail') {
-      this.providerNavPage('detail', this.providerDetailId, this.providerDetailTab)
+      this.providerNavPage('detail', this.providerDetailId)
     } else if (name === 'model_edit') {
       ModelSpecEditor({
         provider: this.modelEditProvider,
@@ -6523,10 +6505,8 @@ struct Index {
             this.refreshLogsAndStats().catch(() => {});
             this.navigateTo('diagnostics');
           } else if (route === 'providers') {
-            this.providerOpenProxy = false;
             this.navigateTo('providers');
           } else if (route === 'networkProxy' || route === 'providers_proxy') {
-            this.providerOpenProxy = false;
             this.navigateTo('networkProxy');
           } else if (route === 'quickPhrases') {
             this.promptTabInit = 2;
@@ -7169,34 +7149,6 @@ struct Index {
         .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
         .transition(SystemMotion.overlayModalTransition(this.reduceMotion))
       }
-      if (this.oauthModalVisible) {
-        Column() {
-          OAuthLoginSheet({
-            oauthKind: this.oauthKind,
-            providers: this.workspace.providers,
-            onConnected: async (prov: Provider) => {
-              const exists = this.workspace.providers.some((p: Provider): boolean => p.id === prov.id);
-              this.workspace.providers = exists
-                ? this.workspace.providers.map((p: Provider): Provider => (p.id === prov.id ? prov : p))
-                : [...this.workspace.providers, prov];
-              this.workspace.activeProvider = prov.id;
-              this.modelConfigTick += 1;
-              await this.persist();
-            },
-            onClose: () => {
-              SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-                this.oauthModalVisible = false;
-              });
-            }
-          })
-        }
-        .width('100%').height('100%')
-        .padding({ top: this.winTopInset, bottom: this.effectiveBottomInset(), left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(this.themeTokens().canvas)
-        .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-        .transition(SystemMotion.overlayModalTransition(this.reduceMotion))
-      }
-
       Column()
         .width(0)
         .height(0)

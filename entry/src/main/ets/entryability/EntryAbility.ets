@@ -5,6 +5,9 @@ import { backgroundGenerationManager } from '../core/BackgroundGeneration';
 import { publishIncomingOpenChatWant, publishIncomingShareWant } from '../core/SystemBridge';
 import { AppWindowController } from '../core/WindowController';
 
+import { initPlanStorage } from '../core/ChatGptSession';
+import { initOpenCodeGoStorage } from '../core/OpenCodeGoSession';
+
 const DOMAIN = 0x0000;
 
 export default class EntryAbility extends UIAbility {
@@ -12,6 +15,8 @@ export default class EntryAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onCreate');
+    initPlanStorage(this.context);
+    initOpenCodeGoStorage(this.context);
     backgroundGenerationManager.attachContext(this.context);
     AppStorage.setOrCreate('appInBackground', false);
     publishIncomingShareWant(want);

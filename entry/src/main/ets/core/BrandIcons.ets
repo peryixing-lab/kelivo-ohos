@@ -1,5 +1,6 @@
 export type BrandIconId =
   | 'openai'
+  | 'opencode'
   | 'gemini'
   | 'claude'
   | 'deepseek'
@@ -81,6 +82,9 @@ export function resolveBrandIconId(nameOrModelId: string, family?: string): Bran
   if (s.includes('mcp')) {
     return 'mcp';
   }
+  if (s.includes('opencode')) {
+    return 'opencode';
+  }
   if (
     s.includes('openai') ||
     s.includes('gpt') ||
@@ -96,6 +100,7 @@ export function resolveBrandIconId(nameOrModelId: string, family?: string): Bran
 export function isMonochromeBrandIcon(id: BrandIconId): boolean {
   return (
     id === 'openai' ||
+    id === 'opencode' ||
     id === 'openrouter' ||
     id === 'grok' ||
     id === 'ollama' ||

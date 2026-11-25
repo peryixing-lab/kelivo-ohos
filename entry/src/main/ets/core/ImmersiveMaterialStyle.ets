@@ -432,6 +432,28 @@ export class ImmersiveMaterialStyle {
     };
   }
 
+  static addProviderSheetOptions(
+    enabled: boolean,
+    canvasHex: string,
+    onDisappear: () => void
+  ): SheetOptions {
+    const options: SheetOptions = {
+      height: '85%',
+      detents: ['85%', SheetSize.LARGE],
+      scrollSizeMode: ScrollSizeMode.CONTINUOUS,
+      keyboardAvoidMode: SheetKeyboardAvoidMode.TRANSLATE_AND_RESIZE,
+      dragBar: true,
+      showClose: false,
+      onDisappear
+    };
+    if (ImmersiveMaterialStyle.isActive(enabled)) {
+      options.systemMaterial = ImmersiveMaterialStyle.ultraThickMaterial();
+    } else {
+      options.backgroundColor = normalizeHexColor(canvasHex, '#F7F7F7');
+    }
+    return options;
+  }
+
   static pageTheme(pageHex: string): CustomTheme {
     return {
       colors: {

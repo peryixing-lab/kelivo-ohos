@@ -5,6 +5,8 @@ export function brandIconResource(id: BrandIconId): Resource | undefined {
   switch (id) {
     case 'openai':
       return $r('app.media.icon_openai');
+    case 'opencode':
+      return $r('app.media.icon_opencode');
     case 'gemini':
       return $r('app.media.icon_gemini');
     case 'claude':

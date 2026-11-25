@@ -1,5 +1,7 @@
 import {
   ApiFamily,
+  CHATGPT_PLAN_API,
+  planClientId,
   Attachment,
   ChatMessage,
   GenerationParams,
@@ -15,7 +17,9 @@ import {
   findProviderModelSpec,
   getAllAttachments,
   isLocalOrCustomHost,
-  messageText
+  isOpenCodeGoEndpoint,
+  messageText,
+  openCodeGoSessionId
 } from './Models';
 import {
   applyChatCompletionsBuiltInSearch,
@@ -79,7 +83,26 @@ interface GeminiContent { role?: string; parts: WirePart[] }
 interface OpenBody { model: string; messages: WireMessage[]; stream: boolean }
 interface ClaudeBody { model: string; system?: string; messages: WireMessage[]; max_tokens: number; stream: boolean }
 interface GeminiBody { contents: GeminiContent[]; systemInstruction?: GeminiContent }
-export interface ChatCall { address: string; headers: Record<string, string>; body: string }
+export interface ChatCall {
+  planClient?: string;
+  openCodeGoSession?: string;
+  address: string;
+  headers: Record<string, string>;
+  body: string;
+}
+
+function withOpenCodeGoSession(call: ChatCall, goSession: string): ChatCall {
+  if (!goSession) {
+    return call;
+  }
+  return {
+    planClient: call.planClient,
+    openCodeGoSession: goSession,
+    address: call.address,
+    headers: call.headers,
+    body: call.body
+  };
+}
 
 interface ReplyToolFn { name?: string; arguments?: string }
 interface ReplyToolCallItem { index?: number; id?: string; type?: string; function?: ReplyToolFn }
@@ -142,7 +165,8 @@ interface ReplyResponseItem {
   arguments?: string;
   content?: ReplyResponsesContentBlock[];
 }
-interface ReplyResponseObj { usage?: ReplyUsage; output?: ReplyResponseItem[] }
+interface PlanResponseError { message?: string }
+interface ReplyResponseObj { error?: PlanResponseError; usage?: ReplyUsage; output?: ReplyResponseItem[] }
 interface ReplyMessageStart { usage?: ReplyUsage }
 interface ReplyEvent {
   type?: string;
@@ -382,6 +406,11 @@ function contentParts(msg: ChatMessage, family: ApiFamily, allowRemoteImageUrls:
 
 export function makeChatCall(provider: Provider, key: string, prompt: string, history: ChatMessage[],
   conversationId?: string): ChatCall {
+  if (planClientId(provider)) return makeAdvancedChatCall(provider, key, prompt, history, { conversationId });
+  const goSession = openCodeGoSessionId(provider);
+  if (goSession && !isOpenCodeGoEndpoint(provider.baseUrl)) {
+    throw new Error('OpenCode Go 账号登录仅支持官方 OpenCode Go 接口地址');
+  }
   const base = checkEndpoint(provider.baseUrl);
   const headers = buildProviderHeaders(provider, key, conversationId);
   if (!provider.model.trim()) throw new Error('请在模型设置中填写模型 ID。');
@@ -392,11 +421,11 @@ export function makeChatCall(provider: Provider, key: string, prompt: string, hi
     const payload: GeminiBody = { contents };
     if (prompt) payload.systemInstruction = { parts: [{ text: prompt }] };
     const modelId = encodeURIComponent(provider.model.replace(/^models\//, ''));
-    return {
+    return withOpenCodeGoSession({
       address: base + '/models/' + modelId + ':streamGenerateContent?alt=sse',
       headers,
       body: JSON.stringify(payload)
-    };
+    }, goSession);
   }
   const messages: WireMessage[] = [];
   if (prompt && provider.family === 'openai') messages.push({ role: 'system', content: prompt });
@@ -411,10 +440,16 @@ export function makeChatCall(provider: Provider, key: string, prompt: string, hi
   if (provider.family === 'anthropic') {
     const claude: ClaudeBody = { model: provider.model, messages, max_tokens: 4096, stream: true };
     if (prompt) claude.system = prompt;
-    return { address: resolveEndpointUrl(base, provider.chatPath, '/messages'), headers, body: JSON.stringify(claude) };
+    return withOpenCodeGoSession(
+      { address: resolveEndpointUrl(base, provider.chatPath, '/messages'), headers, body: JSON.stringify(claude) },
+      goSession
+    );
   }
   const body: OpenBody = { model: provider.model, messages, stream: true };
-  return { address: resolveEndpointUrl(base, provider.chatPath, '/chat/completions'), headers, body: JSON.stringify(body) };
+  return withOpenCodeGoSession(
+    { address: resolveEndpointUrl(base, provider.chatPath, '/chat/completions'), headers, body: JSON.stringify(body) },
+    goSession
+  );
 }
 
 function mergeCustomBody(target: Record<string, Object>, rawJson?: string): void {
@@ -626,6 +661,14 @@ export function makeAdvancedChatCall(
   const opts: ChatCallOptions = options || {};
   const modelName = (opts.modelId || provider.model).trim();
   if (!modelName) throw new Error('请在模型设置中填写模型 ID。');
+  const planClient = planClientId(provider);
+  if (planClient && (provider.baseUrl !== CHATGPT_PLAN_API || provider.family !== 'openai-responses' || provider.chatPath)) {
+    throw new Error('ChatGPT 订阅仅支持官方 Responses 接口');
+  }
+  const goSession = openCodeGoSessionId(provider);
+  if (goSession && !isOpenCodeGoEndpoint(provider.baseUrl)) {
+    throw new Error('OpenCode Go 账号登录仅支持官方 OpenCode Go 接口地址');
+  }
   const base = checkEndpoint(provider.baseUrl);
   const host = extractUrlHost(provider.baseUrl);
   const params = opts.params;
@@ -785,11 +828,11 @@ export function makeAdvancedChatCall(
     mergeCustomBody(body, opts.customBodyJson);
     const cleanModel = encodeURIComponent(modelName.replace(/^models\//, ''));
     const suffix = useStream ? ':streamGenerateContent?alt=sse' : ':generateContent';
-    return {
+    return withOpenCodeGoSession({
       address: base + '/models/' + cleanModel + suffix,
       headers,
       body: JSON.stringify(body)
-    };
+    }, goSession);
   }
 
   if (usesResponsesApi(provider)) {
@@ -856,6 +899,7 @@ export function makeAdvancedChatCall(
             const tc = turn.toolCalls[j];
             const fc: Record<string, Object> = {};
             fc['type'] = 'function_call';
+            if (planClient) fc['namespace'] = 'kelivo';
             fc['call_id'] = tc.id;
             fc['name'] = tc.name;
             fc['arguments'] = tc.argsDelta || '{}';
@@ -904,6 +948,19 @@ export function makeAdvancedChatCall(
       rt['parameters'] = normalizeObjectToolSchema(td.parametersJson);
       rTools.push(rt);
     }
+    if (planClient) {
+      const planBody: Record<string, Object> = { 'model': modelName, 'input': inputItems, 'store': false, 'stream': true };
+      inputItems.forEach((item: Record<string, Object>) => {
+        if (item['role'] === 'system') item['role'] = 'developer';
+      });
+      if (prompt) planBody['instructions'] = prompt;
+      if (body['reasoning']) planBody['reasoning'] = body['reasoning'];
+      const planTools: Array<Record<string, Object>> = [];
+      if (rTools.length) planTools.push({ 'type': 'namespace', 'name': 'kelivo', 'description': 'Kelivo tools', 'tools': rTools });
+      if (enableBuiltinSearch) planTools.push({ 'type': 'web_search' });
+      if (planTools.length) planBody['tools'] = planTools;
+      return { planClient, address: CHATGPT_PLAN_API + '/responses', headers: {}, body: JSON.stringify(planBody) };
+    }
     if (enableBuiltinSearch) {
       const builtinTools = buildResponsesBuiltInSearchTools(provider, modelName);
       for (let i = 0; i < builtinTools.length; i++) {
@@ -927,7 +984,10 @@ export function makeAdvancedChatCall(
     mergeCustomBody(body, provider.customBodyJson);
     mergeCustomBodyEntries(body, spec.customBodyEntries);
     mergeCustomBody(body, opts.customBodyJson);
-    return { address: resolveEndpointUrl(base, provider.chatPath, '/responses'), headers, body: JSON.stringify(body) };
+    return withOpenCodeGoSession(
+      { address: resolveEndpointUrl(base, provider.chatPath, '/responses'), headers, body: JSON.stringify(body) },
+      goSession
+    );
   }
 
   if (provider.family === 'anthropic') {
@@ -1025,7 +1085,10 @@ export function makeAdvancedChatCall(
     mergeCustomBody(body, provider.customBodyJson);
     mergeCustomBodyEntries(body, spec.customBodyEntries);
     mergeCustomBody(body, opts.customBodyJson);
-    return { address: resolveEndpointUrl(base, provider.chatPath, '/messages'), headers, body: JSON.stringify(body) };
+    return withOpenCodeGoSession(
+      { address: resolveEndpointUrl(base, provider.chatPath, '/messages'), headers, body: JSON.stringify(body) },
+      goSession
+    );
   }
 
   // OpenAI Chat Completions
@@ -1126,7 +1189,10 @@ export function makeAdvancedChatCall(
     ? applyChatCompletionsBuiltInSearch(body, provider, modelName)
     : body;
   applyModelExtraChatCompletionsTools(finalBody, provider, spec);
-  return { address: resolveEndpointUrl(base, provider.chatPath, '/chat/completions'), headers, body: JSON.stringify(finalBody) };
+  return withOpenCodeGoSession(
+    { address: resolveEndpointUrl(base, provider.chatPath, '/chat/completions'), headers, body: JSON.stringify(finalBody) },
+    goSession
+  );
 }
 
 function usageFromWire(u?: ReplyUsage): TokenUsage | undefined {
@@ -1245,6 +1311,9 @@ export function parseRichReply(data: string): RichFragment {
     return result;
   }
   const event = JSON.parse(data) as ReplyEvent;
+  if (event.type === 'response.failed' || event.type === 'response.incomplete') {
+    throw new Error(event.response?.error?.message || '模型响应未完成，请重试或检查套餐用量');
+  }
   if (event.error || event.type === 'error') {
     throw new Error(event.error?.message || '模型服务返回错误');
   }
@@ -1558,6 +1627,7 @@ export class ThinkTagStreamParser {
 
 export function makeImageGenCall(provider: Provider, key: string, prompt: string, modelId?: string,
   conversationId?: string): ChatCall {
+  if (planClientId(provider)) throw new Error('ChatGPT 订阅连接暂不支持图片生成');
   const base = checkEndpoint(provider.baseUrl);
   const headers = buildProviderHeaders(provider, key, conversationId);
   const model = (modelId || provider.model || 'dall-e-3').trim();
