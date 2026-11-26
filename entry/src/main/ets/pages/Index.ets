@@ -58,7 +58,6 @@ import {
   cloneProvider,
   defaultModelSpec,
   findProviderModelSpec,
-  getAllAttachments,
   initialWorkspace,
   isProviderConfigured,
   normalizeAppearanceConfig,
@@ -84,12 +83,11 @@ import {
   pickPhotoAttachments,
   takePhotoAttachment
 } from '../core/AttachmentStore';
-import { BrandIconId, resolveBrandIconId, splitAssistantParagraphs } from '../core/BrandIcons';
-import { selectApiKey, markKeyError, markKeySuccess } from '../core/KeyPool';
+import { BrandIconId, resolveBrandIconId } from '../core/BrandIcons';
+import { markKeyError, markKeySuccess } from '../core/KeyPool';
 import {
   appendMessageVersion,
   applyContextCompression,
-  buildCompressionPrompt,
   deleteMessageVersion,
   exportMessagesAsMarkdown,
   exportMessagesAsPlainText,
@@ -103,8 +101,8 @@ import { Narration } from '../core/Narration';
 import { SpeechInputController } from '../core/SpeechInput';
 import { McpManager, McpTool } from '../core/RemoteTools';
 import { McpDiscoveredDescriptor, RegisteredTool, assembleToolRegistry, defaultMaxToolSteps } from '../core/ToolRegistry';
-import { ToolCallGroup, ToolExecutionOutput, groupToolCallRecords, runAgentToolLoop } from '../core/ToolLoop';
-import { PromptTemplateContext, applyRegexRules, buildAssembledPrompt } from '../core/PromptEngine';
+import { runAgentToolLoop } from '../core/ToolLoop';
+import { applyRegexRules, buildAssembledPrompt } from '../core/PromptEngine';
 import {
   buildMemoryInjectionBlock,
   buildMemoryRulesSystemPrompt,
@@ -114,7 +112,6 @@ import {
 import {
   buildMemoryTools,
   buildMemoryOrganizeBatch,
-  executeMemoryToolCall,
   runMemoryPipeline
 } from '../core/MemoryEngine';
 import { PaletteTokens, resolveEffectiveDark, resolveThemeTokens, resolveWallpaperColor } from '../core/ThemeManager';
@@ -161,23 +158,49 @@ import { AppearancePanel } from '../components/AppearancePanel';
 import { SettingsPanel } from '../components/SettingsPanel';
 import { DefaultModelPanel } from '../components/DefaultModelPanel';
 import { AboutPanel } from '../components/AboutPanel';
-import { KelivoAvatarBadge, KelivoNavTitleBar } from '../components/KelivoChrome';
+import { KelivoAvatarBadge, KelivoNavRouteShell } from '../components/KelivoChrome';
 import { BottomToolsSheet } from '../components/BottomToolsSheet';
-import { ChatListSheet } from '../components/ChatListSheet';
 import { ModelSelectSheet } from '../components/ModelSelectSheet';
-import { ChatToolsSheet, ReasoningLevelSheet, SearchQuickSheet, reasoningBulbResource } from '../components/ChatQuickSheets';
+import { ChatToolsSheet, ReasoningLevelSheet, SearchQuickSheet } from '../components/ChatQuickSheets';
 import { WorkspacePanel } from '../components/WorkspacePanel';
 import { SkillsPanel } from '../components/SkillsPanel';
 import { NetworkProxyPanel } from '../components/NetworkProxyPanel';
 import { BrowserPanel } from '../components/BrowserPanel';
 import { ScheduledTasksPanel } from '../components/ScheduledTasksPanel';
-import { buildWorkspaceTools, executeWorkspaceTool } from '../core/WorkspaceTools';
+import { ChatSidebarView, ChatDrawerOverlay } from '../components/ChatSidebarView';
+import { ChatMessageRowView, ChatReplyActivityCard } from '../components/ChatMessageRowView';
+import { ChatTitleBarView } from '../components/ChatTitleBarView';
+import { ChatComposerView } from '../components/ChatComposerView';
+import {
+  ChatEditMessageModal,
+  ChatMessageActionSheet,
+  ChatMiniMapSheet,
+  ChatScrollNavOverlay,
+  ChatSelectCopyModal,
+  ChatWideSidePanel
+} from '../components/ChatOverlaysView';
+import { buildWorkspaceTools } from '../core/WorkspaceTools';
 import { buildSkillsPromptSummary, defaultBuiltinSkills } from '../core/SkillsParser';
-import { buildSkillTools, executeSkillTool } from '../core/SkillsManager';
+import { buildSkillTools } from '../core/SkillsManager';
 import { BrowserAgentManager, buildBrowserTools } from '../core/BrowserAgent';
-import { AskUserPromptRequest, DeviceToolBridge, buildDeviceTools, executeDeviceTool } from '../core/DeviceTools';
+import { AskUserPromptRequest, buildDeviceTools } from '../core/DeviceTools';
 import { ScheduledTaskRunner } from '../core/ScheduledTasks';
-import { WebSearch, fetchWebPage } from '../core/WebSearch';
+import { WebSearch } from '../core/WebSearch';
+import {
+  ResolvedRoleTarget,
+  buildChatTemplateContext,
+  buildChatToolSchemaCandidates,
+  executeChatRegisteredTool,
+  formatChatMessageTime,
+  formatStorageSizeLabel,
+  generateAutoChatTitle,
+  generateChatCompressionSummary,
+  generateChatSuggestions,
+  resolveProviderKeyAndProxy,
+  resolveRoleProviderTarget,
+  runChatOcrOnImage,
+  translateChatMessageText
+} from '../core/ChatAuxService';
 import { computeFloatingBottomInsetVp, hexWithAlpha } from '../core/ImmersiveUtils';
 import { syncWindowBackgroundColor, syncWindowSystemBars } from '../core/WindowController';
 import { ImmersiveMaterialStyle } from '../core/ImmersiveMaterialStyle';
@@ -185,28 +208,9 @@ import { SystemMotion } from '../core/SystemMotion';
 import { backgroundGenerationManager, GenerationPhase } from '../core/BackgroundGeneration';
 import { ChatGenerationJob, GenerationSessionRegistry } from '../core/GenerationSession';
 
-interface ReplyActivityData {
-  messageId: string;
-  reasoning: string;
-  records: ToolCallRecord[];
-  thinking: boolean;
-  durationMs: number;
-}
-
 interface ComposerDraftData {
   text: string;
   attachments: Attachment[];
-}
-
-interface ResolvedProviderAuth {
-  key: string;
-  keyEntryId: string;
-  proxyPass: string;
-}
-
-interface ResolvedRoleTarget {
-  prov: Provider;
-  model: string;
 }
 
 interface MemoryQueueJob {
@@ -227,8 +231,6 @@ struct Index {
   @State loadError: string = '';
   @State wide: boolean = false;
   @State notice: string = '';
-  @State renameId: string = '';
-  @State renameText: string = '';
   @State query: string = '';
   @State draft: string = '';
   @State attachedList: Attachment[] = [];
@@ -292,10 +294,7 @@ struct Index {
   @State askQuestionPlaceholder: string = '';
   @State askQuestionAnswer: string = '';
   @State drawerOpen: boolean = false;
-  @State drawerAssistantsExpanded: boolean = false;
   @State drawerGlobalSearch: boolean = false;
-  @State drawerEditingUser: boolean = false;
-  @State drawerUserNameDraft: string = '';
   @State promptTabInit: number = 0;
   @State diagTabInit: number = 0;
   @State providerDetailId: string = '';
@@ -498,18 +497,6 @@ struct Index {
     this.chatNavTargetIdx = msgs.length - 1;
     this.scrollView.scrollEdge(Edge.Bottom);
     this.scheduleChatScrollNavHide();
-  }
-
-  private composerInactiveIconColor(): Resource {
-    return ImmersiveMaterialStyle.isActive(this.immersiveLightOn())
-      ? $r('sys.color.icon_secondary')
-      : $r('app.color.muted');
-  }
-
-  private composerPillBg(): Resource {
-    return ImmersiveMaterialStyle.isActive(this.immersiveLightOn())
-      ? $r('sys.color.comp_background_tertiary')
-      : $r('app.color.panel');
   }
 
   private consumePendingShareText(): void {
@@ -995,35 +982,10 @@ struct Index {
     }).sort((a: Conversation, b: Conversation): number => Number(!!b.pinned) - Number(!!a.pinned) || b.updated - a.updated);
   }
 
-  private dateGroupLabel(c: Conversation): string {
-    if (c.pinned) return '置顶';
-    const d = new Date(c.updated || Date.now());
-    const now = new Date();
-    const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-    const diffDays = Math.round((startToday - dayStart) / 86400000);
-    if (diffDays <= 0) return '今天';
-    if (diffDays === 1) return '昨天';
-    if (diffDays <= 7) return '近 7 天';
-    return '更早';
-  }
-
-  private isDrawerGroupStart(rows: Conversation[], idx: number): boolean {
-    if (idx <= 0) return true;
-    return this.dateGroupLabel(rows[idx]) !== this.dateGroupLabel(rows[idx - 1]);
-  }
-
   private async refreshStorageSize(): Promise<void> {
     if (!this.filesDirPath) return;
     const stats = await computeStorageBreakdown(this.filesDirPath, this.dbDirPath || this.filesDirPath);
-    const total = stats.totalBytes;
-    if (total < 1024) {
-      this.storageSizeLabel = `${total} B`;
-    } else if (total < 1024 * 1024) {
-      this.storageSizeLabel = `${(total / 1024).toFixed(1)} KB`;
-    } else {
-      this.storageSizeLabel = `${(total / (1024 * 1024)).toFixed(1)} MB`;
-    }
+    this.storageSizeLabel = formatStorageSizeLabel(stats.totalBytes);
   }
 
   private selectModelQuick(providerId: string, modelId: string): void {
@@ -1283,7 +1245,6 @@ struct Index {
     this.draftOverrideModel = '';
     this.modelConfigTick += 1;
     this.drawerGlobalSearch = false;
-    this.drawerAssistantsExpanded = false;
     const candidates = this.workspace.conversations
       .filter((c: Conversation): boolean => !c.ephemeral && c.personaId === personaId)
       .sort((a: Conversation, b: Conversation): number => Number(!!b.pinned) - Number(!!a.pinned) || b.updated - a.updated);
@@ -1672,34 +1633,6 @@ struct Index {
     this.persistAction();
   }
 
-  private assistantParagraphsFor(msg: ChatMessage): string[] {
-    const full = this.displayMessageText(msg);
-    if (this.appearanceCfg().splitParagraphsIntoBubbles) {
-      const parts = splitAssistantParagraphs(full);
-      if (parts.length > 0) return parts;
-    }
-    return full ? [full] : [];
-  }
-
-  private assistantBubbleBg(): ResourceColor {
-    const st = this.appearanceCfg().bubbleStyle;
-    if (st === 'frosted') {
-      return hexWithAlpha(this.themeTokens().surface, this.effectiveDark() ? '90' : 'B8');
-    }
-    if (st === 'solid') {
-      return this.themeTokens().surface;
-    }
-    return Color.Transparent;
-  }
-
-  private userBubbleBg(): ResourceColor {
-    const st = this.appearanceCfg().bubbleStyle;
-    if (st === 'frosted') {
-      return hexWithAlpha(this.themeTokens().tint, this.effectiveDark() ? 'A8' : 'C0');
-    }
-    return $r('app.color.tint');
-  }
-
   private composerBgColor(): string {
     const alphaNum = Math.max(0.35, Math.min(1.0, this.appearanceCfg().inputBoxOpacity ?? 0.88));
     const alphaHex = Math.round(alphaNum * 255).toString(16).padStart(2, '0').toUpperCase();
@@ -1707,22 +1640,6 @@ struct Index {
       return hexWithAlpha(this.themeTokens().surface, alphaHex === 'FF' ? 'EB' : alphaHex);
     }
     return hexWithAlpha(this.themeTokens().surface, alphaHex === 'FF' ? 'F8' : alphaHex);
-  }
-
-  private formatMsgTime(ts?: number): string {
-    if (!ts) return '';
-    const d = new Date(ts);
-    const hh = String(d.getHours()).padStart(2, '0');
-    const mm = String(d.getMinutes()).padStart(2, '0');
-    return `${hh}:${mm}`;
-  }
-
-  private modelHeaderLabel(msg: ChatMessage): string {
-    const name = msg.model || '助手';
-    if (this.chatDisplayCfg().showProviderAfterModelName && msg.model) {
-      return `${name} (${this.provider().name})`;
-    }
-    return name;
   }
 
   private composerPlaceholder(): string {
@@ -1735,11 +1652,6 @@ struct Index {
     const globalList = this.workspace.quickPhrases || defaultQuickPhrases();
     const personaList = this.persona().quickPhrases || [];
     return [...personaList, ...globalList];
-  }
-
-  private displayMessageText(msg: ChatMessage): string {
-    const rules = this.persona().regexRules || [];
-    return applyRegexRules(msg.text, rules, 'display');
   }
 
   private async refreshLogsAndStats(): Promise<void> {
@@ -1761,40 +1673,7 @@ struct Index {
   }
 
   private buildToolSchemaCandidates(): ToolSchemaCandidate[] {
-    const out: ToolSchemaCandidate[] = [
-      { name: 'web_search', defaultDescription: '使用联网搜索引擎检索最新公开网页信息', source: 'builtin' },
-      { name: 'web_fetch', defaultDescription: '抓取指定网页正文转为纯文本', source: 'builtin' }
-    ];
-    const groups: RegisteredTool[][] = [
-      buildMemoryTools(),
-      buildWorkspaceTools(),
-      buildSkillTools(),
-      buildBrowserTools(),
-      buildDeviceTools()
-    ];
-    for (let g = 0; g < groups.length; g++) {
-      const list = groups[g];
-      for (let i = 0; i < list.length; i++) {
-        out.push({
-          name: list[i].declaration.name,
-          defaultDescription: list[i].declaration.description,
-          source: list[i].source
-        });
-      }
-    }
-    const mcpServers = this.workspace.mcpServers || [];
-    for (let i = 0; i < mcpServers.length; i++) {
-      const srv = mcpServers[i];
-      const cached = this.mcpManager.getCachedTools(srv.id);
-      for (let j = 0; j < cached.length; j++) {
-        out.push({
-          name: cached[j].name,
-          defaultDescription: cached[j].description || cached[j].name,
-          source: `mcp:${srv.name}`
-        });
-      }
-    }
-    return out;
+    return buildChatToolSchemaCandidates(this.workspace.mcpServers || [], this.mcpManager);
   }
 
   private workspaceForChat(chat: Conversation | undefined, persona: Persona): LocalWorkspace | undefined {
@@ -1873,25 +1752,6 @@ struct Index {
     if (this.ready) {
       await this.persist().catch(() => {});
     }
-  }
-
-  private buildTemplateContext(prov: Provider, modelId: string, chatTitle: string): PromptTemplateContext {
-    let userName = '用户';
-    const profile = this.workspace.userProfile || [];
-    for (let i = 0; i < profile.length; i++) {
-      const k = profile[i].key.trim().toLowerCase();
-      if (k === '称呼' || k === '名字' || k === '姓名' || k === 'name' || k === 'user') {
-        userName = profile[i].value.trim();
-        break;
-      }
-    }
-    return {
-      userName,
-      assistantName: this.persona().name,
-      modelName: modelId,
-      providerName: prov.name,
-      conversationTitle: chatTitle
-    };
   }
 
   private queueMemoryOrganization(
@@ -2053,7 +1913,7 @@ struct Index {
         const model = configured ? (defaults?.memoryModelId || configured.model || fallback.model) : fallback.model;
         if (!model) throw new Error('请先配置记忆模型');
         trace.modelId = model;
-        const auth = await this.resolveProviderKeyAndProxy(provider);
+        const auth = await resolveProviderKeyAndProxy(provider);
         if (!auth.key && !isProviderConfigured(provider)) throw new Error('记忆模型的服务商未配置');
         const pipelineOut = await runMemoryPipeline({
           provider,
@@ -2278,174 +2138,29 @@ struct Index {
     });
   }
 
-  private async executeRegisteredTool(
-    tool: RegisteredTool, argsJson: string, chat: Conversation, persona: Persona, job: ChatGenerationJob
-  ): Promise<ToolExecutionOutput> {
-    let parsed: Record<string, Object> = {};
-    try {
-      const obj = JSON.parse(argsJson || '{}') as Record<string, Object>;
-      if (obj && typeof obj === 'object') {
-        parsed = obj;
-      }
-    } catch (_) {
-      return { text: '工具参数 JSON 解析失败', isError: true };
-    }
-    if (tool.declaration.name === 'web_search') {
-      const query = String(parsed['query'] || '');
-      const svc = this.activeSearchService();
-      if (!svc) return { text: '未配置搜索服务', isError: true };
-      const searcher = new WebSearch();
-      job.searcher = searcher;
-      const fallbackKey = this.workspace.search?.secretRef ? await readKey(this.workspace.search.secretRef) : '';
-      const hits = await searcher.findWithService(svc, fallbackKey, query);
-      if (!hits.length) return { text: '未找到相关网页结果' };
-      const out = hits.map((h: SearchHit, idx: number): string =>
-        '[' + (idx + 1) + '] ' + h.title + '\nURL: ' + h.url + '\n摘要: ' + h.excerpt
-      ).join('\n\n');
-      return { text: out };
-    }
-    if (tool.declaration.name === 'web_fetch') {
-      const url = String(parsed['url'] || '');
-      const maxChars = Number(parsed['max_chars'] || 8000);
-      const offset = Number(parsed['offset'] || 0);
-      const txt = await fetchWebPage(url, maxChars, offset);
-      return { text: txt };
-    }
-    if (tool.source === 'memory') {
-      const current = this.workspace.personas.find((item: Persona): boolean => item.id === persona.id) || persona;
-      const outcome = executeMemoryToolCall(
-        tool.declaration.name, parsed, this.workspace.memories || [], this.workspace.userProfile || [],
-        this.workspace.conversations, chat, current, this.workspace.memorySettings?.injectGlobal !== false
-      );
-      if (outcome.memories || outcome.profile) {
-        if (outcome.memories) this.workspace.memories = outcome.memories;
-        if (outcome.profile) this.workspace.userProfile = outcome.profile;
-        this.persistAction();
-      }
-      return { text: outcome.text, isError: outcome.isError };
-    }
-    if (tool.source === 'workspace') {
-      return executeWorkspaceTool(
-        tool.declaration.name,
-        argsJson,
-        this.workspaceForChat(chat, persona),
-        this.workspace.envVars || []
-      );
-    }
-    if (tool.source === 'skill') {
-      return executeSkillTool(argsJson, this.workspace.skills || defaultBuiltinSkills());
-    }
-    if (tool.source === 'browser') {
-      if (this.wide && this.sidePanelMode === '' && this.workspace.activeConversation === chat.id && this.activeRoute === 'chat') {
-        this.setSidePanelMode('browser');
-      }
-      return this.browserManager.executeAction(argsJson, this.workspace.workspaces || []);
-    }
-    if (tool.source === 'device') {
-      const bridge: DeviceToolBridge = {
-        hostContext: this.host(),
-        speakText: async (text: string): Promise<void> => {
-          const ttsCfg = this.workspace.tts;
-          if (ttsCfg && ttsCfg.engine !== 'system') {
-            const key = ttsCfg.secretRef ? await readKey(ttsCfg.secretRef) : '';
-            await this.speaker.playWithConfig(text, ttsCfg, key, this.host().cacheDir, () => {});
-          } else {
-            await this.speaker.play(text, () => {});
-          }
-        },
-        askUserInput: (req: AskUserPromptRequest): Promise<string> => this.requestAskUserInput(job, req),
-        getConversations: (): Conversation[] => this.workspace.conversations,
-        getActiveConversation: (): Conversation | undefined =>
-          this.workspace.conversations.find((item: Conversation): boolean => item.id === chat.id) || chat
-      };
-      return executeDeviceTool(tool.declaration.name, argsJson, bridge);
-    }
-    if (tool.source === 'mcp' && tool.serverId) {
-      const res = await this.mcpManager.invokeMcpTool(tool.serverId, tool.declaration.name, argsJson);
-      return { text: res.text, images: res.images };
-    }
-    return { text: '未实现的工具: ' + tool.declaration.name, isError: true };
-  }
-
-  private async resolveProviderKeyAndProxy(p: Provider): Promise<ResolvedProviderAuth> {
-    let key = '';
-    let keyEntryId = '';
-    if (p.apiKeys && p.apiKeys.length > 0) {
-      const chosen = selectApiKey(p.id, p.apiKeys, p.keyStrategy || 'round_robin');
-      if (chosen) {
-        keyEntryId = chosen.id;
-        key = await readKey(chosen.secretRef);
-      }
-    }
-    if (!key && p.secretRef) {
-      key = await readKey(p.secretRef);
-    }
-    const proxyPass = p.proxy?.passwordRef ? await readKey(p.proxy.passwordRef) : '';
-    return { key, keyEntryId, proxyPass };
-  }
-
-  private resolveRoleProvider(role: 'title' | 'summary' | 'suggestions' | 'compress' | 'translate' | 'ocr' | 'memory'): ResolvedRoleTarget {
-    const defs = this.workspace.modelDefaults;
-    let pid = '';
-    let mid = '';
-    if (defs) {
-      if (role === 'title') { pid = defs.titleProviderId; mid = defs.titleModelId; }
-      else if (role === 'summary') { pid = defs.summaryProviderId || ''; mid = defs.summaryModelId || ''; }
-      else if (role === 'suggestions') { pid = defs.suggestionsProviderId || ''; mid = defs.suggestionsModelId || ''; }
-      else if (role === 'compress') { pid = defs.compressProviderId || ''; mid = defs.compressModelId || ''; }
-      else if (role === 'translate') { pid = defs.translateProviderId; mid = defs.translateModelId; }
-      else if (role === 'ocr') { pid = defs.ocrProviderId; mid = defs.ocrModelId; }
-      else { pid = defs.memoryProviderId; mid = defs.memoryModelId; }
-    }
-    const prov = this.workspace.providers.find((p: Provider): boolean => p.id === pid && p.enabled !== false) || this.provider();
-    return { prov, model: mid || (prov.id === this.provider().id ? this.activeModelId() : prov.model) };
-  }
-
   private async autoGenerateTitle(chatId: string, firstQuestion: string, firstAnswer: string): Promise<void> {
-    if (!this.workspace.systemSettings?.autoTitleEnabled) return;
-    try {
-      const target = this.resolveRoleProvider('title');
-      const auth = await this.resolveProviderKeyAndProxy(target.prov);
-      if (!target.model) return;
-      const title = await completeOnce(
-        target.prov, auth.key,
-        '请根据下面这轮对话生成一个简短准确的中文或原文标题（不超过16个字，不加引号和标点）。',
-        '用户：' + firstQuestion.slice(0, 400) + '\n助手：' + firstAnswer.slice(0, 400),
-        target.model, 64, auth.proxyPass, chatId
-      );
-      const clean = title.replace(/["'《》「」]/g, '').trim().slice(0, 28);
-      if (!clean) return;
-      const c = this.workspace.conversations.find((item: Conversation): boolean => item.id === chatId);
-      if (c) {
-        c.title = clean;
-        this.workspace.conversations = this.workspace.conversations.slice();
-        this.persistAction();
-      }
-    } catch (_) {}
+    const clean = await generateAutoChatTitle(
+      this.workspace, this.provider(), this.activeModelId(), chatId, firstQuestion, firstAnswer
+    );
+    if (!clean) return;
+    const c = this.workspace.conversations.find((item: Conversation): boolean => item.id === chatId);
+    if (c) {
+      c.title = clean;
+      this.workspace.conversations = this.workspace.conversations.slice();
+      this.persistAction();
+    }
   }
 
   private async fetchSuggestions(chatId: string, lastQuestion: string, lastAnswer: string): Promise<void> {
-    if (!this.workspace.systemSettings?.chatSuggestionsEnabled) return;
-    try {
-      const roleTarget = this.resolveRoleProvider('suggestions');
-      const auth = await this.resolveProviderKeyAndProxy(roleTarget.prov);
-      const model = roleTarget.model;
-      if (!model) return;
-      const raw = await completeOnce(
-        roleTarget.prov, auth.key,
-        '根据对话末尾内容，用一行一个的格式给出 3 个简短的后续追问建议（每条不超过18字，不要序号）。',
-        '问：' + lastQuestion.slice(0, 300) + '\n答：' + lastAnswer.slice(0, 500),
-        model, 120, auth.proxyPass, chatId
-      );
-      const lines = raw.split('\n').map((s: string): string => s.replace(/^[-*•\d.]+\s*/, '').trim())
-        .filter((s: string): boolean => s.length > 1 && s.length <= 36).slice(0, 3);
-      const c = this.workspace.conversations.find((item: Conversation): boolean => item.id === chatId);
-      if (c && lines.length) {
-        c.suggestions = lines;
-        this.workspace.conversations = this.workspace.conversations.slice();
-        this.persistAction();
-      }
-    } catch (_) {}
+    const lines = await generateChatSuggestions(
+      this.workspace, this.provider(), this.activeModelId(), chatId, lastQuestion, lastAnswer
+    );
+    const c = this.workspace.conversations.find((item: Conversation): boolean => item.id === chatId);
+    if (c && lines.length) {
+      c.suggestions = lines;
+      this.workspace.conversations = this.workspace.conversations.slice();
+      this.persistAction();
+    }
   }
 
   async send(retry: boolean = false, fromMessageId: string = ''): Promise<void> {
@@ -2795,7 +2510,7 @@ struct Index {
         if (isViewingThisChat()) this.fetchingSources = false;
       }
 
-      const auth = await this.resolveProviderKeyAndProxy(p);
+      const auth = await resolveProviderKeyAndProxy(p);
       authKeyId = auth.keyEntryId;
       if (job.stopped) return;
 
@@ -2867,7 +2582,9 @@ struct Index {
           instructionCards: this.workspace.instructionCards || [],
           activeInstructionIds: this.workspace.activeInstructionIds || [],
           memoryBlock: memBlock,
-          templateContext: this.buildTemplateContext(p, modelId, target.title)
+          templateContext: buildChatTemplateContext(
+            this.workspace.userProfile || [], this.persona().name, p.name, modelId, target.title
+          )
         });
 
         const allMcpServers = this.workspace.mcpServers || [];
@@ -2956,7 +2673,22 @@ struct Index {
               });
               endReasoning();
             },
-            executeTool: (tool: RegisteredTool, argsJson: string) => this.executeRegisteredTool(tool, argsJson, target, persona, job),
+            executeTool: (tool: RegisteredTool, argsJson: string) => executeChatRegisteredTool(
+              tool, argsJson, target, persona, job, {
+                workspace: this.workspace,
+                activeSearchService: () => this.activeSearchService(),
+                workspaceForChat: (chatArg: Conversation, personaArg: Persona) => this.workspaceForChat(chatArg, personaArg),
+                onWorkspaceMutated: () => { this.persistAction(); },
+                mcpManager: this.mcpManager,
+                browserManager: this.browserManager,
+                shouldOpenBrowserPanel: (chatId: string): boolean =>
+                  this.wide && this.sidePanelMode === '' && this.workspace.activeConversation === chatId && this.activeRoute === 'chat',
+                onOpenBrowserPanel: () => { this.setSidePanelMode('browser'); },
+                hostContext: this.host(),
+                speaker: this.speaker,
+                requestAskUserInput: (jobArg: ChatGenerationJob, req: AskUserPromptRequest) => this.requestAskUserInput(jobArg, req)
+              }
+            ),
             requestApproval: (tool: RegisteredTool, argsJson: string) => this.requestToolApproval(job, tool, argsJson),
             onUpdate: (lText: string, lReason: string, recs: ToolCallRecord[]) => {
               answer = lText;
@@ -3212,14 +2944,10 @@ struct Index {
       if (!targetChatId) this.toast('当前对话正在生成中，请稍候');
       return;
     }
-    const roleTarget = this.resolveRoleProvider('compress');
-    const auth = await this.resolveProviderKeyAndProxy(roleTarget.prov);
-    const modelId = roleTarget.model || this.activeModelId();
-    const summary = await completeOnce(
-      roleTarget.prov, auth.key, '你是精准的上下文压缩助手。',
-      buildCompressionPrompt(c.messages, template), modelId, 1200, auth.proxyPass, c.id
+    const compressed = await generateChatCompressionSummary(
+      this.workspace, this.provider(), this.activeModelId(), c.messages, template, c.id
     );
-    c.messages = applyContextCompression(c.messages, summary, newId(), modelId);
+    c.messages = applyContextCompression(c.messages, compressed.summary, newId(), compressed.modelId);
     c.updated = Date.now();
     this.workspace.conversations = this.workspace.conversations.slice();
     if (!c.ephemeral) await this.persist();
@@ -3240,12 +2968,8 @@ struct Index {
   private async compressToNewChat(template: string): Promise<void> {
     const c = this.activeChat();
     if (!c || !c.messages.length) return;
-    const roleTarget = this.resolveRoleProvider('compress');
-    const auth = await this.resolveProviderKeyAndProxy(roleTarget.prov);
-    const modelId = roleTarget.model || this.activeModelId();
-    const summary = await completeOnce(
-      roleTarget.prov, auth.key, '你是精准的上下文压缩助手。',
-      buildCompressionPrompt(c.messages, template), modelId, 1200, auth.proxyPass, c.id
+    const compressed = await generateChatCompressionSummary(
+      this.workspace, this.provider(), this.activeModelId(), c.messages, template, c.id
     );
     const newChat: Conversation = {
       id: newId(),
@@ -3255,8 +2979,8 @@ struct Index {
       messages: [{
         id: newId(),
         role: 'assistant',
-        text: '【继承自「' + c.title + '」的上下文摘要】\n' + summary,
-        model: modelId,
+        text: '【继承自「' + c.title + '」的上下文摘要】\n' + compressed.summary,
+        model: compressed.modelId,
         createdAt: Date.now(),
         isSummary: true
       }]
@@ -3377,12 +3101,8 @@ struct Index {
     }
     this.toast('正在翻译…');
     try {
-      const role = this.resolveRoleProvider('translate');
-      const auth = await this.resolveProviderKeyAndProxy(role.prov);
-      const out = await completeOnce(
-        role.prov, auth.key,
-        '若输入主要为中文请译为地道英文，否则译为地道简体中文，保留格式，只输出译文。',
-        target.text, role.model, 2048, auth.proxyPass, c.id
+      const out = await translateChatMessageText(
+        this.workspace, this.provider(), this.activeModelId(), c.id, target.text
       );
       c.messages = c.messages.map((m: ChatMessage): ChatMessage => {
         if (m.id !== msgId) return m;
@@ -3404,25 +3124,7 @@ struct Index {
   }
 
   private async runOcrOnImage(dataUri: string): Promise<string> {
-    const comma = dataUri.indexOf(',');
-    if (comma < 0) throw new Error('仅支持对本地/Base64 图片执行 OCR');
-    const meta = dataUri.slice(5, comma);
-    const mime = meta.split(';')[0] || 'image/png';
-    const b64 = dataUri.slice(comma + 1);
-    const role = this.resolveRoleProvider('ocr');
-    const auth = await this.resolveProviderKeyAndProxy(role.prov);
-    const ocrMsg: ChatMessage = {
-      id: 'ocr',
-      role: 'user',
-      text: '请准确提取图片中的所有文字内容并保持原有排版，不添加额外解释。',
-      model: '',
-      attachment: { name: 'ocr.png', mime, data: b64, kind: 'image' }
-    };
-    const call = makeAdvancedChatCall(role.prov, auth.key, '', [ocrMsg], { modelId: role.model, conversationId: this.activeChat()?.id });
-    const s = new ChatStream();
-    let out = '';
-    await s.runRich(call, (frag: RichFragment) => { out += frag.text; });
-    return out.trim();
+    return runChatOcrOnImage(this.workspace, this.provider(), this.activeModelId(), this.activeChat()?.id, dataUri);
   }
 
   private exportSelection(asMarkdown: boolean, singleMsg?: ChatMessage): void {
@@ -3611,44 +3313,8 @@ struct Index {
     return att.data ? 'data:' + att.mime + ';base64,' + att.data : (att.filePath ? 'file://' + att.filePath : '');
   }
 
-  private usageBadgeText(msg: ChatMessage): string {
-    if (!msg.usage) return '';
-    return '↑' + msg.usage.promptTokens + ' ↓' + msg.usage.completionTokens +
-      (msg.usage.cachedTokens ? ' ⚡' + msg.usage.cachedTokens : '') +
-      (msg.usage.durationMs ? ' · ' + (msg.usage.durationMs / 1000).toFixed(1) + 's' : '');
-  }
-
-  private compactTokenCountText(msg: ChatMessage): string {
-    if (!msg.usage) return '';
-    const total = msg.usage.totalTokens > 0
-      ? msg.usage.totalTokens
-      : (msg.usage.promptTokens + msg.usage.completionTokens);
-    return total > 0 ? `${total} tokens` : '';
-  }
-
-  private versionLabel(msg: ChatMessage): string {
-    const total = msg.versions?.length || 1;
-    const cur = (msg.activeVersion ?? (total - 1)) + 1;
-    return `${cur}/${total}`;
-  }
-
   private isRegeneratingMessage(msg: ChatMessage): boolean {
     return this.working && this.regeneratingMsgId === msg.id;
-  }
-
-  private activeVersionCount(msg: ChatMessage): number {
-    return msg.versions?.length || 1;
-  }
-
-  private canPrevVersion(msg: ChatMessage): boolean {
-    const cur = msg.activeVersion ?? ((msg.versions?.length || 1) - 1);
-    return cur > 0;
-  }
-
-  private canNextVersion(msg: ChatMessage): boolean {
-    const total = msg.versions?.length || 1;
-    const cur = msg.activeVersion ?? (total - 1);
-    return cur < total - 1;
   }
 
   private openMessageActionSheet(msg: ChatMessage): void {
@@ -3713,62 +3379,32 @@ struct Index {
   }
 
   @Builder
-  actionIcon(symbol: Resource, label: string, action: () => void) {
-    Button({ type: ButtonType.Circle }) {
-      SymbolGlyph(symbol).fontSize(20).fontColor([$r('app.color.ink')])
-    }.width(40).height(40).backgroundColor(Color.Transparent).accessibilityText(label).onClick(action)
-  }
-
-  @Builder
-  msgActionIcon(
-    symbol: Resource,
-    label: string,
-    lockWhileWorking: boolean,
-    idStr: string,
-    action: () => void
-  ) {
-    Button({ type: ButtonType.Circle }) {
-      SymbolGlyph(symbol)
-        .fontSize(17)
-        .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-        .fontColor([$r('app.color.muted')])
-    }
-    .id(idStr)
-    .width(32)
-    .height(32)
-    .padding(0)
-    .enabled(!(lockWhileWorking && this.working))
-    .opacity(lockWhileWorking && this.working ? 0.38 : 1)
-    .backgroundColor(Color.Transparent)
-    .accessibilityText(label)
-    .onClick(action)
-  }
-
-  @Builder
-  msgMoreDotsBtn(idStr: string, action: () => void) {
-    Button({ type: ButtonType.Circle }) {
-      Row({ space: 3 }) {
-        Column().width(3.5).height(3.5).borderRadius(2).backgroundColor($r('app.color.muted'))
-        Column().width(3.5).height(3.5).borderRadius(2).backgroundColor($r('app.color.muted'))
-        Column().width(3.5).height(3.5).borderRadius(2).backgroundColor($r('app.color.muted'))
-      }
-      .alignItems(VerticalAlign.Center)
-    }
-    .id(idStr)
-    .width(32)
-    .height(32)
-    .padding(0)
-    .backgroundColor(Color.Transparent)
-    .accessibilityText('更多操作')
-    .onClick(action)
-  }
-
-  @Builder
   liveStreamBody() {
     Column({ space: 8 }) {
-      this.replyActivityCard({
-        messageId: this.liveMessageId, reasoning: this.liveReasoning, records: this.liveToolCalls,
-        thinking: this.liveThinking, durationMs: this.liveReasoningMs
+      ChatReplyActivityCard({
+        messageId: this.liveMessageId,
+        reasoning: this.liveReasoning,
+        records: this.liveToolCalls,
+        thinking: this.liveThinking,
+        durationMs: this.liveReasoningMs,
+        showThinkingCards: this.chatDisplayCfg().showThinkingCards,
+        showToolCards: this.chatDisplayCfg().showToolCards,
+        enableReasoningMarkdown: this.appearanceCfg().enableReasoningMarkdown !== false,
+        enableMathLatex: this.appearanceCfg().enableMathLatex !== false,
+        codeFontSize: this.codeTextSize(),
+        tintHex: this.themeTokens().tint,
+        isDark: this.effectiveDark(),
+        liveMessageId: this.liveMessageId,
+        working: this.working,
+        pendingApprovalTool: this.pendingApprovalTool,
+        pendingApprovalArgs: this.pendingApprovalArgs,
+        expandedReasoning: this.expandedReasoning,
+        expandedToolId: this.expandedToolId,
+        onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
+        onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
+        onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
+        onAskDraft: (draftStr: string) => { this.draft = draftStr; },
+        onResolveToolApproval: (choice: 'allow_once' | 'allow_all' | 'deny') => this.resolveToolApproval(choice)
       })
       if (this.liveText) {
         MessageBody({
@@ -3805,578 +3441,81 @@ struct Index {
 
   @Builder
   sidebarBody(isOverlay: boolean) {
-    Column({ space: 10 }) {
-      // Top Search Pill + New Chat Button (aligned to android_02_drawer.png)
-      Row({ space: 8 }) {
-        Row({ space: 8 }) {
-          Button({ type: ButtonType.Circle }) {
-            SymbolGlyph(this.drawerGlobalSearch ? $r('sys.symbol.externaldrive') : $r('sys.symbol.magnifyingglass'))
-              .fontSize(16)
-              .fontColor([this.drawerGlobalSearch ? $r('app.color.accent') : $r('app.color.muted')])
-          }
-          .width(30)
-          .height(30)
-          .padding(0)
-          .backgroundColor(Color.Transparent)
-          .accessibilityText(this.drawerGlobalSearch ? '切换为当前助手检索' : '切换为全局会话检索')
-          .onClick(() => { this.drawerGlobalSearch = !this.drawerGlobalSearch; })
-
-          TextInput({
-            text: this.query,
-            placeholder: this.drawerGlobalSearch ? '搜索所有会话...' : `搜索 ${this.persona().name}...`
-          })
-            .id('historySearch')
-            .layoutWeight(1)
-            .height(36)
-            .padding(0)
-            .fontSize(13)
-            .backgroundColor(Color.Transparent)
-            .onChange((v: string) => { this.query = v; })
-
-          if (this.query.length > 0) {
-            Button({ type: ButtonType.Circle }) {
-              SymbolGlyph($r('sys.symbol.xmark'))
-                .fontSize(12)
-                .fontColor([$r('app.color.muted')])
-            }
-            .width(24)
-            .height(24)
-            .padding(0)
-            .backgroundColor(Color.Transparent)
-            .onClick(() => { this.query = ''; })
-          }
-        }
-        .layoutWeight(1)
-        .height(40)
-        .padding({ left: 8, right: 8 })
-        .borderRadius(20)
-        .backgroundColor($r('app.color.surface'))
-
-        Button({ type: ButtonType.Circle }) {
-          SymbolGlyph($r('sys.symbol.square_and_pencil'))
-            .fontSize(17)
-            .fontColor([$r('app.color.ink')])
-        }
-        .width(40)
-        .height(40)
-        .padding(0)
-        .backgroundColor($r('app.color.surface'))
-        .accessibilityText(this.uiLabels().newChat)
-        .onClick(() => {
-          this.setDrawerOpen(false);
-          this.activate('');
-        })
+    ChatSidebarView({
+      isOverlay: isOverlay,
+      drawerGlobalSearch: this.drawerGlobalSearch,
+      query: this.query,
+      personaName: this.persona().name,
+      personaAvatar: this.persona().avatar || '',
+      selectedPersonaIdVal: this.selectedPersonaId(),
+      personas: this.workspace.personas,
+      chatListRows: this.chatRows(),
+      activeConversationId: this.workspace.activeConversation,
+      generatingChatIds: this.generatingChatIds,
+      userName: this.workspace.userName || '用户',
+      newChatLabel: this.uiLabels().newChat,
+      translateToolLabel: this.uiLabels().translateTool,
+      settingsLabel: this.uiLabels().settings,
+      picking: this.picking,
+      bottomInset: this.effectiveBottomInset(),
+      onCloseDrawer: () => { this.setDrawerOpen(false); },
+      onSelectChat: (chatId: string) => { this.activate(chatId); },
+      onSelectAssistant: (personaId: string) => { this.selectAssistant(personaId, false); },
+      onOpenPersonaDetail: (personaId: string) => {
+        this.personaEditTargetId = personaId;
+        this.navigateTo('persona_detail');
+      },
+      onOpenPersonas: () => {
+        this.personaEditTargetId = '';
+        this.navigateTo('personas');
+      },
+      onRenameChat: (c: Conversation, titleText: string) => {
+        this.putChat({ id: c.id, title: titleText, updated: c.updated, pinned: c.pinned, messages: c.messages, personaId: c.personaId });
+        this.persistAction();
+      },
+      onTogglePinChat: (c: Conversation) => {
+        this.putChat({ id: c.id, title: c.title, updated: c.updated, personaId: c.personaId, messages: c.messages, pinned: !c.pinned });
+        this.persistAction();
+      },
+      onDuplicateChat: (c: Conversation) => { this.duplicateChat(c); },
+      onMoveChatToNextPersona: (c: Conversation) => { this.moveChatToNextPersona(c); },
+      onRemoveChat: (c: Conversation) => { this.removeChat(c); },
+      onSaveUserName: (name: string) => {
+        this.workspace.userName = name;
+        this.persistAction();
+      },
+      onOpenTranslate: () => {
+        this.translateInitialText = '';
+        this.navigateTo('translate');
+      },
+      onOpenSettings: () => {
+        this.refreshStorageSize().catch(() => {});
+        this.navigateTo('settings');
       }
-      .width('100%')
-
-      // Collapsible Assistant Switcher Row
-      Row({ space: 10 }) {
-        KelivoAvatarBadge({
-          brandId: '',
-          avatarText: this.persona().avatar || '',
-          fallbackLetter: this.persona().name,
-          badgeSize: 32
-        })
-        Text(this.persona().name)
-          .fontSize(15)
-          .fontWeight(FontWeight.Medium)
-          .fontColor($r('app.color.ink'))
-          .layoutWeight(1)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-        SymbolGlyph(this.drawerAssistantsExpanded ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
-          .fontSize(15)
-          .fontColor([$r('app.color.muted')])
-      }
-      .width('100%')
-      .padding({ left: 8, right: 8, top: 8, bottom: 8 })
-      .borderRadius(12)
-      .backgroundColor(this.drawerAssistantsExpanded ? $r('app.color.surface') : Color.Transparent)
-      .onClick(() => { this.drawerAssistantsExpanded = !this.drawerAssistantsExpanded; })
-
-      if (this.drawerAssistantsExpanded) {
-        Column({ space: 4 }) {
-          ForEach(this.workspace.personas, (pItem: Persona) => {
-            Row({ space: 8 }) {
-              KelivoAvatarBadge({
-                brandId: '',
-                avatarText: pItem.avatar || '',
-                fallbackLetter: pItem.name,
-                badgeSize: 26
-              })
-              Text(pItem.name)
-                .fontSize(14)
-                .fontColor(pItem.id === this.persona().id ? $r('app.color.accent') : $r('app.color.ink'))
-                .layoutWeight(1)
-                .maxLines(1)
-                .textOverflow({ overflow: TextOverflow.Ellipsis })
-              if (pItem.id === this.selectedPersonaId()) {
-                SymbolGlyph($r('sys.symbol.checkmark'))
-                  .fontSize(14)
-                  .fontColor([$r('app.color.accent')])
-              }
-              Button({ type: ButtonType.Circle }) {
-                SymbolGlyph($r('sys.symbol.square_and_pencil'))
-                  .fontSize(14)
-                  .fontColor([$r('app.color.muted')])
-              }
-              .width(28)
-              .height(28)
-              .padding(0)
-              .backgroundColor(Color.Transparent)
-              .accessibilityText(`编辑 ${pItem.name}`)
-              .onClick(() => {
-                this.drawerAssistantsExpanded = false;
-                this.personaEditTargetId = pItem.id;
-                this.navigateTo('persona_detail');
-              })
-            }
-            .width('100%')
-            .padding({ left: 10, right: 8, top: 6, bottom: 6 })
-            .borderRadius(10)
-            .backgroundColor(pItem.id === this.selectedPersonaId() ? $r('app.color.tint') : Color.Transparent)
-            .onClick(() => {
-              this.selectAssistant(pItem.id, false);
-            })
-          }, (pItem: Persona) => `da-${pItem.id}-${pItem.name}`)
-
-          Row({ space: 6 }) {
-            SymbolGlyph($r('sys.symbol.gearshape'))
-              .fontSize(14)
-              .fontColor([$r('app.color.accent')])
-            Text('管理助手与提示词')
-              .fontSize(13)
-              .fontColor($r('app.color.accent'))
-          }
-          .width('100%')
-          .padding({ left: 10, right: 10, top: 8, bottom: 6 })
-          .onClick(() => {
-            this.drawerAssistantsExpanded = false;
-            this.personaEditTargetId = '';
-            this.navigateTo('personas');
-          })
-        }
-        .width('100%')
-        .padding(6)
-        .borderRadius(12)
-        .backgroundColor($r('app.color.surface'))
-      }
-
-      // Conversations List grouped by Pinned / Today / Yesterday / Earlier
-      List({ space: 4 }) {
-        ForEach(this.chatRows(), (c: Conversation, ci: number) => {
-          ListItem() {
-            Column({ space: 2 }) {
-              if (this.isDrawerGroupStart(this.chatRows(), ci)) {
-                Text(this.dateGroupLabel(c))
-                  .fontSize(11)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('app.color.muted'))
-                  .padding({ left: 8, top: ci === 0 ? 2 : 8, bottom: 2 })
-                  .width('100%')
-              }
-              Row() {
-                if (this.renameId === c.id) {
-                  TextInput({ text: this.renameText, placeholder: '对话名称' }).layoutWeight(1).maxLength(120)
-                    .onChange((v: string) => { this.renameText = v; })
-                  Button('保存')
-                    .height(30)
-                    .fontSize(12)
-                    .onClick(() => {
-                      this.putChat({ id: c.id, title: this.renameText.trim(), updated: c.updated, messages: c.messages, personaId: c.personaId });
-                      this.renameId = '';
-                      this.persistAction();
-                    })
-                  this.actionIcon($r('sys.symbol.xmark'), '取消重命名', () => { this.renameId = ''; })
-                } else {
-                  Row({ space: 6 }) {
-                    if (c.pinned) {
-                      SymbolGlyph($r('sys.symbol.pin'))
-                        .fontSize(13)
-                        .fontColor([$r('app.color.accent')])
-                    }
-                    Text((c.ephemeral ? '🕶 ' : '') + c.title)
-                      .fontSize(14)
-                      .fontWeight(c.id === this.workspace.activeConversation ? FontWeight.Medium : FontWeight.Normal)
-                      .fontColor($r('app.color.ink'))
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      .layoutWeight(1)
-                    if (this.generatingChatIds.includes(c.id)) {
-                      LoadingProgress()
-                        .width(14)
-                        .height(14)
-                        .color($r('app.color.accent'))
-                    }
-                  }
-                  .layoutWeight(1)
-                  .padding({ left: 10, right: 4, top: 11, bottom: 11 })
-                  .onClick(() => {
-                    this.setDrawerOpen(false);
-                    this.activate(c.id);
-                  })
-
-                  Button({ type: ButtonType.Circle }) {
-                    SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-                      .fontSize(16)
-                      .fontColor([$r('app.color.muted')])
-                  }
-                  .height(34)
-                  .width(34)
-                  .padding(0)
-                  .backgroundColor(Color.Transparent)
-                  .accessibilityText('管理对话')
-                  .bindMenu([
-                    { value: c.pinned ? '取消置顶' : '置顶', action: () => {
-                      this.putChat({ id: c.id, title: c.title, updated: c.updated, personaId: c.personaId, messages: c.messages, pinned: !c.pinned });
-                      this.persistAction();
-                    } },
-                    { value: '重命名', action: () => { this.renameText = c.title; this.renameId = c.id; } },
-                    { value: '复制对话', action: () => { this.duplicateChat(c); } },
-                    { value: '迁移至下一助手', action: () => { this.moveChatToNextPersona(c); } },
-                    { value: '删除对话', action: () => this.removeChat(c) }
-                  ], ImmersiveMaterialStyle.menuOptions(this.immersiveLightOn()))
-                }
-              }
-              .width('100%')
-              .borderRadius(12)
-              .backgroundColor(c.id === this.workspace.activeConversation ? $r('app.color.tint') : Color.Transparent)
-            }
-            .width('100%')
-          }
-        }, (c: Conversation) => `${c.id}_${c.title}_${c.updated}_${c.messages.length}_${!!c.pinned}_${c.id === this.workspace.activeConversation}_${c.id === this.renameId}_${this.generatingChatIds.includes(c.id)}`)
-
-        if (!this.chatRows().length) {
-          ListItem() {
-            Text(this.query ? '没有匹配的对话' : '发送第一条消息后，对话会保存在这里。')
-              .padding({ left: 10, top: 14 })
-              .fontSize(13)
-              .fontColor($r('app.color.muted'))
-          }
-        }
-      }
-      .width('100%')
-      .layoutWeight(1)
-
-      // Bottom User Profile + Translate + Settings Bar (matching android_02_drawer.png)
-      if (this.drawerEditingUser) {
-        Row({ space: 6 }) {
-          TextInput({ text: this.drawerUserNameDraft, placeholder: '输入昵称' })
-            .layoutWeight(1)
-            .height(34)
-            .fontSize(13)
-            .onChange((v: string) => { this.drawerUserNameDraft = v; })
-          Button('确定')
-            .height(32)
-            .fontSize(12)
-            .onClick(() => {
-              const trimmed = this.drawerUserNameDraft.trim();
-              if (trimmed) {
-                this.workspace.userName = trimmed;
-                this.persistAction();
-              }
-              this.drawerEditingUser = false;
-            })
-        }
-        .width('100%')
-        .padding({ top: 4 })
-      } else {
-        Row({ space: 8 }) {
-          KelivoAvatarBadge({
-            brandId: '',
-            avatarText: '',
-            fallbackLetter: this.workspace.userName || '用户',
-            badgeSize: 32
-          })
-          Text(this.workspace.userName || '用户')
-            .fontSize(14)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.ink'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-            .onClick(() => {
-              this.drawerUserNameDraft = this.workspace.userName || '用户';
-              this.drawerEditingUser = true;
-            })
-
-          Button({ type: ButtonType.Circle }) {
-            SymbolGlyph($r('sys.symbol.translate'))
-              .fontSize(19)
-              .fontColor([$r('app.color.ink')])
-          }
-          .width(38)
-          .height(38)
-          .padding(0)
-          .backgroundColor(Color.Transparent)
-          .accessibilityText(this.uiLabels().translateTool)
-          .onClick(() => {
-            this.translateInitialText = '';
-            this.navigateTo('translate');
-          })
-
-          Button({ type: ButtonType.Circle }) {
-            SymbolGlyph($r('sys.symbol.gearshape'))
-              .fontSize(19)
-              .fontColor([$r('app.color.ink')])
-          }
-          .width(38)
-          .height(38)
-          .padding(0)
-          .backgroundColor(Color.Transparent)
-          .accessibilityText(this.uiLabels().settings)
-          .onClick(() => {
-            this.refreshStorageSize().catch(() => {});
-            this.navigateTo('settings');
-          })
-        }
-        .width('100%')
-        .padding({ top: 4 })
-      }
-    }
-    .padding({
-      top: this.winTopInset + 6,
-      left: 14 + (isOverlay ? this.winLeftInset : 0),
-      right: 14,
-      bottom: Math.max(12, this.effectiveBottomInset() + 8)
     })
-    .width(isOverlay ? '100%' : 285)
-    .height('100%')
-    .backgroundColor(isOverlay ? $r('app.color.surface') : $r('app.color.panel'))
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .enabled(!this.picking)
   }
 
   @Builder
   drawerOverlay() {
-    Row() {
-      Column() {
-        this.sidebarBody(true)
-      }
-      .width('78%')
-      .constraintSize({ maxWidth: 335 })
-      .height('100%')
-      .transition(SystemMotion.drawerPanelTransition(this.reduceMotion))
-
-      Column()
-        .layoutWeight(1)
-        .height('100%')
-        .onClick(() => { this.setDrawerOpen(false); })
-    }
-    .width('100%')
-    .height('100%')
-    .backgroundColor('#4D000000')
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .transition(SystemMotion.drawerScrimTransition(this.reduceMotion))
-  }
-
-  private toolRowLabel(name: string): string {
-    switch (name) {
-      case 'memory_update': return '更新记忆';
-      case 'memory_read': return '读取记忆';
-      case 'memory_search_profile': return '查找记忆';
-      case 'memory_edit': return '编辑记忆';
-      case 'memory_delete': return '归档记忆';
-      case 'update_user_profile': return '更新用户画像';
-      case 'web_search': return '搜索网页';
-      case 'web_fetch': return '读取网页';
-      case '$web_search':
-      case 'builtin_search': return '模型内置搜索';
-      default: return name;
-    }
-  }
-
-  @Builder
-  toolApprovalControls() {
-    Column({ space: 6 }) {
-      Text('工具执行授权请求：' + this.pendingApprovalTool)
-        .fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.ink'))
-      Text(this.pendingApprovalArgs).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
-        .maxLines(3).textOverflow({ overflow: TextOverflow.Ellipsis })
-      Row({ space: 6 }) {
-        Button('允许一次').height(28).fontSize(12).backgroundColor($r('app.color.accent')).fontColor($r('app.color.on_accent'))
-          .onClick(() => this.resolveToolApproval('allow_once'))
-        Button('本对话全部允许').height(28).fontSize(12).backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-          .onClick(() => this.resolveToolApproval('allow_all'))
-        Button('拒绝').height(28).fontSize(12).backgroundColor($r('app.color.panel')).fontColor($r('app.color.warning'))
-          .onClick(() => this.resolveToolApproval('deny'))
-      }
-    }.width('100%').padding(10).alignItems(HorizontalAlign.Start)
-  }
-
-  private toolRecordStatusLabel(status: string): string {
-    if (status === 'pending') return '待授权';
-    if (status === 'running') return '执行中';
-    if (status === 'denied') return '已拒绝';
-    if (status === 'error') return '失败';
-    return '完成';
-  }
-
-  private toolGroupBadgeText(grp: ToolCallGroup): string {
-    if (grp.status === 'pending') return '待授权';
-    if (grp.status === 'running') return '执行中';
-    if (grp.status === 'denied') return '已拒绝';
-    if (grp.status === 'error') return '失败';
-    if (grp.failedCount > 0) return `${grp.failedCount} 次失败`;
-    return '';
-  }
-
-  @Builder
-  toolCallGroupRow(grp: ToolCallGroup, rowId: string, isLive: boolean) {
-    Column({ space: 4 }) {
-      Button({ type: ButtonType.Normal }) {
-        Row({ space: 8 }) {
-          Text('•••').fontSize(11).fontColor($r('app.color.muted'))
-          Row({ space: 5 }) {
-            Text(this.toolRowLabel(grp.name))
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.muted'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .constraintSize({ maxWidth: '80%' })
-            if (grp.count > 1) {
-              Text(`×${grp.count}`)
-                .fontSize(11)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.muted'))
-            }
-          }
-          .layoutWeight(1)
-          .alignItems(VerticalAlign.Center)
-
-          if (this.toolGroupBadgeText(grp).length > 0) {
-            Text(this.toolGroupBadgeText(grp))
-              .fontSize(11)
-              .fontColor((grp.status === 'error' || grp.status === 'denied' || grp.failedCount > 0)
-                ? $r('app.color.warning')
-                : $r('app.color.accent'))
-          }
-          SymbolGlyph(this.expandedToolId === rowId ? $r('sys.symbol.chevron_down') : $r('sys.symbol.chevron_right'))
-            .fontSize(12).fontColor([$r('app.color.muted')])
-        }.width('100%')
-      }
-      .width('100%').height(36).padding({ left: 12, right: 12 }).backgroundColor(Color.Transparent)
-      .onClick(() => { this.expandedToolId = this.expandedToolId === rowId ? '' : rowId; })
-
-      if (this.expandedToolId === rowId) {
-        Column({ space: 8 }) {
-          ForEach(grp.records, (tc: ToolCallRecord, idx: number) => {
-            Column({ space: 4 }) {
-              if (grp.count > 1) {
-                if (idx > 0) {
-                  Divider().color($r('app.color.line')).margin({ bottom: 2 })
-                }
-                Text(`#${idx + 1} · ${this.toolRecordStatusLabel(tc.status)}${tc.durationMs > 0 ? ' · ' + tc.durationMs + ' ms' : ''}`)
-                  .fontSize(11)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor((tc.status === 'error' || tc.status === 'denied') ? $r('app.color.warning') : $r('app.color.muted'))
-              } else {
-                Text(tc.name + (tc.durationMs > 0 ? ' · ' + tc.durationMs + ' ms' : ''))
-                  .fontSize(11).fontColor($r('app.color.muted'))
-              }
-              Text('参数：' + tc.argsJson).fontFamily('monospace').fontSize(11).fontColor($r('app.color.muted'))
-                .copyOption(CopyOptions.LocalDevice)
-              if (tc.diffText) {
-                Text(tc.diffText).fontFamily('monospace').fontSize(11).fontColor($r('app.color.ink'))
-                  .padding(6).borderRadius(6).backgroundColor($r('app.color.surface')).copyOption(CopyOptions.LocalDevice)
-              }
-              if (tc.resultText) {
-                Text(tc.resultText.slice(0, 2000)).fontSize(12).fontColor($r('app.color.ink')).copyOption(CopyOptions.LocalDevice)
-              }
-            }
-            .width('100%')
-            .alignItems(HorizontalAlign.Start)
-          }, (tc: ToolCallRecord, idx: number) => `${rowId}-${idx}-${tc.id}-${tc.status}`)
-        }.width('100%').alignItems(HorizontalAlign.Start).padding({ left: 12, right: 12, bottom: 8 })
-      }
-      if (isLive && grp.status === 'pending' && this.pendingApprovalTool === grp.name) {
-        this.toolApprovalControls()
-      }
-    }.width('100%').alignItems(HorizontalAlign.Start)
-  }
-
-  private toggleReasoning(messageId: string): void {
-    const nextId = this.expandedReasoning === messageId ? '' : messageId;
-    if (this.reduceMotion) {
-      this.expandedReasoning = nextId;
-      return;
-    }
-    SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
-      this.expandedReasoning = nextId;
-    });
-  }
-
-  @Builder
-  replyActivityCard($$: ReplyActivityData) {
-    if (($$.reasoning && this.chatDisplayCfg().showThinkingCards) || ($$.records.length && this.chatDisplayCfg().showToolCards)) {
-      Column() {
-        if ($$.reasoning && this.chatDisplayCfg().showThinkingCards) {
-          Button({ type: ButtonType.Normal }) {
-            Row({ space: 8 }) {
-              SymbolGlyph($r('sys.symbol.lightbulb')).fontSize(15).fontColor([$r('app.color.accent')])
-              Text($$.thinking ? '正在思考' : '深度思考').fontSize(13).fontWeight(FontWeight.Medium).fontColor($r('app.color.ink'))
-              if (!$$.thinking && $$.durationMs > 0) {
-                Text('(' + ($$.durationMs / 1000).toFixed(1) + 's)').fontSize(12).fontColor($r('app.color.muted'))
-              }
-              Blank().layoutWeight(1)
-              SymbolGlyph($r('sys.symbol.chevron_down'))
-                .fontSize(12).fontColor([$r('app.color.muted')])
-                .rotate({ angle: this.expandedReasoning === $$.messageId ? 180 : 0 })
-            }.width('100%')
-          }
-          .width('100%').height(36).padding({ left: 12, right: 12 }).backgroundColor(Color.Transparent)
-          .accessibilityText(this.expandedReasoning === $$.messageId ? '收起思考过程' : '展开思考过程')
-          .onClick(() => this.toggleReasoning($$.messageId))
-
-          if (this.expandedReasoning === $$.messageId) {
-            Column() {
-              if (!$$.thinking && this.appearanceCfg().enableReasoningMarkdown !== false) {
-                MessageBody({
-                  source: $$.reasoning, bodyFontSize: 13, codeFontSize: Math.max(11, this.codeTextSize() - 1),
-                  enableMarkdown: true, enableMathLatex: this.appearanceCfg().enableMathLatex !== false,
-                  onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
-                  onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
-                  onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
-                  onAskDraft: (draftStr: string) => { this.draft = draftStr; }
-                })
-              } else {
-                Text($$.reasoning).fontSize(13).lineHeight(20).fontColor($r('app.color.muted'))
-                  .copyOption(CopyOptions.LocalDevice).width('100%')
-              }
-            }.width('100%').padding({ left: 12, right: 12, bottom: 8 })
-              .transition(SystemMotion.reasoningRevealTransition(this.reduceMotion))
-          }
-        }
-        if (this.chatDisplayCfg().showToolCards) {
-          ForEach(
-            groupToolCallRecords($$.records),
-            (grp: ToolCallGroup) => {
-              this.toolCallGroupRow(grp, $$.messageId + '/' + grp.name, $$.messageId === this.liveMessageId && this.working);
-            },
-            (grp: ToolCallGroup) => `${$$.messageId}/${grp.name}/${grp.count}/${grp.status}/${grp.failedCount}`
-          )
-        }
-      }.width('100%').padding({ top: 2, bottom: 2 }).borderRadius(16)
-        .clip(true)
-        .backgroundColor(hexWithAlpha(this.themeTokens().tint, this.effectiveDark() ? '80' : '60'))
-    }
+    ChatDrawerOverlay({
+      sidebarContent: () => { this.sidebarBody(true); },
+      onDismiss: () => { this.setDrawerOpen(false); }
+    })
   }
 
   @Builder
   messageRow(msg: ChatMessage, msgIdx: number) {
-    Column({ space: 6 }) {
-      if (this.multiSelectMode) {
-        Row({ space: 6 }) {
-          Button(this.selectedMsgIds.includes(msg.id) ? '☑ 已选中' : '☐ 选择此消息')
-            .height(26).fontSize(11)
-            .backgroundColor(this.selectedMsgIds.includes(msg.id) ? $r('app.color.accent') : $r('app.color.panel'))
-            .fontColor(this.selectedMsgIds.includes(msg.id) ? $r('app.color.on_accent') : $r('app.color.ink'))
-            .onClick(() => this.toggleSelectedMsg(msg.id))
-        }.width('100%')
-      }
-
-      if (msg.role === 'assistant') {
+    if (msg.role === 'assistant' && this.isRegeneratingMessage(msg)) {
+      Column({ space: 6 }) {
+        if (this.multiSelectMode) {
+          Row({ space: 6 }) {
+            Button(this.selectedMsgIds.includes(msg.id) ? '☑ 已选中' : '☐ 选择此消息')
+              .height(26).fontSize(11)
+              .backgroundColor(this.selectedMsgIds.includes(msg.id) ? $r('app.color.accent') : $r('app.color.panel'))
+              .fontColor(this.selectedMsgIds.includes(msg.id) ? $r('app.color.on_accent') : $r('app.color.ink'))
+              .onClick(() => this.toggleSelectedMsg(msg.id))
+          }.width('100%')
+        }
         if (this.chatDisplayCfg().showModelIcon || this.chatDisplayCfg().showModelName ||
           this.chatDisplayCfg().showModelTimestamp || msg.isSummary) {
           Row({ space: 8 }) {
@@ -4391,7 +3530,11 @@ struct Index {
               })
             }
             if (this.chatDisplayCfg().showModelName) {
-              Text(this.persona().useAssistantName ? this.persona().name : this.modelHeaderLabel(msg))
+              Text(this.persona().useAssistantName
+                ? this.persona().name
+                : (this.chatDisplayCfg().showProviderAfterModelName && msg.model
+                  ? `${msg.model} (${this.provider().name})`
+                  : (msg.model || '助手')))
                 .fontSize(12)
                 .fontWeight(FontWeight.Medium)
                 .fontColor($r('app.color.ink'))
@@ -4406,8 +3549,8 @@ struct Index {
                 .backgroundColor($r('app.color.tint'))
                 .fontColor($r('app.color.accent'))
             }
-            if (this.chatDisplayCfg().showModelTimestamp && this.formatMsgTime(msg.createdAt).length > 0) {
-              Text(this.formatMsgTime(msg.createdAt))
+            if (this.chatDisplayCfg().showModelTimestamp && formatChatMessageTime(msg.createdAt).length > 0) {
+              Text(formatChatMessageTime(msg.createdAt))
                 .fontSize(11)
                 .fontColor($r('app.color.muted'))
             }
@@ -4415,918 +3558,201 @@ struct Index {
           .alignItems(VerticalAlign.Center)
           .width('100%')
         }
-
-        if (this.isRegeneratingMessage(msg)) {
-          this.liveStreamBody()
-        } else {
-          this.replyActivityCard({
-            messageId: msg.id, reasoning: msg.reasoning || '', records: msg.toolCalls || [],
-            thinking: false, durationMs: msg.reasoningDurationMs || 0
-          })
-
-          ForEach(this.assistantParagraphsFor(msg), (para: string, pi: number) => {
-            Column() {
-              MessageBody({
-                source: para,
-                bodyFontSize: this.bodyTextSize(),
-                codeFontSize: this.codeTextSize(),
-                enableMarkdown: this.appearanceCfg().enableAssistantMarkdown !== false,
-                enableMathLatex: this.appearanceCfg().enableMathLatex !== false,
-                onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
-                onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
-                onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
-                onAskDraft: (draftStr: string) => { this.draft = draftStr; }
-              })
-            }
-            .width(this.appearanceCfg().fitAssistantBubble ? undefined : '100%')
-            .constraintSize(this.appearanceCfg().fitAssistantBubble ? { maxWidth: '92%' } : undefined)
-            .alignItems(HorizontalAlign.Start)
-            .padding(this.appearanceCfg().bubbleStyle === 'default' && !this.appearanceCfg().splitParagraphsIntoBubbles
-              ? 0
-              : { left: 12, right: 12, top: 10, bottom: 10 })
-            .borderRadius(this.bubbleRadiusVal())
-            .backgroundColor(this.appearanceCfg().bubbleStyle === 'default'
-              ? (this.appearanceCfg().splitParagraphsIntoBubbles ? $r('app.color.surface') : Color.Transparent)
-              : this.assistantBubbleBg())
-            .backgroundBlurStyle(this.appearanceCfg().bubbleStyle === 'frosted' ? BlurStyle.COMPONENT_THICK : BlurStyle.NONE)
-          }, (para: string, pi: number) => `${msg.id}-${this.versionLabel(msg)}-p-${pi}-${para.length}-${this.appearanceCfg().bubbleStyle}-${this.appearanceCfg().fitAssistantBubble}`)
-
-          if (msg.sources?.length) {
-            Button('搜索来源 · ' + msg.sources.length)
-              .type(ButtonType.Normal)
-              .height(28)
-              .fontSize(12)
-              .borderRadius(14)
-              .padding({ left: 10, right: 10 })
-              .fontColor($r('app.color.accent'))
-              .backgroundColor($r('app.color.tint'))
-              .onClick(() => { this.expandedSources = this.expandedSources === msg.id ? '' : msg.id; })
-            if (this.expandedSources === msg.id) {
-              Column({ space: 6 }) {
-                ForEach(msg.sources, (hit: SearchHit, i: number) => {
-                  Column({ space: 2 }) {
-                    Text(`[${i + 1}] ${hit.title || hit.url}`)
-                      .fontSize(12)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor($r('app.color.ink'))
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                    Text(hit.url)
-                      .fontSize(11)
-                      .fontColor($r('app.color.accent'))
-                      .maxLines(1)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  }
-                  .width('100%')
-                  .alignItems(HorizontalAlign.Start)
-                  .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-                  .borderRadius(8)
-                  .backgroundColor($r('app.color.panel'))
-                  .onClick(() => { this.openUrlInBrowser(hit.url); })
-                }, (hit: SearchHit, i: number) => `${msg.id}-src-${i}-${hit.url}`)
-              }
-              .width('100%')
-              .alignItems(HorizontalAlign.Start)
-            }
-          }
-          if (msg.generatedImages?.length && this.chatDisplayCfg().showFilesBelowReplies) {
-            Row({ space: 8 }) {
-              ForEach(msg.generatedImages, (imgAtt: Attachment, ii: number) => {
-                Image(this.imageSrcForAttachment(imgAtt)).width(160).height(160).objectFit(ImageFit.Cover).borderRadius(12)
-                  .onClick(() => this.openImage(this.imageSrcForAttachment(imgAtt), imgAtt.name))
-              }, (imgAtt: Attachment, ii: number) => msg.id + '-gi-' + ii)
-            }
-          }
-          if (msg.translation) {
-            Column({ space: 4 }) {
-              Text('译文').fontSize(11).fontWeight(FontWeight.Bold).fontColor($r('app.color.accent'))
-              Text(msg.translation).fontSize(14).lineHeight(22).fontColor($r('app.color.ink')).copyOption(CopyOptions.LocalDevice)
-            }.width('100%').padding(10).borderRadius(10).backgroundColor($r('app.color.panel')).alignItems(HorizontalAlign.Start)
-          }
-
-          Row({ space: 2 }) {
-            this.msgActionIcon(
-              $r('sys.symbol.rectangle_on_rectangle'),
-              '复制',
-              false,
-              `msgCopy-${msgIdx}`,
-              () => { this.copyText(msg.text); }
-            )
-            this.msgActionIcon(
-              $r('sys.symbol.arrow_2_circlepath'),
-              '重新生成',
-              true,
-              `msgRegen-${msgIdx}`,
-              () => { this.send(true, msg.id); }
-            )
-            Button({ type: ButtonType.Circle }) {
-              SymbolGlyph(this.readingId === msg.id ? $r('sys.symbol.speaker_slash') : $r('sys.symbol.speaker_wave_2'))
-                .fontSize(17)
-                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-                .fontColor([this.readingId === msg.id ? $r('app.color.accent') : $r('app.color.muted')])
-            }
-            .id(`msgSpeak-${msgIdx}`)
-            .width(32)
-            .height(32)
-            .padding(0)
-            .backgroundColor(Color.Transparent)
-            .accessibilityText(this.readingId === msg.id ? '停止朗读' : '朗读')
-            .onClick(() => { this.narrate(msg); })
-
-            Button({ type: ButtonType.Circle }) {
-              SymbolGlyph($r('sys.symbol.translate'))
-                .fontSize(17)
-                .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-                .fontColor([msg.translation ? $r('app.color.accent') : $r('app.color.muted')])
-            }
-            .id(`msgTrans-${msgIdx}`)
-            .width(32)
-            .height(32)
-            .padding(0)
-            .backgroundColor(Color.Transparent)
-            .accessibilityText(msg.translation ? '隐藏译文' : '翻译')
-            .onClick(() => { this.translateMessage(msg.id); })
-
-            this.msgMoreDotsBtn(`msgMore-${msgIdx}`, () => { this.openMessageActionSheet(msg); })
-            if (this.activeVersionCount(msg) > 1) {
-              Button({ type: ButtonType.Circle }) {
-                SymbolGlyph($r('sys.symbol.chevron_left'))
-                  .fontSize(15)
-                  .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-                  .fontColor([this.canPrevVersion(msg) ? $r('app.color.muted') : $r('app.color.line')])
-              }
-              .id(`msgVerPrev-${msgIdx}`)
-              .width(26)
-              .height(28)
-              .padding(0)
-              .backgroundColor(Color.Transparent)
-              .enabled(this.canPrevVersion(msg))
-              .accessibilityText('上一版本')
-              .onClick(() => { this.switchReplyVersion(msg.id, -1); })
-
-              Text(this.versionLabel(msg))
-                .id(`msgVerLabel-${msgIdx}`)
-                .fontSize(12)
-                .fontColor($r('app.color.muted'))
-                .padding({ left: 2, right: 2 })
-
-              Button({ type: ButtonType.Circle }) {
-                SymbolGlyph($r('sys.symbol.chevron_right'))
-                  .fontSize(15)
-                  .renderingStrategy(SymbolRenderingStrategy.SINGLE)
-                  .fontColor([this.canNextVersion(msg) ? $r('app.color.muted') : $r('app.color.line')])
-              }
-              .id(`msgVerNext-${msgIdx}`)
-              .width(26)
-              .height(28)
-              .padding(0)
-              .backgroundColor(Color.Transparent)
-              .enabled(this.canNextVersion(msg))
-              .accessibilityText('下一版本')
-              .onClick(() => { this.switchReplyVersion(msg.id, 1); })
-            }
-            Blank()
-            if (this.chatDisplayCfg().showTokenStats && this.compactTokenCountText(msg).length > 0) {
-              Text(this.compactTokenCountText(msg))
-                .fontSize(11)
-                .fontColor($r('app.color.muted'))
-            }
-          }
-          .width('100%')
-          .alignItems(VerticalAlign.Center)
-          .padding({ top: 2 })
-        }
-      } else {
-        if (this.chatDisplayCfg().showUserAvatar || this.chatDisplayCfg().showUserName ||
-          (this.chatDisplayCfg().showUserTimestamp && this.formatMsgTime(msg.createdAt).length > 0)) {
-          Row({ space: 6 }) {
-            if (this.chatDisplayCfg().showUserTimestamp && this.formatMsgTime(msg.createdAt).length > 0) {
-              Text(this.formatMsgTime(msg.createdAt))
-                .fontSize(11)
-                .fontColor($r('app.color.muted'))
-            }
-            if (this.chatDisplayCfg().showUserName) {
-              Text(this.workspace.userName || '用户')
-                .fontSize(12)
-                .fontWeight(FontWeight.Medium)
-                .fontColor($r('app.color.muted'))
-            }
-            if (this.chatDisplayCfg().showUserAvatar) {
-              KelivoAvatarBadge({
-                brandId: '',
-                avatarText: '',
-                fallbackLetter: this.workspace.userName || '用户',
-                badgeSize: 20
-              })
-            }
-          }
-          .justifyContent(FlexAlign.End)
-          .width('100%')
-        }
-        Column({ space: 6 }) {
-          if (msg.quote?.excerpt) {
-            Text('❝ ' + msg.quote.excerpt).fontSize(12).fontColor($r('app.color.muted'))
-              .padding(6).borderRadius(8).backgroundColor($r('app.color.surface'))
-          }
-          if (msg.sources?.length) {
-            Button('网页来源 · ' + msg.sources.length).height(30).fontSize(12).fontColor($r('app.color.accent'))
-              .backgroundColor($r('app.color.surface')).onClick(() => { this.expandedSources = this.expandedSources === msg.id ? '' : msg.id; })
-            if (this.expandedSources === msg.id) {
-              ForEach(msg.sources, (hit: SearchHit, i: number) => {
-                Text('[' + (i + 1) + '] ' + hit.title + '\n' + hit.url).fontSize(12).fontColor($r('app.color.muted'))
-                  .copyOption(CopyOptions.LocalDevice)
-              }, (hit: SearchHit, i: number) => i + hit.url)
-            }
-          }
-          ForEach(getAllAttachments(msg), (att: Attachment, ai: number) => {
-            if (att.mime.startsWith('image/') && (att.data || att.filePath)) {
-              Image(this.imageSrcForAttachment(att)).width(160).height(120).objectFit(ImageFit.Cover).borderRadius(10)
-                .onClick(() => this.openImage(this.imageSrcForAttachment(att), att.name))
-            } else {
-              Text('附件 · ' + att.name).fontSize(12).fontColor($r('app.color.muted'))
-            }
-          }, (att: Attachment, ai: number) => msg.id + '-att-' + ai + '-' + att.name)
-          if (msg.text) {
-            if ((this.appearanceCfg().collapseLongUserChars || 0) > 0 &&
-              msg.text.length > (this.appearanceCfg().collapseLongUserChars || 0) &&
-              !this.expandedLongMsgIds.includes(msg.id)) {
-              Column({ space: 4 }) {
-                Text(msg.text.slice(0, this.appearanceCfg().collapseLongUserChars) + '...')
-                  .fontSize(this.bodyTextSize())
-                  .lineHeight(Math.round(this.bodyTextSize() * 1.48))
-                  .fontColor($r('app.color.ink'))
-                  .copyOption(CopyOptions.LocalDevice)
-                Text(`展开全文 (${msg.text.length} 字)`)
-                  .fontSize(12)
-                  .fontColor($r('app.color.accent'))
-                  .onClick(() => {
-                    this.expandedLongMsgIds = [...this.expandedLongMsgIds, msg.id];
-                  })
-              }
-              .alignItems(HorizontalAlign.Start)
-            } else if (this.appearanceCfg().enableUserMarkdown !== false &&
-              /(`|\*\*|#|\[.*\]\(|\n[-*>]\s)/.test(msg.text)) {
-              MessageBody({
-                source: msg.text,
-                bodyFontSize: this.bodyTextSize(),
-                codeFontSize: this.codeTextSize(),
-                enableMarkdown: true,
-                enableMathLatex: this.appearanceCfg().enableMathLatex !== false,
-                onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
-                onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
-                onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
-                onAskDraft: (draftStr: string) => { this.draft = draftStr; }
-              })
-            } else {
-              Text(msg.text)
-                .fontSize(this.bodyTextSize())
-                .lineHeight(Math.round(this.bodyTextSize() * 1.48))
-                .fontColor($r('app.color.ink'))
-                .copyOption(CopyOptions.LocalDevice)
-            }
-          }
-        }
-        .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-        .constraintSize({ maxWidth: '88%' })
-        .borderRadius(this.bubbleRadiusVal())
-        .backgroundColor(this.userBubbleBg())
-        .backgroundBlurStyle(this.appearanceCfg().bubbleStyle === 'frosted' ? BlurStyle.COMPONENT_THICK : BlurStyle.NONE)
-        .alignItems(HorizontalAlign.Start)
-
-        if (this.chatDisplayCfg().showUserMessageActions) {
-          Row({ space: 4 }) {
-            this.msgActionIcon(
-              $r('sys.symbol.rectangle_on_rectangle'),
-              '复制',
-              false,
-              `userCopy-${msgIdx}`,
-              () => { this.copyText(msg.text); }
-            )
-            this.msgActionIcon(
-              $r('sys.symbol.arrow_2_circlepath'),
-              '重新生成',
-              true,
-              `userRegen-${msgIdx}`,
-              () => { this.send(true, msg.id); }
-            )
-            this.msgActionIcon(
-              $r('sys.symbol.pencil_line'),
-              '编辑',
-              true,
-              `userEdit-${msgIdx}`,
-              () => {
-                this.editingMsgText = msg.text;
-                SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-                  this.editingMsgId = msg.id;
-                });
-              }
-            )
-            this.msgMoreDotsBtn(`userMore-${msgIdx}`, () => { this.openMessageActionSheet(msg); })
-          }
-          .padding({ top: 2, right: 2 })
-        }
-      }
-    }.alignItems(msg.role === 'user' ? HorizontalAlign.End : HorizontalAlign.Start).width('100%')
+        this.liveStreamBody()
+      }.alignItems(HorizontalAlign.Start).width('100%')
+    } else {
+      ChatMessageRowView({
+        msg: msg,
+        msgIdx: msgIdx,
+        multiSelectMode: this.multiSelectMode,
+        isSelected: this.selectedMsgIds.includes(msg.id),
+        working: this.working,
+        readingId: this.readingId,
+        userName: this.workspace.userName || '用户',
+        displayCfg: this.chatDisplayCfg(),
+        appearance: this.appearanceCfg(),
+        useAssistantAvatar: this.persona().useAssistantAvatar === true,
+        useAssistantName: this.persona().useAssistantName === true,
+        personaName: this.persona().name,
+        personaAvatar: this.persona().avatar || '',
+        personaRegexRules: this.persona().regexRules || [],
+        providerName: this.provider().name,
+        providerFamily: this.provider().family,
+        surfaceHex: this.themeTokens().surface,
+        tintHex: this.themeTokens().tint,
+        isDark: this.effectiveDark(),
+        liveMessageId: this.liveMessageId,
+        pendingApprovalTool: this.pendingApprovalTool,
+        pendingApprovalArgs: this.pendingApprovalArgs,
+        expandedReasoning: this.expandedReasoning,
+        expandedToolId: this.expandedToolId,
+        expandedSources: this.expandedSources,
+        expandedLongMsgIds: this.expandedLongMsgIds,
+        onToggleSelect: (msgId: string) => this.toggleSelectedMsg(msgId),
+        onCopyText: (text: string) => { this.copyText(text); },
+        onRegenerate: (msgId: string) => { this.send(true, msgId); },
+        onNarrate: (m: ChatMessage) => { this.narrate(m); },
+        onTranslate: (msgId: string) => { this.translateMessage(msgId); },
+        onOpenActionSheet: (m: ChatMessage) => { this.openMessageActionSheet(m); },
+        onSwitchVersion: (msgId: string, delta: number) => { this.switchReplyVersion(msgId, delta); },
+        onStartEdit: (m: ChatMessage) => {
+          this.editingMsgText = m.text;
+          SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
+            this.editingMsgId = m.id;
+          });
+        },
+        onPreviewRich: (kind: RichPreviewKind, title: string, code: string) => this.openPreview(kind, title, code),
+        onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
+        onViewImage: (url: string, alt: string) => this.openImage(url, alt || '图片'),
+        onAskDraft: (draftStr: string) => { this.draft = draftStr; },
+        onResolveToolApproval: (choice: 'allow_once' | 'allow_all' | 'deny') => this.resolveToolApproval(choice)
+      })
+    }
   }
 
   @Builder
   chatTitleBar() {
-    Stack({ alignContent: Alignment.Top }) {
-      if (this.immersiveLightOn() && this.chatCanScrollUnderTitle()) {
-        Column()
-          .width('100%')
-          .height('100%')
-          .linearGradient({
-            direction: GradientDirection.Bottom,
-            colors: [[hexWithAlpha(this.chatBgColor(), '99'), 0.0], [hexWithAlpha(this.chatBgColor(), '00'), 1.0]]
-          })
-          .hitTestBehavior(HitTestMode.None)
-          .accessibilityLevel('no')
-          .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP])
-      }
-
-      Row({ space: 6 }) {
-        if (!this.wide) {
-          Stack({ alignContent: Alignment.TopEnd }) {
-            Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-              Image($r('app.media.icon_list'))
-                .width(20)
-                .height(20)
-                .objectFit(ImageFit.Contain)
-                .fillColor($r('sys.color.icon_primary'))
-            }
-            .id('openDrawer')
-            .width(40)
-            .height(40)
-            .padding(0)
-            .accessibilityText('打开侧边栏')
-            .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
-            .onClick(() => {
-              if (!this.picking) {
-                this.setDrawerOpen(true);
-              }
-            })
-            .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
-
-            if (this.hasOtherGeneratingChat()) {
-              Column()
-                .width(8)
-                .height(8)
-                .borderRadius(4)
-                .backgroundColor($r('app.color.accent'))
-                .margin({ top: 3, right: 3 })
-                .hitTestBehavior(HitTestMode.None)
-            }
-          }
-          .width(40)
-          .height(40)
-        }
-
-        Column({ space: 1 }) {
-          Text(this.activeChat()?.title || (this.ephemeralMode ? '临时对话' : this.uiLabels().newChat))
-            .fontSize(16)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('sys.color.font_primary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-          Text(`${this.persona().name} · ${this.activeModelId() || this.provider().name}`)
-            .fontSize(11)
-            .fontColor($r('sys.color.font_secondary'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-        }
-        .alignItems(HorizontalAlign.Start)
-        .constraintSize({ maxWidth: this.wide ? 360 : 185 })
-        .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-        .borderRadius(18)
-        .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
-        .onClick(() => {
-          if (!this.working && !this.picking) {
-            this.showModelQuickSheet = true;
-          }
-        })
-        .systemMaterial(ImmersiveMaterialStyle.titlePillMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
-
-        Blank()
-
-        if (this.wideSide) {
-          Button(this.sidePanelMode ? '收起' : '分栏', { buttonStyle: ButtonStyleMode.TEXTUAL })
-            .height(36)
-            .fontSize(12)
-            .fontColor($r('sys.color.font_primary'))
-            .borderRadius(18)
-            .padding({ left: 12, right: 12 })
-            .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn(), this.sidePanelMode !== ''))
-            .onClick(() => {
-              this.setSidePanelMode(this.sidePanelMode === '' ? 'browser' : '');
-            })
-            .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn(), this.sidePanelMode !== ''))
-        }
-
-        Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-          SymbolGlyph($r('sys.symbol.map'))
-            .fontSize(18)
-            .fontColor([$r('sys.color.icon_primary')])
-        }
-        .width(40)
-        .height(40)
-        .padding(0)
-        .accessibilityText('对话大纲')
-        .enabled(!this.picking)
-        .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
-        .onClick(() => { this.showMiniMap = true; })
-        .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
-
-        if (!this.activeChat() || (this.activeChat()?.messages.length || 0) === 0) {
-          Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-            if (this.ephemeralMode) {
-              Image($r('app.media.icon_temp_chat_checked'))
-                .width(19)
-                .height(19)
-                .objectFit(ImageFit.Contain)
-                .fillColor($r('app.color.accent'))
-            } else {
-              SymbolGlyph($r('sys.symbol.circle_dashed'))
-                .fontSize(19)
-                .fontColor([$r('sys.color.icon_primary')])
-            }
-          }
-          .id('tempChatToggle')
-          .width(40)
-          .height(40)
-          .padding(0)
-          .accessibilityText(this.ephemeralMode ? '退出临时对话' : '临时对话')
-          .enabled(!this.picking)
-          .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn(), this.ephemeralMode))
-          .onClick(() => { this.activate('', !this.ephemeralMode); })
-          .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn(), this.ephemeralMode))
-        } else {
-          Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-            SymbolGlyph($r('sys.symbol.plus'))
-              .fontSize(19)
-              .fontColor([$r('sys.color.icon_primary')])
-          }
-          .width(40)
-          .height(40)
-          .padding(0)
-          .accessibilityText(this.uiLabels().newChat)
-          .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
-          .onClick(() => { this.activate(''); })
-          .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
-        }
-
-        Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-          SymbolGlyph($r('sys.symbol.ellipsis_circle'))
-            .fontSize(19)
-            .fontColor([$r('sys.color.icon_primary')])
-        }
-        .id('chatMenu')
-        .width(40)
-        .height(40)
-        .padding(0)
-        .accessibilityText('更多操作')
-        .enabled(!this.picking)
-        .backgroundColor(ImmersiveMaterialStyle.titleButtonBackground(this.themeTokens(), this.immersiveLightOn()))
-        .bindMenu([
-          { value: '搜索本对话内容', action: () => {
-            SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
-              this.inChatSearchOpen = !this.inChatSearchOpen;
-            });
-          } },
-          { value: this.fullAccessMode ? '切换为工具审批模式' : '切换为工具完全访问', action: () => {
-            this.fullAccessMode = !this.fullAccessMode;
-            const c = this.activeChat();
-            if (c) { c.toolPermissionMode = this.fullAccessMode ? 'full' : 'ask'; this.persistAction(); }
-          } },
-          { value: '整理本对话记忆', action: () => { this.organizeCurrentConversation(); } },
-          { value: '助手与提示词设置', action: () => { this.navigateTo('personas'); } },
-          { value: '上下文与生成参数', action: () => { this.navigateTo('context'); } },
-          { value: '内置浏览器', action: () => { this.navigateTo('browser'); } },
-          { value: '用量统计', action: () => { this.refreshUsageStats().catch(() => {}); this.navigateTo('stats'); } },
-          { value: '设置中心', action: () => { this.refreshStorageSize().catch(() => {}); this.navigateTo('settings'); } }
-        ], ImmersiveMaterialStyle.menuOptions(this.immersiveLightOn()))
-        .systemMaterial(ImmersiveMaterialStyle.titleButtonMaterial(this.themeTokens(), this.effectiveDark(), this.immersiveLightOn()))
-      }
-      .width('100%')
-      .height('100%')
-      .padding({
-        top: this.winTopInset,
-        left: this.wide ? 16 : 8,
-        right: 8 + this.winTitleRightAvoid
-      })
-      .alignItems(VerticalAlign.Center)
-      .clip(false)
-    }
-    .width('100%')
-    .height('100%')
-    .clip(false)
-  }
-
-  @Builder
-  composerCardContent() {
-    if (this.quoteDraft) {
-      Row({ space: 6 }) {
-        Text('引用: ' + this.quoteDraft.excerpt).fontSize(12).fontColor($r('app.color.muted'))
-          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
-        Button('×').height(24).fontSize(12).padding(0).backgroundColor(Color.Transparent).fontColor($r('app.color.muted'))
-          .onClick(() => {
-            SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
-              this.quoteDraft = undefined;
-            });
-          })
-      }.width('100%').padding({ left: 8, right: 4 }).backgroundColor($r('app.color.panel')).borderRadius(8)
-        .transition(SystemMotion.inlineBarTransition(this.reduceMotion))
-    }
-    if (this.attachedList.length) {
-      Scroll() {
-        Row({ space: 6 }) {
-          ForEach(this.attachedList, (att: Attachment, ai: number) => {
-            Button(att.name + '  ×').height(28).fontSize(12).backgroundColor($r('app.color.tint'))
-              .fontColor($r('app.color.accent')).onClick(() => {
-                this.attachedList = this.attachedList.filter((_a: Attachment, idx: number): boolean => idx !== ai);
-              })
-          }, (att: Attachment, ai: number) => 'catt-' + ai + '-' + att.name)
-        }
-      }.scrollable(ScrollDirection.Horizontal).width('100%')
-    }
-    if (this.showPromptQuickBar) {
-      Column({ space: 6 }) {
-        if ((this.workspace.instructionCards || []).length > 0) {
-          Scroll() {
-            Row({ space: 6 }) {
-              ForEach(this.workspace.instructionCards || [], (card: InstructionCard) => {
-                Button(((this.workspace.activeInstructionIds || []).includes(card.id) ? '✓ ' : '') + card.title)
-                  .height(26).fontSize(11).borderRadius(8)
-                  .backgroundColor((this.workspace.activeInstructionIds || []).includes(card.id) ? $r('app.color.accent') : $r('app.color.panel'))
-                  .fontColor((this.workspace.activeInstructionIds || []).includes(card.id) ? $r('app.color.on_accent') : $r('app.color.ink'))
-                  .onClick(() => {
-                    const cur = this.workspace.activeInstructionIds || [];
-                    this.workspace.activeInstructionIds = cur.includes(card.id)
-                      ? cur.filter((id: string): boolean => id !== card.id)
-                      : [...cur, card.id];
-                    this.persistAction();
-                  })
-              }, (card: InstructionCard) => 'ic-' + card.id)
-            }
-          }.scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off).width('100%')
-        }
-        if (this.allQuickPhrases().length > 0) {
-          Scroll() {
-            Row({ space: 6 }) {
-              ForEach(this.allQuickPhrases(), (qp: QuickPhrase) => {
-                Button('» ' + qp.title)
-                  .height(26).fontSize(11).borderRadius(8)
-                  .backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-                  .onClick(() => {
-                    this.draft = this.draft.trim().length > 0 ? `${this.draft}\n${qp.content}` : qp.content;
-                    SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
-                      this.showPromptQuickBar = false;
-                    });
-                  })
-              }, (qp: QuickPhrase) => 'qp-' + qp.id)
-            }
-          }.scrollable(ScrollDirection.Horizontal).scrollBar(BarState.Off).width('100%')
-        }
-      }.width('100%').padding({ bottom: 4 })
-        .transition(SystemMotion.inlineBarTransition(this.reduceMotion))
-    }
-
-    TextArea({ text: this.draft, placeholder: this.composerPlaceholder() })
-      .id('composer')
-      .width('100%')
-      .enabled(!this.working && !this.picking)
-      .fontSize(16)
-      .fontColor(ImmersiveMaterialStyle.isActive(this.immersiveLightOn()) ? $r('sys.color.font_primary') : $r('app.color.ink'))
-      .placeholderColor(ImmersiveMaterialStyle.isActive(this.immersiveLightOn()) ? $r('sys.color.font_secondary') : $r('app.color.muted'))
-      .barState(BarState.Auto)
-      .constraintSize({ minHeight: 40, maxHeight: 160 })
-      .backgroundColor(Color.Transparent)
-      .onSubmit((enterKey: EnterKeyType) => {
-        if (this.appearanceCfg().enterToSend && !this.working && !this.picking && (this.draft.trim().length > 0 || this.attachedList.length > 0)) {
-          this.send();
-        }
-      })
-      .onChange((v: string) => { this.draft = v; })
-
-    Row({ space: 4 }) {
-      Button({ type: ButtonType.Normal, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-        KelivoAvatarBadge({
-          brandId: this.activeBrandId(),
-          avatarText: '',
-          fallbackLetter: this.provider().name,
-          badgeSize: 20,
-          plain: true
-        })
-      }
-      .id('currentModel')
-      .width(36)
-      .height(36)
-      .padding(0)
-      .borderRadius(10)
-      .accessibilityText('选择模型')
-      .enabled(!this.working && !this.picking)
-      .backgroundColor(Color.Transparent)
-      .onClick(() => { this.showModelQuickSheet = true; })
-
-      Button({ type: ButtonType.Normal, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-        SymbolGlyph(this.currentBuiltinSearchOn()
-          ? $r('sys.symbol.magnifyingglass')
-          : $r('sys.symbol.globe_badge_message'))
-          .fontSize(19)
-          .fontColor([(this.currentBuiltinSearchOn() || this.searchOn)
-            ? $r('app.color.accent')
-            : this.composerInactiveIconColor()])
-      }
-      .id('webSearch')
-      .width(36)
-      .height(36)
-      .padding(0)
-      .borderRadius(10)
-      .accessibilityText(this.currentBuiltinSearchOn()
-        ? '模型内置搜索已开启'
-        : (this.searchOn ? '联网搜索已开启' : '联网搜索'))
-      .enabled(!this.working && !this.picking)
-      .backgroundColor(Color.Transparent)
-      .onClick(() => { this.showSearchQuickSheet = true; })
-
-      if (this.activeReasoningControl().levels.length > 1) {
-        Button({ type: ButtonType.Normal, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-          Row({ space: 4 }) {
-            Image(reasoningBulbResource(reasoningBulbRayCount(this.activeReasoningControl(), this.activeReasoningEffort())))
-              .width(this.chatDisplayCfg().showReasoningLevelOnButton ? 18 : 20)
-              .height(this.chatDisplayCfg().showReasoningLevelOnButton ? 18 : 20)
-              .objectFit(ImageFit.Contain)
-              .fillColor(this.activeReasoningEffort() !== 'off' ? $r('app.color.accent') : this.composerInactiveIconColor())
-            if (this.chatDisplayCfg().showReasoningLevelOnButton) {
-              Text(this.reasoningLabelShort())
-                .fontSize(11)
-                .fontColor(this.activeReasoningEffort() !== 'off' ? $r('app.color.accent') : this.composerInactiveIconColor())
-            }
-          }
-        }
-        .id('reasoningToggle')
-        .height(36)
-        .constraintSize({ minWidth: 36 })
-        .padding(this.chatDisplayCfg().showReasoningLevelOnButton ? { left: 6, right: 6 } : 0)
-        .borderRadius(10)
-        .accessibilityText(`思考深度: ${this.reasoningLabelShort()}`)
-        .enabled(!this.working && !this.picking)
-        .backgroundColor(Color.Transparent)
-        .onClick(() => { this.showReasoningSheet = true; })
-      }
-
-      Button({ type: ButtonType.Circle }) {
-        SymbolGlyph($r('sys.symbol.wrench_and_screwdriver'))
-          .fontSize(16)
-          .fontColor([this.fullAccessMode ? $r('app.color.accent') : this.composerInactiveIconColor()])
-      }
-      .id('chatTools')
-      .width(36)
-      .height(36)
-      .padding(0)
-      .accessibilityText('对话工具与工作区')
-      .enabled(!this.working && !this.picking)
-      .backgroundColor(this.fullAccessMode ? $r('app.color.tint') : Color.Transparent)
-      .onClick(() => { this.showChatToolsSheet = true; })
-
-      if (this.imageGenMode) {
-        Text('绘图')
-          .fontSize(11)
-          .fontColor($r('app.color.accent'))
-          .backgroundColor($r('app.color.tint'))
-          .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-          .borderRadius(10)
-          .onClick(() => { this.imageGenMode = false; })
-      }
-
-      Blank()
-
-      Button({ type: ButtonType.Circle }) {
-        SymbolGlyph($r('sys.symbol.mic'))
-          .fontSize(17)
-          .fontColor([this.recording ? Color.White : this.composerInactiveIconColor()])
-      }
-      .id('dictateBtn')
-      .width(34)
-      .height(34)
-      .padding(0)
-      .accessibilityText(this.recording ? '停止录音' : '语音输入')
-      .enabled(!this.working && !this.picking)
-      .backgroundColor(this.recording ? $r('app.color.warning') : Color.Transparent)
-      .onClick(() => { this.toggleDictation(); })
-
-      Button({ type: ButtonType.Circle }) {
-        SymbolGlyph($r('sys.symbol.plus'))
-          .fontSize(18)
-          .fontColor([ImmersiveMaterialStyle.isActive(this.immersiveLightOn()) ? $r('sys.color.icon_primary') : $r('app.color.ink')])
-      }
-      .id('plusToolsBtn')
-      .width(36)
-      .height(36)
-      .padding(0)
-      .accessibilityText('更多功能')
-      .enabled(!this.working && !this.picking)
-      .backgroundColor(this.composerPillBg())
-      .onClick(() => { this.showBottomToolsSheet = true; })
-
-      Button({ type: ButtonType.Circle }) {
-        if (this.working) {
-          Rect().width(13).height(13).radius(3).fill($r('app.color.on_accent'))
-        } else {
-          SymbolGlyph($r('sys.symbol.arrow_up')).fontSize(18).fontColor([$r('app.color.on_accent')])
-        }
-      }
-      .id(this.working ? 'stop' : 'send')
-      .width(36)
-      .height(36)
-      .padding(0)
-      .backgroundColor($r('app.color.accent'))
-      .accessibilityText(this.working ? this.uiLabels().stop : this.uiLabels().send)
-      .enabled(this.working || (!this.picking && (!!this.draft.trim() || !!this.attachedList.length)))
-      .onClick(() => { if (this.working) this.stopReply(); else this.send(); })
-    }
-    .width('100%')
-    .alignItems(VerticalAlign.Center)
+    ChatTitleBarView({
+      wide: this.wide,
+      wideSide: this.wideSide,
+      picking: this.picking,
+      working: this.working,
+      hasOtherGenerating: this.hasOtherGeneratingChat(),
+      titleLabel: this.activeChat()?.title || (this.ephemeralMode ? '临时对话' : this.uiLabels().newChat),
+      subtitleLabel: `${this.persona().name} · ${this.activeModelId() || this.provider().name}`,
+      sidePanelMode: this.sidePanelMode,
+      hasActiveMessages: Boolean(this.activeChat()) && (this.activeChat()?.messages.length || 0) > 0,
+      ephemeralMode: this.ephemeralMode,
+      fullAccessMode: this.fullAccessMode,
+      newChatLabel: this.uiLabels().newChat,
+      chatBgHex: this.chatBgColor(),
+      palette: this.themeTokens(),
+      scrollUnderTitle: this.chatCanScrollUnderTitle(),
+      onOpenDrawer: () => { this.setDrawerOpen(true); },
+      onOpenModelQuickSheet: () => { this.showModelQuickSheet = true; },
+      onToggleSidePanel: () => { this.setSidePanelMode(this.sidePanelMode === '' ? 'browser' : ''); },
+      onOpenMiniMap: () => { this.showMiniMap = true; },
+      onToggleEphemeral: () => { this.activate('', !this.ephemeralMode); },
+      onNewChat: () => { this.activate(''); },
+      onToggleInChatSearch: () => {
+        SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
+          this.inChatSearchOpen = !this.inChatSearchOpen;
+        });
+      },
+      onToggleFullAccess: () => {
+        this.fullAccessMode = !this.fullAccessMode;
+        const c = this.activeChat();
+        if (c) { c.toolPermissionMode = this.fullAccessMode ? 'full' : 'ask'; this.persistAction(); }
+      },
+      onOrganizeMemory: () => { this.organizeCurrentConversation(); },
+      onOpenPersonas: () => { this.navigateTo('personas'); },
+      onOpenContext: () => { this.navigateTo('context'); },
+      onOpenBrowser: () => { this.navigateTo('browser'); },
+      onOpenStats: () => { this.refreshUsageStats().catch(() => {}); this.navigateTo('stats'); },
+      onOpenSettings: () => { this.refreshStorageSize().catch(() => {}); this.navigateTo('settings'); }
+    })
   }
 
   @Builder
   composerTabBar() {
-    Column() {
-      if (this.readingId) {
-        Row({ space: 8 }) {
-          Text('🔊 正在语音朗读').fontSize(12).fontWeight(FontWeight.Medium).fontColor($r('app.color.accent')).layoutWeight(1)
-          Button(this.ttsPaused ? '继续' : '暂停').height(26).fontSize(11)
-            .backgroundColor($r('app.color.surface')).fontColor($r('app.color.ink'))
-            .onClick(() => { this.toggleTtsPause(); })
-          Button('停止').height(26).fontSize(11)
-            .backgroundColor($r('app.color.surface')).fontColor($r('app.color.warning'))
-            .onClick(() => { this.speaker.stop(); this.readingId = ''; this.ttsPaused = false; })
-        }.width('94%').constraintSize({ maxWidth: 800 }).padding({ left: 12, right: 12, top: 6, bottom: 6 })
-          .borderRadius(12).backgroundColor($r('app.color.tint')).margin({ bottom: 6 })
-      }
-
-      if (this.pendingPromptChatId.length > 0 && this.pendingPromptChatId !== this.workspace.activeConversation) {
-        Row({ space: 8 }) {
-          SymbolGlyph($r('sys.symbol.exclamationmark_circle'))
-            .fontSize(15)
-            .fontColor([$r('app.color.accent')])
-          Text(this.pendingPromptLabel)
-            .fontSize(12)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.ink'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-          Button('前往处理')
-            .height(26)
-            .fontSize(11)
-            .borderRadius(13)
-            .padding({ left: 10, right: 10 })
-            .backgroundColor($r('app.color.accent'))
-            .fontColor($r('app.color.on_accent'))
-            .onClick(() => { this.activate(this.pendingPromptChatId); })
+    ChatComposerView({
+      draft: this.draft,
+      showPromptQuickBar: this.showPromptQuickBar,
+      askQuestionAnswer: this.askQuestionAnswer,
+      quoteExcerpt: this.quoteDraft?.excerpt || '',
+      attachedList: this.attachedList,
+      instructionCards: this.workspace.instructionCards || [],
+      activeInstructionIds: this.workspace.activeInstructionIds || [],
+      quickPhrases: this.allQuickPhrases(),
+      placeholderText: this.composerPlaceholder(),
+      working: this.working,
+      picking: this.picking,
+      enterToSend: this.appearanceCfg().enterToSend === true,
+      activeBrandId: this.activeBrandId(),
+      providerName: this.provider().name,
+      builtinSearchOn: this.currentBuiltinSearchOn(),
+      searchOn: this.searchOn,
+      reasoningLevelCount: this.activeReasoningControl().levels.length,
+      reasoningBulbRays: reasoningBulbRayCount(this.activeReasoningControl(), this.activeReasoningEffort()),
+      reasoningEffort: this.activeReasoningEffort(),
+      reasoningLabel: this.reasoningLabelShort(),
+      showReasoningLevelOnButton: this.chatDisplayCfg().showReasoningLevelOnButton === true,
+      fullAccessMode: this.fullAccessMode,
+      imageGenMode: this.imageGenMode,
+      recording: this.recording,
+      stopLabel: this.uiLabels().stop,
+      sendLabel: this.uiLabels().send,
+      readingId: this.readingId,
+      ttsPaused: this.ttsPaused,
+      pendingPromptChatId: this.pendingPromptChatId,
+      activeConversationId: this.workspace.activeConversation,
+      pendingPromptLabel: this.pendingPromptLabel,
+      askQuestionText: this.askQuestionText,
+      askQuestionOptions: this.askQuestionOptions,
+      askQuestionPlaceholder: this.askQuestionPlaceholder,
+      pendingApprovalTool: this.pendingApprovalTool,
+      pendingApprovalArgs: this.pendingApprovalArgs,
+      showToolCards: this.chatDisplayCfg().showToolCards,
+      notice: this.notice,
+      palette: this.themeTokens(),
+      composerBgHex: this.composerBgColor(),
+      bubbleStyle: this.appearanceCfg().bubbleStyle,
+      chatBgHex: this.chatBgColor(),
+      wide: this.wide,
+      wideSide: this.wideSide,
+      hasSidePanel: this.sidePanelMode !== '',
+      bottomInset: this.effectiveBottomInset(),
+      onClearQuote: () => {
+        SystemMotion.quickAnimate(this.getUIContext(), this.reduceMotion, () => {
+          this.quoteDraft = undefined;
+        });
+      },
+      onRemoveAttachment: (idx: number) => {
+        this.attachedList = this.attachedList.filter((_a: Attachment, i: number): boolean => i !== idx);
+      },
+      onToggleInstructionCard: (cardId: string) => {
+        const cur = this.workspace.activeInstructionIds || [];
+        this.workspace.activeInstructionIds = cur.includes(cardId)
+          ? cur.filter((id: string): boolean => id !== cardId)
+          : [...cur, cardId];
+        this.persistAction();
+      },
+      onOpenModelQuickSheet: () => { this.showModelQuickSheet = true; },
+      onOpenSearchQuickSheet: () => { this.showSearchQuickSheet = true; },
+      onOpenReasoningSheet: () => { this.showReasoningSheet = true; },
+      onOpenChatToolsSheet: () => { this.showChatToolsSheet = true; },
+      onClearImageGenMode: () => { this.imageGenMode = false; },
+      onToggleDictation: () => { this.toggleDictation(); },
+      onOpenBottomToolsSheet: () => { this.showBottomToolsSheet = true; },
+      onSend: () => { this.send(); },
+      onStop: () => { this.stopReply(); },
+      onToggleTtsPause: () => { this.toggleTtsPause(); },
+      onStopTts: () => { this.speaker.stop(); this.readingId = ''; this.ttsPaused = false; },
+      onOpenPendingPromptChat: (chatId: string) => { this.activate(chatId); },
+      onAskAnswerChanged: (v: string) => {
+        const curJob = this.genRegistry.get(this.workspace.activeConversation);
+        if (curJob) {
+          curJob.askQuestionAnswer = v;
         }
-        .width('94%')
-        .constraintSize({ maxWidth: 800 })
-        .padding({ left: 12, right: 10, top: 6, bottom: 6 })
-        .borderRadius(12)
-        .backgroundColor($r('app.color.tint'))
-        .margin({ bottom: 6 })
-      }
-
-      if (this.askQuestionText) {
-        Column({ space: 8 }) {
-          Text('🤖 AI 向您确认：' + this.askQuestionText)
-            .fontSize(13).fontWeight(FontWeight.Bold).fontColor($r('app.color.ink'))
-          if (this.askQuestionOptions.length > 0) {
-            Flex({ wrap: FlexWrap.Wrap }) {
-              ForEach(this.askQuestionOptions, (opt: string, oi: number) => {
-                Button(opt)
-                  .height(28).fontSize(12).margin({ right: 6, bottom: 6 }).borderRadius(8)
-                  .backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-                  .onClick(() => this.submitAskUserInput(opt))
-              }, (opt: string, oi: number) => `ask_${oi}_${opt}`)
-            }
-          }
-          Row({ space: 6 }) {
-            TextInput({ text: this.askQuestionAnswer, placeholder: this.askQuestionPlaceholder || '输入回答...' })
-              .layoutWeight(1).height(34).fontSize(12).borderRadius(8).backgroundColor($r('app.color.canvas'))
-              .onChange((v: string) => {
-                this.askQuestionAnswer = v;
-                const curJob = this.genRegistry.get(this.workspace.activeConversation);
-                if (curJob) {
-                  curJob.askQuestionAnswer = v;
-                }
-              })
-            Button('提交').height(34).fontSize(12).borderRadius(8)
-              .backgroundColor($r('app.color.accent')).fontColor($r('app.color.on_accent'))
-              .onClick(() => this.submitAskUserInput(this.askQuestionAnswer.trim()))
-            Button('跳过').height(34).fontSize(12).borderRadius(8)
-              .backgroundColor($r('app.color.panel')).fontColor($r('app.color.muted'))
-              .onClick(() => this.submitAskUserInput(''))
-          }.width('100%')
-        }.width('94%').constraintSize({ maxWidth: 800 }).padding(10).borderRadius(12)
-          .backgroundColor($r('app.color.surface')).border({ width: 1, color: $r('app.color.accent') })
-          .alignItems(HorizontalAlign.Start).margin({ bottom: 6 })
-      }
-
-      if (this.pendingApprovalTool && !this.chatDisplayCfg().showToolCards) {
-        this.toolApprovalControls()
-      }
-
-      if (this.notice) { Text(this.notice).width('100%').padding({ left: 18, right: 18, bottom: 6 }).fontSize(13).fontColor($r('app.color.warning')) }
-
-      if (ImmersiveMaterialStyle.isActive(this.immersiveLightOn())) {
-        Column({ space: 6 }) {
-          this.composerCardContent()
-        }
-        .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-        .borderRadius(24)
-        .backgroundColor(Color.Transparent)
-        .width('94%')
-        .constraintSize({ maxWidth: 800 })
-        .alignItems(HorizontalAlign.Start)
-        .systemMaterial(ImmersiveMaterialStyle.composerMaterial(this.themeTokens(), this.effectiveDark(), true))
-      } else {
-        Column({ space: 6 }) {
-          this.composerCardContent()
-        }
-        .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-        .borderRadius(24)
-        .backgroundColor(this.composerBgColor())
-        .backgroundBlurStyle(this.immersiveLightOn() || this.appearanceCfg().bubbleStyle === 'frosted'
-          ? BlurStyle.COMPONENT_THICK
-          : BlurStyle.NONE)
-        .border({ width: 1, color: $r('app.color.line') })
-        .width('94%')
-        .constraintSize({ maxWidth: 800 })
-        .alignItems(HorizontalAlign.Start)
-        .systemMaterial(ImmersiveMaterialStyle.composerMaterial(this.themeTokens(), this.effectiveDark(), false))
-      }
-    }
-    .width('100%')
-    .clip(false)
-    .alignItems(HorizontalAlign.Center)
-    .padding({
-      left: this.wide ? 0 : this.winLeftInset,
-      right: this.sidePanelMode !== '' && this.wideSide ? 0 : this.winRightInset,
-      top: 10,
-      bottom: this.winKeyboardHeight > 0 ? 8 : Math.max(8, this.effectiveBottomInset() + 2)
+      },
+      onSubmitAskAnswer: (ans: string) => { this.submitAskUserInput(ans); },
+      onResolveToolApproval: (choice: 'allow_once' | 'allow_all' | 'deny') => this.resolveToolApproval(choice),
+      onAreaHeightChange: (heightVp: number) => { this.updateComposerBarHeight(heightVp); }
     })
-    .linearGradient(this.immersiveLightOn()
-      ? {
-          direction: GradientDirection.Top,
-          colors: [[hexWithAlpha(this.chatBgColor(), 'B8'), 0.0], [hexWithAlpha(this.chatBgColor(), '00'), 1.0]]
-        }
-      : undefined)
-    .onAreaChange((_oldArea: Area, newArea: Area) => {
-      this.updateComposerBarHeight(Number(newArea.height));
-    })
-  }
-
-  @Builder
-  chatScrollNavButton(symbolRes: Resource, rotate180: boolean, a11yText: string, onTap: () => void) {
-    Button({ type: ButtonType.Circle, buttonStyle: ButtonStyleMode.TEXTUAL }) {
-      SymbolGlyph(symbolRes)
-        .fontSize(13)
-        .fontColor([$r('app.color.muted')])
-        .rotate({ angle: rotate180 ? 180 : 0 })
-    }
-    .width(30)
-    .height(30)
-    .padding(0)
-    .accessibilityText(a11yText)
-    .backgroundColor(hexWithAlpha(this.themeTokens().surface, this.effectiveDark() ? '98' : 'A8'))
-    .backgroundBlurStyle(BlurStyle.Thin)
-    .border({ width: 0.5, color: $r('app.color.line') })
-    .shadow({
-      radius: 6,
-      color: this.effectiveDark() ? '#24000000' : '#0C000000',
-      offsetX: 0,
-      offsetY: 1
-    })
-    .opacity(0.82)
-    .onClick(() => { onTap(); })
   }
 
   @Builder
   chatScrollNavButtons() {
-    Row() {
-      Column({ space: 6 }) {
-        this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), false, '跳转到顶部对话', () => { this.jumpChatTop(); })
-        this.chatScrollNavButton($r('sys.symbol.chevron_up'), false, '跳转到上一条对话', () => { this.jumpChatPrev(); })
-        this.chatScrollNavButton($r('sys.symbol.chevron_down'), false, '跳转到下一条对话', () => { this.jumpChatNext(); })
-        this.chatScrollNavButton($r('sys.symbol.chevron_up_2'), true, '跳转到最新对话', () => { this.jumpChatBottom(); })
-      }
-      .margin({
-        right: (this.sidePanelMode !== '' && this.wideSide ? 0 : this.winRightInset) + 10,
-        bottom: this.composerBarHeightVp + 4
-      })
-    }
-    .width('100%')
-    .justifyContent(FlexAlign.End)
-    .hitTestBehavior(HitTestMode.None)
-    .transition(SystemMotion.endSlideTransition(this.reduceMotion))
+    ChatScrollNavOverlay({
+      hasSidePanel: this.sidePanelMode !== '',
+      wideSide: this.wideSide,
+      composerBarHeightVp: this.composerBarHeightVp,
+      surfaceHex: this.themeTokens().surface,
+      onJumpTop: () => { this.jumpChatTop(); },
+      onJumpPrev: () => { this.jumpChatPrev(); },
+      onJumpNext: () => { this.jumpChatNext(); },
+      onJumpBottom: () => { this.jumpChatBottom(); }
+    })
   }
 
   @Builder
@@ -5826,289 +4252,113 @@ struct Index {
   }
 
   @Builder
-  sheetActionRow(
-    symbol: Resource,
-    label: string,
-    isDanger: boolean,
-    idStr: string,
-    action: () => void
-  ) {
-    Button({ type: ButtonType.Normal }) {
-      Row({ space: 16 }) {
-        SymbolGlyph(symbol)
-          .fontSize(20)
-          .fontColor([isDanger ? $r('app.color.warning') : $r('app.color.ink')])
-        Text(label)
-          .fontSize(16)
-          .fontColor(isDanger ? $r('app.color.warning') : $r('app.color.ink'))
-          .layoutWeight(1)
-      }
-      .width('100%')
-      .alignItems(VerticalAlign.Center)
-    }
-    .id(idStr)
-    .width('100%')
-    .height(52)
-    .padding({ left: 22, right: 22 })
-    .backgroundColor(Color.Transparent)
-    .onClick(action)
-  }
-
-  @Builder
   messageActionSheetOverlay() {
-    Column({ space: 2 }) {
-      if (this.actionSheetTargetMessage()) {
-        this.sheetActionRow($r('sys.symbol.textformat'), '选择复制', false, 'sheetSelectCopy', () => {
-          this.runMessageSheetAction('select_copy');
-        })
-        this.sheetActionRow($r('sys.symbol.book'), '网页视图渲染', false, 'sheetWebRender', () => {
-          this.runMessageSheetAction('web_render');
-        })
-        if (this.isActionSheetTargetAssistant()) {
-          this.sheetActionRow($r('sys.symbol.pencil_line'), '编辑', false, 'sheetEdit', () => {
-            this.runMessageSheetAction('edit');
-          })
-        }
-        this.sheetActionRow($r('sys.symbol.share'), '分享', false, 'sheetShare', () => {
-          this.runMessageSheetAction('share');
-        })
-        this.sheetActionRow($r('sys.symbol.checkmark_square'), '选择消息', false, 'sheetSelectMessages', () => {
-          this.runMessageSheetAction('select_messages');
-        })
-        this.sheetActionRow($r('sys.symbol.arrow_triangle_divide'), '创建分支', false, 'sheetFork', () => {
-          this.runMessageSheetAction('fork');
-        })
-        this.sheetActionRow($r('sys.symbol.trash'), '删除本版本', true, 'sheetDeleteVersion', () => {
-          this.runMessageSheetAction('delete_version');
-        })
-        if (this.actionSheetTargetHasMultiVersions()) {
-          this.sheetActionRow($r('sys.symbol.trash'), '删除全部版本', true, 'sheetDeleteAll', () => {
-            this.runMessageSheetAction('delete_all');
-          })
-        }
-      }
-    }
-    .width('100%')
-    .padding({ top: 6, bottom: Math.max(16, this.effectiveBottomInset() + 8) })
-    .backgroundColor(Color.Transparent)
-  }
-
-  @Builder
-  miniMapControls() {
-    Row({ space: 8 }) {
-      SymbolGlyph($r('sys.symbol.map'))
-        .fontSize(17)
-        .fontColor([$r('app.color.accent')])
-      Text('共 ' + (this.activeChat()?.messages.length || 0) + ' 条消息 · 点击跳转')
-        .fontSize(13)
-        .fontColor($r('app.color.muted'))
-        .layoutWeight(1)
-      if ((this.activeChat()?.messages.length || 0) > 1) {
-        Button('顶部')
-          .type(ButtonType.Normal)
-          .height(26)
-          .fontSize(11)
-          .padding({ left: 10, right: 10 })
-          .borderRadius(13)
-          .backgroundColor($r('app.color.tint'))
-          .fontColor($r('app.color.accent'))
-          .onClick(() => {
-            this.showMiniMap = false;
-            this.jumpChatTop();
-          })
-        Button('最新')
-          .type(ButtonType.Normal)
-          .height(26)
-          .fontSize(11)
-          .padding({ left: 10, right: 10 })
-          .borderRadius(13)
-          .backgroundColor($r('app.color.tint'))
-          .fontColor($r('app.color.accent'))
-          .onClick(() => {
-            this.showMiniMap = false;
-            this.jumpChatBottom();
-          })
-      }
-    }
-    .width('100%')
-    .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-    .borderRadius(14)
-    .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
-  }
-
-  @Builder
-  miniMapItems() {
-    if ((this.activeChat()?.messages.length || 0) === 0) {
-      Column({ space: 6 }) {
-        Text('当前对话暂无消息')
-          .fontSize(14)
-          .fontColor($r('app.color.muted'))
-      }
-      .width('100%')
-      .padding({ top: 24, bottom: 24 })
-      .alignItems(HorizontalAlign.Center)
-      .borderRadius(14)
-      .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
-    } else {
-      Column({ space: 6 }) {
-        ForEach(this.activeChat()?.messages || [], (m: ChatMessage, idx: number) => {
-          Row({ space: 10 }) {
-            Text('#' + (idx + 1) + (m.role === 'user' ? ' 问' : ' 答'))
-              .fontSize(12)
-              .fontWeight(FontWeight.Bold)
-              .fontColor(m.role === 'user' ? $r('app.color.accent') : $r('app.color.muted'))
-              .width(54)
-            Text(m.text.replace(/\s+/g, ' ').slice(0, 80) || '[空/附件]')
-              .fontSize(13)
-              .fontColor($r('app.color.ink'))
-              .maxLines(2)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
-          }
-          .width('100%')
-          .padding({ left: 12, right: 12, top: 10, bottom: 10 })
-          .borderRadius(12)
-          .backgroundColor(ImmersiveMaterialStyle.sheetCardBackground(this.immersiveLightOn()))
-          .onClick(() => {
-            this.showMiniMap = false;
-            const total = this.activeChat()?.messages.length || 0;
-            this.followBottom = idx >= total - 1;
-            this.chatNavTargetIdx = idx;
-            this.scrollView.scrollToIndex(idx, !this.reduceMotion, ScrollAlign.START);
-          })
-        }, (m: ChatMessage, idx: number) => 'mm-' + idx + '-' + m.id)
-      }
-      .width('100%')
-      .padding({ top: 2, bottom: 4 })
-    }
+    ChatMessageActionSheet({
+      hasTarget: Boolean(this.actionSheetTargetMessage()),
+      isAssistant: this.isActionSheetTargetAssistant(),
+      hasMultiVersions: this.actionSheetTargetHasMultiVersions(),
+      bottomInset: this.effectiveBottomInset(),
+      onAction: (actionKey: string) => { this.runMessageSheetAction(actionKey); }
+    })
   }
 
   @Builder
   miniMapOverlay() {
-    ChatListSheet({
-      heading: '对话大纲',
+    ChatMiniMapSheet({
+      messages: this.activeChat()?.messages || [],
       palette: this.themeTokens(),
-      isDark: this.effectiveDark(),
-      immersiveLightEnabled: this.immersiveLightOn(),
       onClose: () => { this.showMiniMap = false; },
-      controls: () => { this.miniMapControls(); },
-      items: () => { this.miniMapItems(); }
+      onJumpTop: () => {
+        this.showMiniMap = false;
+        this.jumpChatTop();
+      },
+      onJumpBottom: () => {
+        this.showMiniMap = false;
+        this.jumpChatBottom();
+      },
+      onJumpIndex: (idx: number) => {
+        this.showMiniMap = false;
+        const total = this.activeChat()?.messages.length || 0;
+        this.followBottom = idx >= total - 1;
+        this.chatNavTargetIdx = idx;
+        this.scrollView.scrollToIndex(idx, !this.reduceMotion, ScrollAlign.START);
+      }
     })
   }
 
   @Builder
   editMessageOverlay() {
-    Column({ space: 12 }) {
-      Row() {
-        Button('取消').backgroundColor(Color.Transparent).fontColor($r('app.color.muted'))
-          .onClick(() => {
-            SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-              this.editingMsgId = '';
-            });
-          })
-        Text('编辑消息').fontSize(18).fontWeight(FontWeight.Bold).fontColor($r('app.color.ink')).layoutWeight(1)
-        Button('仅保存').height(32).fontSize(12).backgroundColor($r('app.color.panel')).fontColor($r('app.color.ink'))
-          .onClick(() => this.saveEditedMessage(false))
-        Button('保存并重发').height(32).fontSize(12).backgroundColor($r('app.color.accent')).fontColor($r('app.color.on_accent'))
-          .margin({ left: 6 }).onClick(() => this.saveEditedMessage(true))
-      }.width('100%').padding(12)
-      TextArea({ text: this.editingMsgText }).layoutWeight(1).width('94%').fontSize(15)
-        .onChange((v: string) => { this.editingMsgText = v; })
-    }
-    .width('100%')
-    .height('100%')
-    .padding({ top: this.winTopInset, bottom: Math.max(16, this.effectiveBottomInset() + 8), left: this.winLeftInset, right: this.winRightInset })
-    .backgroundColor(this.themeTokens().canvas)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .transition(SystemMotion.overlayModalTransition(this.reduceMotion))
+    ChatEditMessageModal({
+      editingMsgText: this.editingMsgText,
+      canvasHex: this.themeTokens().canvas,
+      bottomInset: this.effectiveBottomInset(),
+      onCancel: () => {
+        SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
+          this.editingMsgId = '';
+        });
+      },
+      onSaveOnly: () => { this.saveEditedMessage(false); },
+      onSaveAndRerun: () => { this.saveEditedMessage(true); }
+    })
   }
 
   @Builder
   selectCopyOverlay() {
-    Column({ space: 12 }) {
-      Row() {
-        Text('自由选词复制').fontSize(18).fontWeight(FontWeight.Bold).fontColor($r('app.color.ink')).layoutWeight(1)
-        Button('全部复制').height(32).fontSize(12).backgroundColor($r('app.color.tint')).fontColor($r('app.color.accent'))
-          .onClick(() => { this.copyText(this.selectCopyText); })
-        Button('关闭').backgroundColor(Color.Transparent).fontColor($r('app.color.muted'))
-          .onClick(() => {
-            SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
-              this.selectCopyText = '';
-            });
-          })
-      }.width('100%').padding(12)
-      TextArea({ text: this.selectCopyText }).layoutWeight(1).width('94%').fontSize(15)
-        .onChange((_v: string) => {})
-    }
-    .width('100%')
-    .height('100%')
-    .padding({ top: this.winTopInset, bottom: Math.max(16, this.effectiveBottomInset() + 8), left: this.winLeftInset, right: this.winRightInset })
-    .backgroundColor(this.themeTokens().canvas)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .transition(SystemMotion.overlayModalTransition(this.reduceMotion))
-  }
-
-  @Builder
-  navSubHeader(titleText: string, subtitleText: string = '') {
-    KelivoNavTitleBar({
-      titleText: titleText,
-      subtitleText: subtitleText,
-      showBack: true,
-      onBack: () => { this.navigateBack(); }
+    ChatSelectCopyModal({
+      selectCopyText: this.selectCopyText,
+      canvasHex: this.themeTokens().canvas,
+      bottomInset: this.effectiveBottomInset(),
+      onCopyAll: () => { this.copyText(this.selectCopyText); },
+      onClose: () => {
+        SystemMotion.springAnimate(this.getUIContext(), this.reduceMotion, () => {
+          this.selectCopyText = '';
+        });
+      }
     })
   }
 
   @Builder
   appearanceNavPage(subView: string, titleText: string) {
-    NavDestination() {
-      Column() {
-        AppearancePanel({
-          appearance: this.appearanceCfg(),
-          systemSettings: this.workspace.systemSettings || defaultSystemSettings(),
-          generationParams: this.workspace.generationParams || defaultGenerationParams(),
-          embeddedInNav: true,
-          initialSubView: subView,
-          onChangeAppearance: async (cfg: AppearanceConfig) => {
-            this.workspace.appearance = cfg;
-            applySystemColorMode(this.host(), cfg.themeMode);
-            syncWindowSystemBars(resolveEffectiveDark(cfg.themeMode, this.systemDarkNow()));
-            syncWindowBackgroundColor(this.themeTokens().canvas);
-            this.syncImmersiveStorage();
-            await this.persist();
-          },
-          onUpdateSettings: async (next: SystemSettings) => {
-            this.workspace.systemSettings = next;
-            await this.persist();
-          },
-          onUpdateGenerationParams: async (next: GenerationParams) => {
-            this.workspace.generationParams = next;
-            await this.persist();
-          },
-          onRequestNotifyPermission: async () => {
-            await ensureNotificationPermission(this.host());
-          },
-          onOpenSubView: (sub: string) => {
-            this.navigateTo(`appearance_${sub}`);
-          },
-          onClose: () => { this.navigateBack(); }
-        })
-      }
-      .width('100%')
-      .height('100%')
-      .padding({ left: this.winLeftInset, right: this.winRightInset })
-      .backgroundColor(Color.Transparent)
+    KelivoNavRouteShell({
+      titleText: titleText,
+      canvasColor: this.themeTokens().canvas,
+      scrollUnderTitle: true,
+      onBack: () => { this.navigateBack(); },
+      onRouteShown: () => { this.syncActiveRouteFromStack(); },
+      onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+      onDismissOverlay: () => this.dismissTopOverlay()
+    }) {
+      AppearancePanel({
+        appearance: this.appearanceCfg(),
+        systemSettings: this.workspace.systemSettings || defaultSystemSettings(),
+        generationParams: this.workspace.generationParams || defaultGenerationParams(),
+        embeddedInNav: true,
+        initialSubView: subView,
+        onChangeAppearance: async (cfg: AppearanceConfig) => {
+          this.workspace.appearance = cfg;
+          applySystemColorMode(this.host(), cfg.themeMode);
+          syncWindowSystemBars(resolveEffectiveDark(cfg.themeMode, this.systemDarkNow()));
+          syncWindowBackgroundColor(this.themeTokens().canvas);
+          this.syncImmersiveStorage();
+          await this.persist();
+        },
+        onUpdateSettings: async (next: SystemSettings) => {
+          this.workspace.systemSettings = next;
+          await this.persist();
+        },
+        onUpdateGenerationParams: async (next: GenerationParams) => {
+          this.workspace.generationParams = next;
+          await this.persist();
+        },
+        onRequestNotifyPermission: async () => {
+          await ensureNotificationPermission(this.host());
+        },
+        onOpenSubView: (sub: string) => {
+          this.navigateTo(`appearance_${sub}`);
+        },
+        onClose: () => { this.navigateBack(); }
+      })
     }
-    .hideBackButton(true)
-    .backgroundColor(this.themeTokens().canvas)
-    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-    .title(
-      { builder: () => { this.navSubHeader(titleText); }, height: 56 + this.winTopInset },
-      ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-    )
-    .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-    .onShown(() => { this.syncActiveRouteFromStack(); })
-    .onHidden(() => { this.syncActiveRouteFromStack(); })
-    .onBackPressed(() => this.dismissTopOverlay())
   }
 
   @Builder
@@ -6258,191 +4508,156 @@ struct Index {
     } else if (name === 'persona_detail') {
       this.personaNavPage('detail', this.personaEditTargetId)
     } else if (name === 'tools') {
-      NavDestination() {
-        Column() {
-          ToolsPanel({
-            lastEndpoint: this.workspace.mcpEndpoint || '',
-            servers: this.workspace.mcpServers || [],
-            builtinFetchEnabled: this.workspace.systemSettings?.builtinFetchEnabled !== false,
-            mcpManager: this.mcpManager,
-            embeddedInNav: true,
-            onRemember: (endpoint: string) => { this.workspace.mcpEndpoint = endpoint; this.persistAction(); },
-            onSaveServers: (srvs: McpServerConfig[], bFetch: boolean) => {
-              this.workspace.mcpServers = srvs;
-              const sys = this.workspace.systemSettings || defaultSystemSettings();
-              sys.builtinFetchEnabled = bFetch;
-              this.workspace.systemSettings = sys;
-              this.persistAction();
-            },
-            onUseResult: (resName: string, text: string) => {
-              this.attachedList = [...this.attachedList, { name: resName + '.txt', data: text, mime: 'text/plain', kind: 'text' }];
-              this.navigateTo('chat');
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: 'MCP 工具中心',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        ToolsPanel({
+          lastEndpoint: this.workspace.mcpEndpoint || '',
+          servers: this.workspace.mcpServers || [],
+          builtinFetchEnabled: this.workspace.systemSettings?.builtinFetchEnabled !== false,
+          mcpManager: this.mcpManager,
+          embeddedInNav: true,
+          onRemember: (endpoint: string) => { this.workspace.mcpEndpoint = endpoint; this.persistAction(); },
+          onSaveServers: (srvs: McpServerConfig[], bFetch: boolean) => {
+            this.workspace.mcpServers = srvs;
+            const sys = this.workspace.systemSettings || defaultSystemSettings();
+            sys.builtinFetchEnabled = bFetch;
+            this.workspace.systemSettings = sys;
+            this.persistAction();
+          },
+          onUseResult: (resName: string, text: string) => {
+            this.attachedList = [...this.attachedList, { name: resName + '.txt', data: text, mime: 'text/plain', kind: 'text' }];
+            this.navigateTo('chat');
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('MCP 工具中心'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'voice') {
-      NavDestination() {
-        Column() {
-          VoiceSettingsPanel({
-            tts: this.workspace.tts || { engine: 'system', endpoint: '', secretRef: '', model: 'tts-1', voice: 'alloy', speed: 1.0, language: 'zh-CN' },
-            asr: this.workspace.asr || { engine: 'system', endpoint: '', secretRef: '', model: 'whisper-1', language: 'zh-CN' },
-            embeddedInNav: true,
-            onSave: (tts: TtsConfig, asr: AsrConfig) => {
-              this.workspace.tts = tts;
-              this.workspace.asr = asr;
-              this.persistAction();
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '语音朗读与识别',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        VoiceSettingsPanel({
+          tts: this.workspace.tts || { engine: 'system', endpoint: '', secretRef: '', model: 'tts-1', voice: 'alloy', speed: 1.0, language: 'zh-CN' },
+          asr: this.workspace.asr || { engine: 'system', endpoint: '', secretRef: '', model: 'whisper-1', language: 'zh-CN' },
+          embeddedInNav: true,
+          onSave: (tts: TtsConfig, asr: AsrConfig) => {
+            this.workspace.tts = tts;
+            this.workspace.asr = asr;
+            this.persistAction();
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('语音朗读与识别'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'webdav') {
-      NavDestination() {
-        Column() {
-          WebDavPanel({
-            initialDirectory: this.workspace.davDirectory || '',
-            initialPath: this.workspace.davPath || 'kelivo_backups',
-            initialUsername: this.workspace.davUsername || '',
-            initialPassRef: this.workspace.davPasswordRef || '',
-            initialUserAgent: this.workspace.davUserAgent || '',
-            initialFile: this.workspace.davFilename || '',
-            conversations: this.workspace.conversations,
-            workspaceData: this.workspace,
-            embeddedInNav: true,
-            onWorkspaceRestored: async (nextWs: Workspace) => {
-              this.stopAllGenerations(true);
-              backgroundGenerationManager.stopAll();
-              this.workspace = nextWs;
-              this.workspace.globalProxy = normalizeProxyConfig(this.workspace.globalProxy, true);
-              this.workspace.worldBooks = normalizeWorldBooks(this.workspace.worldBooks);
-              const normCards = normalizeInstructionCards(this.workspace.instructionCards);
-              this.workspace.instructionCards = normCards.length > 0 ? normCards : defaultInstructionCards();
-              const normPhrases = normalizeQuickPhrases(this.workspace.quickPhrases);
-              this.workspace.quickPhrases = normPhrases.length > 0 ? normPhrases : defaultQuickPhrases();
-              this.draftOverrideProviderId = '';
-              this.draftOverrideModel = '';
-              this.modelConfigTick += 1;
-              this.searchOn = this.workspace.systemSettings?.searchEnabled === true;
-              applySystemColorMode(this.host(), this.appearanceCfg().themeMode);
-              syncWindowSystemBars(this.effectiveDark());
-              syncWindowBackgroundColor(this.themeTokens().canvas);
-              this.syncImmersiveStorage();
-              await this.syncGlobalProxyRuntime();
-              this.syncActiveGenerationView();
-              await this.persist();
-              await this.refreshStorageSize().catch(() => {});
-              this.scrollDown(true);
-            },
-            onSaveBackupConfig: (cfg: BackupPreferencesConfig) => {
-              this.workspace.backupConfig = cfg;
-              if (this.workspace.systemSettings) {
-                this.workspace.systemSettings.autoSnapshotEnabled = cfg.localCopiesEnabled;
-              }
-              this.persistAction();
-            },
-            onSaveWebDavConfig: (url: string, path: string, user: string, passRef: string, userAgent: string) => {
-              this.workspace.davDirectory = url;
-              this.workspace.davPath = path;
-              this.workspace.davUsername = user;
-              this.workspace.davPasswordRef = passRef;
-              this.workspace.davUserAgent = userAgent;
-              this.persistAction();
-            },
-            onSaveS3Config: (s3: S3BackupConfig) => {
-              this.workspace.s3Config = s3;
-              this.persistAction();
-            },
-            onUpdateSnapshots: (list: LocalSnapshotMeta[]) => {
-              this.workspace.snapshots = list;
-              this.persistAction();
-              this.refreshStorageSize().catch(() => {});
-            },
-            onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '备份与恢复',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        WebDavPanel({
+          initialDirectory: this.workspace.davDirectory || '',
+          initialPath: this.workspace.davPath || 'kelivo_backups',
+          initialUsername: this.workspace.davUsername || '',
+          initialPassRef: this.workspace.davPasswordRef || '',
+          initialUserAgent: this.workspace.davUserAgent || '',
+          initialFile: this.workspace.davFilename || '',
+          conversations: this.workspace.conversations,
+          workspaceData: this.workspace,
+          embeddedInNav: true,
+          onWorkspaceRestored: async (nextWs: Workspace) => {
+            this.stopAllGenerations(true);
+            backgroundGenerationManager.stopAll();
+            this.workspace = nextWs;
+            this.workspace.globalProxy = normalizeProxyConfig(this.workspace.globalProxy, true);
+            this.workspace.worldBooks = normalizeWorldBooks(this.workspace.worldBooks);
+            const normCards = normalizeInstructionCards(this.workspace.instructionCards);
+            this.workspace.instructionCards = normCards.length > 0 ? normCards : defaultInstructionCards();
+            const normPhrases = normalizeQuickPhrases(this.workspace.quickPhrases);
+            this.workspace.quickPhrases = normPhrases.length > 0 ? normPhrases : defaultQuickPhrases();
+            this.draftOverrideProviderId = '';
+            this.draftOverrideModel = '';
+            this.modelConfigTick += 1;
+            this.searchOn = this.workspace.systemSettings?.searchEnabled === true;
+            applySystemColorMode(this.host(), this.appearanceCfg().themeMode);
+            syncWindowSystemBars(this.effectiveDark());
+            syncWindowBackgroundColor(this.themeTokens().canvas);
+            this.syncImmersiveStorage();
+            await this.syncGlobalProxyRuntime();
+            this.syncActiveGenerationView();
+            await this.persist();
+            await this.refreshStorageSize().catch(() => {});
+            this.scrollDown(true);
+          },
+          onSaveBackupConfig: (cfg: BackupPreferencesConfig) => {
+            this.workspace.backupConfig = cfg;
+            if (this.workspace.systemSettings) {
+              this.workspace.systemSettings.autoSnapshotEnabled = cfg.localCopiesEnabled;
+            }
+            this.persistAction();
+          },
+          onSaveWebDavConfig: (url: string, path: string, user: string, passRef: string, userAgent: string) => {
+            this.workspace.davDirectory = url;
+            this.workspace.davPath = path;
+            this.workspace.davUsername = user;
+            this.workspace.davPasswordRef = passRef;
+            this.workspace.davUserAgent = userAgent;
+            this.persistAction();
+          },
+          onSaveS3Config: (s3: S3BackupConfig) => {
+            this.workspace.s3Config = s3;
+            this.persistAction();
+          },
+          onUpdateSnapshots: (list: LocalSnapshotMeta[]) => {
+            this.workspace.snapshots = list;
+            this.persistAction();
+            this.refreshStorageSize().catch(() => {});
+          },
+          onOpenUrl: (url: string) => { this.openUrlInBrowser(url); },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('备份与恢复'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'search') {
-      NavDestination() {
-        Column() {
-          SearchEditor({
-            config: this.workspace.search || { kind: 'searxng', endpoint: '', secretRef: '' },
-            services: this.workspace.searchServices || defaultSearchServices(),
-            activeServiceId: this.workspace.activeSearchId || 'search-duckduckgo',
-            embeddedInNav: true,
-            onApply: (config: SearchConfig, key: string) => this.applySearch(config, key),
-            onSaveServices: (svcs: SearchServiceConfig[], actId: string, enable: boolean) => {
-              this.workspace.searchServices = svcs;
-              this.workspace.activeSearchId = actId;
-              this.setSearchEnabled(enable);
-            },
-            onDisable: () => { this.setSearchEnabled(false); },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '联网搜索',
+        subtitleText: '26 种搜索引擎 · Agent 工具 / 预检索',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        SearchEditor({
+          config: this.workspace.search || { kind: 'searxng', endpoint: '', secretRef: '' },
+          services: this.workspace.searchServices || defaultSearchServices(),
+          activeServiceId: this.workspace.activeSearchId || 'search-duckduckgo',
+          embeddedInNav: true,
+          onApply: (config: SearchConfig, key: string) => this.applySearch(config, key),
+          onSaveServices: (svcs: SearchServiceConfig[], actId: string, enable: boolean) => {
+            this.workspace.searchServices = svcs;
+            this.workspace.activeSearchId = actId;
+            this.setSearchEnabled(enable);
+          },
+          onDisable: () => { this.setSearchEnabled(false); },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('联网搜索', '26 种搜索引擎 · Agent 工具 / 预检索'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'settings') {
       SettingsPanel({
         systemSettings: this.workspace.systemSettings || defaultSystemSettings(),
@@ -6539,160 +4754,124 @@ struct Index {
         onClose: () => { this.navigateBack(); }
       })
     } else if (name === 'defaultModel') {
-      NavDestination() {
-        Column() {
-          DefaultModelPanel({
-            providers: this.workspace.providers,
-            modelDefaults: this.workspace.modelDefaults,
-            chatSuggestionsEnabled: this.workspace.systemSettings?.chatSuggestionsEnabled === true,
-            immersiveLightEnabled: this.immersiveLightOn(),
-            embeddedInNav: true,
-            onSaveDefaults: async (next: ModelDefaults) => {
-              this.workspace.modelDefaults = next;
-              this.modelConfigTick += 1;
-              await this.persist();
-            },
-            onToggleChatSuggestions: async (enabled: boolean) => {
-              const sys = this.workspace.systemSettings || defaultSystemSettings();
-              sys.chatSuggestionsEnabled = enabled;
-              this.workspace.systemSettings = sys;
-              await this.persist();
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '默认模型',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        DefaultModelPanel({
+          providers: this.workspace.providers,
+          modelDefaults: this.workspace.modelDefaults,
+          chatSuggestionsEnabled: this.workspace.systemSettings?.chatSuggestionsEnabled === true,
+          immersiveLightEnabled: this.immersiveLightOn(),
+          embeddedInNav: true,
+          onSaveDefaults: async (next: ModelDefaults) => {
+            this.workspace.modelDefaults = next;
+            this.modelConfigTick += 1;
+            await this.persist();
+          },
+          onToggleChatSuggestions: async (enabled: boolean) => {
+            const sys = this.workspace.systemSettings || defaultSystemSettings();
+            sys.chatSuggestionsEnabled = enabled;
+            this.workspace.systemSettings = sys;
+            await this.persist();
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('默认模型'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'about') {
-      NavDestination() {
-        Column() {
-          AboutPanel({
-            providerCount: this.workspace.providers.length,
-            conversationCount: this.workspace.conversations.length,
-            embeddedInNav: true,
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '关于 Kelivo',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        AboutPanel({
+          providerCount: this.workspace.providers.length,
+          conversationCount: this.workspace.conversations.length,
+          embeddedInNav: true,
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('关于 Kelivo'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'networkProxy') {
-      NavDestination() {
-        Column() {
-          NetworkProxyPanel({
-            globalProxy: this.workspace.globalProxy || defaultGlobalProxy(),
-            initialPassword: this.globalProxyPasswordPlain,
-            immersiveLightEnabled: this.immersiveLightOn(),
-            embeddedInNav: true,
-            onSaveGlobalProxy: async (next: ProxyConfig, passwordPlain: string) => {
-              const normalized = normalizeProxyConfig(next, true);
-              const existingRef = this.workspace.globalProxy?.passwordRef || normalized.passwordRef || '';
-              if (passwordPlain.length > 0) {
-                const ref = existingRef || newId();
-                await storeKey(ref, passwordPlain);
-                normalized.passwordRef = ref;
-              } else {
-                if (existingRef) {
-                  await forgetKey(existingRef).catch(() => {});
-                }
-                normalized.passwordRef = undefined;
+      KelivoNavRouteShell({
+        titleText: '网络代理',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        NetworkProxyPanel({
+          globalProxy: this.workspace.globalProxy || defaultGlobalProxy(),
+          initialPassword: this.globalProxyPasswordPlain,
+          immersiveLightEnabled: this.immersiveLightOn(),
+          embeddedInNav: true,
+          onSaveGlobalProxy: async (next: ProxyConfig, passwordPlain: string) => {
+            const normalized = normalizeProxyConfig(next, true);
+            const existingRef = this.workspace.globalProxy?.passwordRef || normalized.passwordRef || '';
+            if (passwordPlain.length > 0) {
+              const ref = existingRef || newId();
+              await storeKey(ref, passwordPlain);
+              normalized.passwordRef = ref;
+            } else {
+              if (existingRef) {
+                await forgetKey(existingRef).catch(() => {});
               }
-              this.workspace.globalProxy = normalized;
-              this.globalProxyPasswordPlain = passwordPlain;
-              setGlobalHttpProxy(normalized, passwordPlain);
-              await this.persist();
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+              normalized.passwordRef = undefined;
+            }
+            this.workspace.globalProxy = normalized;
+            this.globalProxyPasswordPlain = passwordPlain;
+            setGlobalHttpProxy(normalized, passwordPlain);
+            await this.persist();
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('网络代理'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'promptTools') {
-      NavDestination() {
-        Column() {
-          PromptToolsPanel({
-            worldBooks: normalizeWorldBooks(this.workspace.worldBooks || []),
-            instructionCards: normalizeInstructionCards(this.workspace.instructionCards || defaultInstructionCards()),
-            activeInstructionIds: this.workspace.activeInstructionIds || [],
-            quickPhrases: normalizeQuickPhrases(this.workspace.quickPhrases || defaultQuickPhrases()),
-            initialTab: this.promptTabInit,
-            embeddedInNav: true,
-            onSaveWorldBooks: async (books: WorldBook[]) => {
-              this.workspace.worldBooks = normalizeWorldBooks(books);
-              await this.persist();
-            },
-            onSaveInstructionCards: async (cards: InstructionCard[], activeIds: string[]) => {
-              this.workspace.instructionCards = normalizeInstructionCards(cards);
-              this.workspace.activeInstructionIds = activeIds;
-              await this.persist();
-            },
-            onSaveQuickPhrases: async (phrases: QuickPhrase[]) => {
-              this.workspace.quickPhrases = normalizeQuickPhrases(phrases);
-              await this.persist();
-            },
-            onInsertPhrase: (content: string) => {
-              this.draft = this.draft.trim().length > 0 ? `${this.draft}\n${content}` : content;
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: this.promptToolsNavTitle(),
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: false,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        PromptToolsPanel({
+          worldBooks: normalizeWorldBooks(this.workspace.worldBooks || []),
+          instructionCards: normalizeInstructionCards(this.workspace.instructionCards || defaultInstructionCards()),
+          activeInstructionIds: this.workspace.activeInstructionIds || [],
+          quickPhrases: normalizeQuickPhrases(this.workspace.quickPhrases || defaultQuickPhrases()),
+          initialTab: this.promptTabInit,
+          embeddedInNav: true,
+          onSaveWorldBooks: async (books: WorldBook[]) => {
+            this.workspace.worldBooks = normalizeWorldBooks(books);
+            await this.persist();
+          },
+          onSaveInstructionCards: async (cards: InstructionCard[], activeIds: string[]) => {
+            this.workspace.instructionCards = normalizeInstructionCards(cards);
+            this.workspace.activeInstructionIds = activeIds;
+            await this.persist();
+          },
+          onSaveQuickPhrases: async (phrases: QuickPhrase[]) => {
+            this.workspace.quickPhrases = normalizeQuickPhrases(phrases);
+            await this.persist();
+          },
+          onInsertPhrase: (content: string) => {
+            this.draft = this.draft.trim().length > 0 ? `${this.draft}\n${content}` : content;
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader(this.promptToolsNavTitle()); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), false)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'memory') {
       MemoryPanel({
         memories: this.workspace.memories || [],
@@ -6747,112 +4926,85 @@ struct Index {
         onClose: () => { this.navigateBack(); }
       })
     } else if (name === 'translate') {
-      NavDestination() {
-        Column() {
-          TranslatePanel({
-            providers: this.workspace.providers,
-            activeProviderId: this.workspace.activeProvider,
-            defaultTranslateProviderId: this.workspace.modelDefaults?.translateProviderId || '',
-            defaultTranslateModelId: this.workspace.modelDefaults?.translateModelId || '',
-            initialText: this.translateInitialText,
-            embeddedInNav: true,
-            resolveSecret: (ref: string) => readKey(ref),
-            onSendToChat: (text: string) => {
-              this.draft = text;
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '双语划词翻译',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        TranslatePanel({
+          providers: this.workspace.providers,
+          activeProviderId: this.workspace.activeProvider,
+          defaultTranslateProviderId: this.workspace.modelDefaults?.translateProviderId || '',
+          defaultTranslateModelId: this.workspace.modelDefaults?.translateModelId || '',
+          initialText: this.translateInitialText,
+          embeddedInNav: true,
+          resolveSecret: (ref: string) => readKey(ref),
+          onSendToChat: (text: string) => {
+            this.draft = text;
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('双语划词翻译'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'stats') {
-      NavDestination() {
-        Column() {
-          StatsPanel({
-            usageStats: this.usageStats,
-            personas: this.workspace.personas,
-            embeddedInNav: true,
-            onRefresh: () => this.refreshUsageStats(),
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: 'Token 用量统计与热力图',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => {
+          this.syncActiveRouteFromStack();
+          this.refreshUsageStats().catch(() => {});
+        },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        StatsPanel({
+          usageStats: this.usageStats,
+          personas: this.workspace.personas,
+          embeddedInNav: true,
+          onRefresh: () => this.refreshUsageStats(),
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('Token 用量统计与热力图'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => {
-        this.syncActiveRouteFromStack();
-        this.refreshUsageStats().catch(() => {});
-      })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'diagnostics') {
-      NavDestination() {
-        Column() {
-          DiagnosticsPanel({
-            requestLogs: this.requestLogs,
-            contextLogs: this.contextLogs,
-            toolCandidates: this.buildToolSchemaCandidates(),
-            toolOverrides: this.workspace.toolOverrides || [],
-            filesDir: this.filesDirPath,
-            dbDir: this.dbDirPath,
-            embeddedInNav: true,
-            initialTab: this.diagTabInit,
-            onRefreshLogs: () => this.refreshLogsAndStats(),
-            onClearRequestLogs: async () => {
-              if (this.store) await this.store.clearRequestLogs();
-              await this.refreshLogsAndStats();
-            },
-            onClearContextLogs: async () => {
-              if (this.store) await this.store.clearContextLogs();
-              await this.refreshLogsAndStats();
-            },
-            onSaveToolOverrides: async (overrides: ToolSchemaOverride[]) => {
-              this.workspace.toolOverrides = overrides;
-              await this.persist();
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '调试诊断与存储分析',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: false,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        DiagnosticsPanel({
+          requestLogs: this.requestLogs,
+          contextLogs: this.contextLogs,
+          toolCandidates: this.buildToolSchemaCandidates(),
+          toolOverrides: this.workspace.toolOverrides || [],
+          filesDir: this.filesDirPath,
+          dbDir: this.dbDirPath,
+          embeddedInNav: true,
+          initialTab: this.diagTabInit,
+          onRefreshLogs: () => this.refreshLogsAndStats(),
+          onClearRequestLogs: async () => {
+            if (this.store) await this.store.clearRequestLogs();
+            await this.refreshLogsAndStats();
+          },
+          onClearContextLogs: async () => {
+            if (this.store) await this.store.clearContextLogs();
+            await this.refreshLogsAndStats();
+          },
+          onSaveToolOverrides: async (overrides: ToolSchemaOverride[]) => {
+            this.workspace.toolOverrides = overrides;
+            await this.persist();
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('调试诊断与存储分析'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), false)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'appearance') {
       this.appearanceNavPage('', '偏好设置')
     } else if (name === 'appearance_theme') {
@@ -6864,149 +5016,113 @@ struct Index {
     } else if (name === 'appearance_language') {
       this.appearanceNavPage('language', '应用语言')
     } else if (name === 'skills') {
-      NavDestination() {
-        Column() {
-          SkillsPanel({
-            skills: this.workspace.skills || defaultBuiltinSkills(),
-            embeddedInNav: true,
-            onSaveSkills: async (next: SkillRecord[]) => {
-              this.workspace.skills = next;
-              await this.persist();
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: 'Agent Skills 技能包',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: false,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        SkillsPanel({
+          skills: this.workspace.skills || defaultBuiltinSkills(),
+          embeddedInNav: true,
+          onSaveSkills: async (next: SkillRecord[]) => {
+            this.workspace.skills = next;
+            await this.persist();
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('Agent Skills 技能包'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), false)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'workspace') {
-      NavDestination() {
-        Column() {
-          WorkspacePanel({
-            workspaces: this.workspace.workspaces || [],
-            activeWorkspaceId: this.activeWorkspaceForChat()?.id || '',
-            envVars: this.workspace.envVars || [],
-            filesDir: this.filesDirPath,
-            embeddedInNav: true,
-            onSaveWorkspaces: async (list: LocalWorkspace[], activeWsId: string) => {
-              this.workspace.workspaces = list;
-              const c = this.activeChat();
-              if (c) c.workspaceId = activeWsId || undefined;
-              await this.persist();
-            },
-            onSaveEnvVars: async (vars: EnvVar[]) => {
-              this.workspace.envVars = vars;
-              await this.persist();
-            },
-            onOpenHtmlPreview: (title: string, html: string) => {
-              this.openPreview('html', title, html);
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '本地沙箱工作区',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: false,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        WorkspacePanel({
+          workspaces: this.workspace.workspaces || [],
+          activeWorkspaceId: this.activeWorkspaceForChat()?.id || '',
+          envVars: this.workspace.envVars || [],
+          filesDir: this.filesDirPath,
+          embeddedInNav: true,
+          onSaveWorkspaces: async (list: LocalWorkspace[], activeWsId: string) => {
+            this.workspace.workspaces = list;
+            const c = this.activeChat();
+            if (c) c.workspaceId = activeWsId || undefined;
+            await this.persist();
+          },
+          onSaveEnvVars: async (vars: EnvVar[]) => {
+            this.workspace.envVars = vars;
+            await this.persist();
+          },
+          onOpenHtmlPreview: (title: string, html: string) => {
+            this.openPreview('html', title, html);
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('本地沙箱工作区'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), false)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'browser') {
-      NavDestination() {
-        Column() {
-          BrowserPanel({
-            manager: this.browserManager,
-            workspaces: this.workspace.workspaces || [],
-            bookmarks: this.workspace.browserBookmarks || [],
-            compactMode: false,
-            embeddedInNav: true,
-            onSaveBookmarks: async (list: BrowserBookmark[]) => {
-              this.workspace.browserBookmarks = list;
-              await this.persist();
-            },
-            onExtractToChat: (title: string, text: string) => {
-              this.attachedList = [...this.attachedList, { name: `${title.slice(0, 24)}.txt`, data: text, mime: 'text/plain', kind: 'text' }];
-              this.navigateTo('chat');
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '内置浏览器',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: false,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        BrowserPanel({
+          manager: this.browserManager,
+          workspaces: this.workspace.workspaces || [],
+          bookmarks: this.workspace.browserBookmarks || [],
+          compactMode: false,
+          embeddedInNav: true,
+          onSaveBookmarks: async (list: BrowserBookmark[]) => {
+            this.workspace.browserBookmarks = list;
+            await this.persist();
+          },
+          onExtractToChat: (title: string, text: string) => {
+            this.attachedList = [...this.attachedList, { name: `${title.slice(0, 24)}.txt`, data: text, mime: 'text/plain', kind: 'text' }];
+            this.navigateTo('chat');
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('内置浏览器'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), false)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     } else if (name === 'schedules') {
-      NavDestination() {
-        Column() {
-          ScheduledTasksPanel({
-            tasks: this.workspace.scheduledTasks || [],
-            personas: this.workspace.personas,
-            providers: this.workspace.providers,
-            embeddedInNav: true,
-            onSaveTasks: async (next: ScheduledTask[]) => {
-              this.workspace.scheduledTasks = next;
-              await this.persist();
-            },
-            onRunTaskNow: async (task: ScheduledTask) => {
-              await this.scheduler.executeTask(task);
-            },
-            onOpenConversation: (chatId: string) => {
-              this.activate(chatId);
-              this.navigateTo('chat');
-            },
-            onClose: () => { this.navigateBack(); }
-          })
-        }
-        .width('100%')
-        .height('100%')
-        .padding({ left: this.winLeftInset, right: this.winRightInset })
-        .backgroundColor(Color.Transparent)
+      KelivoNavRouteShell({
+        titleText: '自动化定时任务',
+        canvasColor: this.themeTokens().canvas,
+        scrollUnderTitle: true,
+        onBack: () => { this.navigateBack(); },
+        onRouteShown: () => { this.syncActiveRouteFromStack(); },
+        onRouteHidden: () => { this.syncActiveRouteFromStack(); },
+        onDismissOverlay: () => this.dismissTopOverlay()
+      }) {
+        ScheduledTasksPanel({
+          tasks: this.workspace.scheduledTasks || [],
+          personas: this.workspace.personas,
+          providers: this.workspace.providers,
+          embeddedInNav: true,
+          onSaveTasks: async (next: ScheduledTask[]) => {
+            this.workspace.scheduledTasks = next;
+            await this.persist();
+          },
+          onRunTaskNow: async (task: ScheduledTask) => {
+            await this.scheduler.executeTask(task);
+          },
+          onOpenConversation: (chatId: string) => {
+            this.activate(chatId);
+            this.navigateTo('chat');
+          },
+          onClose: () => { this.navigateBack(); }
+        })
       }
-      .hideBackButton(true)
-      .backgroundColor(this.themeTokens().canvas)
-      .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-      .title(
-        { builder: () => { this.navSubHeader('自动化定时任务'); }, height: 56 + this.winTopInset },
-        ImmersiveMaterialStyle.titleBarOptions(this.immersiveLightOn(), true)
-      )
-      .systemTransition(SystemMotion.navTransition(this.reduceMotion))
-      .onShown(() => { this.syncActiveRouteFromStack(); })
-      .onHidden(() => { this.syncActiveRouteFromStack(); })
-      .onBackPressed(() => this.dismissTopOverlay())
     }
   }
 
@@ -7026,69 +5142,37 @@ struct Index {
               if (this.wide) { this.sidebarBody(false) }
               this.chatPane()
               if (this.wideSide && this.sidePanelMode !== '' && this.activeRoute === 'chat') {
-                Column({ space: 4 }) {
-                  Row({ space: 6 }) {
-                    Button('🌐 浏览器')
-                      .height(26).fontSize(11).borderRadius(6)
-                      .backgroundColor(this.sidePanelMode === 'browser' ? $r('app.color.accent') : $r('app.color.panel'))
-                      .fontColor(this.sidePanelMode === 'browser' ? $r('app.color.on_accent') : $r('app.color.ink'))
-                      .onClick(() => { this.setSidePanelMode('browser'); })
-                    Button('📁 工作区')
-                      .height(26).fontSize(11).borderRadius(6)
-                      .backgroundColor(this.sidePanelMode === 'workspace' ? $r('app.color.accent') : $r('app.color.panel'))
-                      .fontColor(this.sidePanelMode === 'workspace' ? $r('app.color.on_accent') : $r('app.color.ink'))
-                      .onClick(() => { this.setSidePanelMode('workspace'); })
-                    Blank()
-                    Button('×')
-                      .width(26).height(26).fontSize(13).borderRadius(6)
-                      .backgroundColor(Color.Transparent).fontColor($r('app.color.muted'))
-                      .onClick(() => { this.setSidePanelMode(''); })
-                  }.width('100%').padding({ left: 8, right: 8, top: 6 })
-                  if (this.sidePanelMode === 'workspace') {
-                    WorkspacePanel({
-                      workspaces: this.workspace.workspaces || [],
-                      activeWorkspaceId: this.activeWorkspaceForChat()?.id || '',
-                      envVars: this.workspace.envVars || [],
-                      filesDir: this.filesDirPath,
-                      onSaveWorkspaces: async (list: LocalWorkspace[], activeWsId: string) => {
-                        this.workspace.workspaces = list;
-                        const c = this.activeChat();
-                        if (c) c.workspaceId = activeWsId || undefined;
-                        await this.persist();
-                      },
-                      onSaveEnvVars: async (vars: EnvVar[]) => {
-                        this.workspace.envVars = vars;
-                        await this.persist();
-                      },
-                      onOpenHtmlPreview: (title: string, html: string) => {
-                        this.openPreview('html', title, html);
-                      },
-                      onClose: () => { this.setSidePanelMode(''); }
-                    }).layoutWeight(1)
-                  } else {
-                    BrowserPanel({
-                      manager: this.browserManager,
-                      workspaces: this.workspace.workspaces || [],
-                      bookmarks: this.workspace.browserBookmarks || [],
-                      compactMode: true,
-                      onSaveBookmarks: async (list: BrowserBookmark[]) => {
-                        this.workspace.browserBookmarks = list;
-                        await this.persist();
-                      },
-                      onExtractToChat: (title: string, text: string) => {
-                        this.attachedList = [...this.attachedList, { name: `${title.slice(0, 24)}.txt`, data: text, mime: 'text/plain', kind: 'text' }];
-                      },
-                      onClose: () => { this.setSidePanelMode(''); }
-                    }).layoutWeight(1)
+                ChatWideSidePanel({
+                  sidePanelMode: this.sidePanelMode,
+                  browserManager: this.browserManager,
+                  workspaces: this.workspace.workspaces || [],
+                  activeWorkspaceId: this.activeWorkspaceForChat()?.id || '',
+                  envVars: this.workspace.envVars || [],
+                  filesDir: this.filesDirPath,
+                  bookmarks: this.workspace.browserBookmarks || [],
+                  bottomInset: this.effectiveBottomInset(),
+                  onChangeMode: (mode: '' | 'browser' | 'workspace') => { this.setSidePanelMode(mode); },
+                  onSaveWorkspaces: async (list: LocalWorkspace[], activeWsId: string) => {
+                    this.workspace.workspaces = list;
+                    const c = this.activeChat();
+                    if (c) c.workspaceId = activeWsId || undefined;
+                    await this.persist();
+                  },
+                  onSaveEnvVars: async (vars: EnvVar[]) => {
+                    this.workspace.envVars = vars;
+                    await this.persist();
+                  },
+                  onOpenHtmlPreview: (title: string, html: string) => {
+                    this.openPreview('html', title, html);
+                  },
+                  onSaveBookmarks: async (list: BrowserBookmark[]) => {
+                    this.workspace.browserBookmarks = list;
+                    await this.persist();
+                  },
+                  onExtractToChat: (title: string, text: string) => {
+                    this.attachedList = [...this.attachedList, { name: `${title.slice(0, 24)}.txt`, data: text, mime: 'text/plain', kind: 'text' }];
                   }
-                }
-                .width('36%')
-                .height('100%')
-                .padding({ top: this.winTopInset, bottom: this.effectiveBottomInset(), right: this.winRightInset })
-                .backgroundColor($r('app.color.panel'))
-                .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
-                .border({ width: { left: 1 }, color: $r('app.color.line') })
-                .transition(SystemMotion.endSlideTransition(this.reduceMotion))
+                })
               }
             }
           }

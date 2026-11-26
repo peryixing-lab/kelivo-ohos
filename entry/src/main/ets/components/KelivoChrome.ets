@@ -1,5 +1,6 @@
 import { BrandIconId, brandInitial, isMonochromeBrandIcon } from '../core/BrandIcons';
 import { ImmersiveMaterialStyle } from '../core/ImmersiveMaterialStyle';
+import { SystemMotion } from '../core/SystemMotion';
 
 export function brandIconResource(id: BrandIconId): Resource | undefined {
   switch (id) {
@@ -425,5 +426,57 @@ export struct KelivoSectionHeader {
       .fontColor($r('app.color.muted'))
       .width('100%')
       .padding({ left: 12, right: 12, top: this.topSpacing, bottom: 6 })
+  }
+}
+
+@Component
+export struct KelivoNavRouteShell {
+  @Prop titleText: string = '';
+  @Prop subtitleText: string = '';
+  @Prop canvasColor: string = '#FFFFFF';
+  @Prop scrollUnderTitle: boolean = true;
+  onBack: () => void = () => {};
+  onRouteShown: () => void = () => {};
+  onRouteHidden: () => void = () => {};
+  onDismissOverlay: () => boolean = (): boolean => false;
+  @BuilderParam content: () => void;
+
+  @StorageProp('windowTopInsetVp') winTopInset: number = 0;
+  @StorageProp('windowLeftInsetVp') winLeftInset: number = 0;
+  @StorageProp('windowRightInsetVp') winRightInset: number = 0;
+  @StorageProp('immersiveLightEnabled') immersiveLight: boolean = true;
+  @StorageProp('reduceMotionEnabled') reduceMotion: boolean = false;
+
+  @Builder
+  private titleBarBuilder() {
+    KelivoNavTitleBar({
+      titleText: this.titleText,
+      subtitleText: this.subtitleText,
+      showBack: true,
+      onBack: () => { this.onBack(); }
+    })
+  }
+
+  build() {
+    NavDestination() {
+      Column() {
+        this.content()
+      }
+      .width('100%')
+      .height('100%')
+      .padding({ left: this.winLeftInset, right: this.winRightInset })
+      .backgroundColor(Color.Transparent)
+    }
+    .hideBackButton(true)
+    .backgroundColor(this.canvasColor)
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.TOP, SafeAreaEdge.BOTTOM])
+    .title(
+      { builder: () => { this.titleBarBuilder(); }, height: 56 + this.winTopInset },
+      ImmersiveMaterialStyle.titleBarOptions(this.immersiveLight, this.scrollUnderTitle)
+    )
+    .systemTransition(SystemMotion.navTransition(this.reduceMotion))
+    .onShown(() => { this.onRouteShown(); })
+    .onHidden(() => { this.onRouteHidden(); })
+    .onBackPressed(() => this.onDismissOverlay())
   }
 }

@@ -5,13 +5,9 @@ import { SystemMotion } from '../core/SystemMotion';
 import {
   MEMORY_CATEGORIES,
   MemoryTemplateKind,
-  STANDARD_PROFILE_FIELDS,
-  StandardProfileFieldSpec,
   findOrphanedMemories,
   getDefaultMemoryTemplate,
   getEffectiveMemoryTemplate,
-  isStandardProfileKey,
-  normalizeMemoryCategory,
   normalizeMemorySettings,
   normalizeMemoryTimestamp,
   normalizeUserProfileFields,
@@ -25,44 +21,36 @@ import {
   MemoryPromptLanguage,
   MemoryPromptTemplates,
   MemorySettings,
-  MemorySourceKind,
   MemoryTrace,
-  MemoryTraceStep,
   ModelDefaults,
-  ModelSpec,
   Persona,
   Provider,
-  UserProfileField,
-  isProviderConfigured,
-  providerEnabledModels
+  UserProfileField
 } from '../core/Models';
 import { newId } from '../core/Storage';
 import { KelivoNavTitleBar } from './KelivoChrome';
-
-type MemorySubPage = 'home' | 'list' | 'profile' | 'legacy' | 'traces' | 'about' | 'template' | 'modelPicker';
-
-interface TemplateRowSpec {
-  kind: MemoryTemplateKind;
-  title: string;
-  subtitle: string;
-}
-
-interface RoleModelChoice {
-  key: string;
-  providerId: string;
-  providerName: string;
-  modelId: string;
-}
-
-const TEMPLATE_ROWS: TemplateRowSpec[] = [
-  { kind: 'rules', title: '记忆规则', subtitle: '注入到主对话系统提示词中' },
-  { kind: 'gate', title: '门控判断 (Gatekeeper)', subtitle: '判定一轮对话是否值得长期记忆' },
-  { kind: 'extract', title: '候选提取 (Extract)', subtitle: '从对话中提取候选长期记忆条目' },
-  { kind: 'smartAddBatch', title: '智能去重 · 批量 (Smart Add)', subtitle: '批量判定 NEW / MERGE / CONFLICT / SKIP' },
-  { kind: 'smartAddSingle', title: '智能去重 · 逐条 (Smart Add)', subtitle: '逐条判定 NEW / MERGE / CONFLICT / SKIP' },
-  { kind: 'profileDistill', title: '画像提炼 (Profile Distiller)', subtitle: '从身份记忆中提炼结构化用户画像字段' },
-  { kind: 'legacyMigrate', title: '旧版记忆迁移', subtitle: '迁移改写旧版自由文本记忆时使用' }
-];
+import {
+  MEMORY_TEMPLATE_ROWS,
+  MemorySubPage,
+  MemoryTemplateRowSpec,
+  cloneMemoryModelDefaults,
+  cloneMemorySettings,
+  collectMemoryModelChoices,
+  findMemoryTemplateSpec,
+  isMemoryTemplateCustomized,
+  memoryCategoryLabel,
+  memoryPersonaName,
+  setCustomMemoryTemplateValue
+} from './MemoryPanelHelpers';
+import {
+  MemoryAboutSubView,
+  MemoryLegacySubView,
+  MemoryListSubView,
+  MemoryModelPickerSubView,
+  MemoryProfileSubView,
+  MemoryTemplateEditorSubView,
+  MemoryTracesSubView
+} from './MemorySubPages';
 
 @Component
 export struct MemoryPanel {
@@ -129,6 +117,30 @@ export struct MemoryPanel {
   @State activeSheetOpen: boolean = false;
   private contentScroller: Scroller = new Scroller();
 
+  // Memory list state
+  @State searchQuery: string = '';
+  @State filterScope: string = 'all'; // 'all' | 'global' | 'orphan' | personaId
+  @State filterCat: string = 'all';
+  @State filterStatus: string = 'active'; // 'active' | 'archived' | 'all'
+  @State pageLimit: number = 40;
+  @State multiSelect: boolean = false;
+  @State selectedIds: string[] = [];
+  @State editingEntryId: string = '';
+  @State entryCat: MemoryCategory = 'instruction';
+  @State entryContent: string = '';
+  @State entryScopeId: string = '';
+
+  // Profile editor state
+  @State editingProfileKey: string = '';
+  @State editingProfileVal: string = '';
+  @State newProfileKey: string = '';
+  @State newProfileVal: string = '';
+
+  // Template editor state
+  @State editTemplateKind: MemoryTemplateKind = 'rules';
+  @State editTemplateLang: 'zh' | 'en' = 'zh';
+  @State editTemplateText: string = '';
+
   private effectiveBottomInset(): number {
     return computeFloatingBottomInsetVp(this.winBottomInset, this.winIsFloating, false);
   }
@@ -175,198 +187,12 @@ export struct MemoryPanel {
     } catch (_) {}
   }
 
-  // Memory list state
-  @State searchQuery: string = '';
-  @State filterScope: string = 'all'; // 'all' | 'global' | 'orphan' | personaId
-  @State filterCat: string = 'all';
-  @State filterStatus: string = 'active'; // 'active' | 'archived' | 'all'
-  @State pageLimit: number = 40;
-  @State multiSelect: boolean = false;
-  @State selectedIds: string[] = [];
-  @State editingEntryId: string = '';
-  @State entryCat: MemoryCategory = 'instruction';
-  @State entryContent: string = '';
-  @State entryScopeId: string = '';
-
-  // Profile editor state
-  @State editingProfileKey: string = '';
-  @State editingProfileVal: string = '';
-  @State newProfileKey: string = '';
-  @State newProfileVal: string = '';
-
-  // Template editor state
-  @State editTemplateKind: MemoryTemplateKind = 'rules';
-  @State editTemplateLang: 'zh' | 'en' = 'zh';
-  @State editTemplateText: string = '';
-
-  // Trace detail state
-  @State expandedTraceId: string = '';
-
-  private cloneSettings(): MemorySettings {
-    const s = normalizeMemorySettings(this.memorySettings);
-    const tpl: MemoryPromptTemplates = s.templates ? {
-      rulesZh: s.templates.rulesZh,
-      rulesEn: s.templates.rulesEn,
-      gateZh: s.templates.gateZh,
-      gateEn: s.templates.gateEn,
-      extractZh: s.templates.extractZh,
-      extractEn: s.templates.extractEn,
-      smartAddSingleZh: s.templates.smartAddSingleZh,
-      smartAddSingleEn: s.templates.smartAddSingleEn,
-      smartAddBatchZh: s.templates.smartAddBatchZh,
-      smartAddBatchEn: s.templates.smartAddBatchEn,
-      profileDistillZh: s.templates.profileDistillZh,
-      profileDistillEn: s.templates.profileDistillEn,
-      legacyMigrateZh: s.templates.legacyMigrateZh,
-      legacyMigrateEn: s.templates.legacyMigrateEn
-    } : {};
-    return {
-      autoExtract: s.autoExtract,
-      injectGlobal: s.injectGlobal,
-      maxInjectCount: s.maxInjectCount,
-      useLegacyMemory: s.useLegacyMemory,
-      enableThinking: s.enableThinking,
-      promptLanguage: s.promptLanguage,
-      recordTraces: s.recordTraces,
-      templates: tpl,
-      legacyMemories: s.legacyMemories ? s.legacyMemories.slice() : []
-    };
-  }
-
-  private cloneModelDefaults(): ModelDefaults {
-    return {
-      chatProviderId: this.modelDefaults.chatProviderId || '',
-      chatModelId: this.modelDefaults.chatModelId || '',
-      perChatModel: this.modelDefaults.perChatModel === true,
-      titleProviderId: this.modelDefaults.titleProviderId || '',
-      titleModelId: this.modelDefaults.titleModelId || '',
-      summaryProviderId: this.modelDefaults.summaryProviderId || '',
-      summaryModelId: this.modelDefaults.summaryModelId || '',
-      suggestionsProviderId: this.modelDefaults.suggestionsProviderId || '',
-      suggestionsModelId: this.modelDefaults.suggestionsModelId || '',
-      compressProviderId: this.modelDefaults.compressProviderId || '',
-      compressModelId: this.modelDefaults.compressModelId || '',
-      translateProviderId: this.modelDefaults.translateProviderId || '',
-      translateModelId: this.modelDefaults.translateModelId || '',
-      ocrProviderId: this.modelDefaults.ocrProviderId || '',
-      ocrModelId: this.modelDefaults.ocrModelId || '',
-      memoryProviderId: this.modelDefaults.memoryProviderId || '',
-      memoryModelId: this.modelDefaults.memoryModelId || ''
-    };
-  }
-
-  private categoryLabel(cat: MemoryCategory): string {
-    if (cat === 'identity') return '身份';
-    if (cat === 'workflow') return '工作方式';
-    if (cat === 'tone') return '表达风格';
-    return '用户指令';
-  }
-
-  private sourceLabel(src?: MemorySourceKind): string {
-    if (src === 'tool') return '工具写入';
-    if (src === 'manual') return '手动';
-    return '自动提取';
-  }
-
-  private personaName(id?: string): string {
-    if (!id || id.length === 0) return '全局';
-    for (let i = 0; i < this.personas.length; i++) {
-      if (this.personas[i].id === id) return this.personas[i].name;
-    }
-    return `已删除助手 (${id.slice(0, 6)})`;
-  }
-
-  private formatTs(ts?: number | string): string {
-    const ms = normalizeMemoryTimestamp(ts);
-    const d = new Date(ms);
-    if (!Number.isFinite(d.getTime())) return '';
-    const pad = (n: number): string => (n < 10 ? `0${n}` : `${n}`);
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  }
-
-  private formatDateOnly(ts?: number | string): string {
-    const ms = normalizeMemoryTimestamp(ts);
-    const d = new Date(ms);
-    if (!Number.isFinite(d.getTime())) return '';
-    const pad = (n: number): string => (n < 10 ? `0${n}` : `${n}`);
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  }
-
   private processingModelLabel(): string {
     const pid = this.modelDefaults.memoryProviderId;
     const mid = this.modelDefaults.memoryModelId;
     if (!pid || !mid) return '跟随当前对话模型';
     const prov = this.providers.find((p: Provider): boolean => p.id === pid);
     return prov ? `${prov.name} / ${mid}` : mid;
-  }
-
-  private availableModelChoices(): RoleModelChoice[] {
-    const enabled = this.providers.filter((p: Provider): boolean =>
-      p.enabled !== false && providerEnabledModels(p).length > 0);
-    const configured = enabled.filter((p: Provider): boolean => isProviderConfigured(p));
-    const source = configured.length > 0 ? configured : enabled;
-    const out: RoleModelChoice[] = [];
-    for (let i = 0; i < source.length; i++) {
-      const p = source[i];
-      const specs: ModelSpec[] = providerEnabledModels(p);
-      for (let j = 0; j < specs.length; j++) {
-        out.push({
-          key: `${p.id}::${specs[j].id}`,
-          providerId: p.id,
-          providerName: p.name,
-          modelId: specs[j].id
-        });
-      }
-    }
-    return out;
-  }
-
-  private isTemplateCustomized(kind: MemoryTemplateKind): boolean {
-    const tpl = this.memorySettings.templates;
-    if (!tpl) return false;
-    if (kind === 'rules') return Boolean(tpl.rulesZh?.trim() || tpl.rulesEn?.trim());
-    if (kind === 'gate') return Boolean(tpl.gateZh?.trim() || tpl.gateEn?.trim());
-    if (kind === 'extract') return Boolean(tpl.extractZh?.trim() || tpl.extractEn?.trim());
-    if (kind === 'smartAddSingle') return Boolean(tpl.smartAddSingleZh?.trim() || tpl.smartAddSingleEn?.trim());
-    if (kind === 'smartAddBatch') return Boolean(tpl.smartAddBatchZh?.trim() || tpl.smartAddBatchEn?.trim());
-    if (kind === 'profileDistill') return Boolean(tpl.profileDistillZh?.trim() || tpl.profileDistillEn?.trim());
-    return Boolean(tpl.legacyMigrateZh?.trim() || tpl.legacyMigrateEn?.trim());
-  }
-
-  private getCustomTemplateValue(tpl: MemoryPromptTemplates | undefined, kind: MemoryTemplateKind, lang: 'zh' | 'en'): string {
-    if (!tpl) return '';
-    if (kind === 'rules') return (lang === 'zh' ? tpl.rulesZh : tpl.rulesEn) || '';
-    if (kind === 'gate') return (lang === 'zh' ? tpl.gateZh : tpl.gateEn) || '';
-    if (kind === 'extract') return (lang === 'zh' ? tpl.extractZh : tpl.extractEn) || '';
-    if (kind === 'smartAddSingle') return (lang === 'zh' ? tpl.smartAddSingleZh : tpl.smartAddSingleEn) || '';
-    if (kind === 'smartAddBatch') return (lang === 'zh' ? tpl.smartAddBatchZh : tpl.smartAddBatchEn) || '';
-    if (kind === 'profileDistill') return (lang === 'zh' ? tpl.profileDistillZh : tpl.profileDistillEn) || '';
-    return (lang === 'zh' ? tpl.legacyMigrateZh : tpl.legacyMigrateEn) || '';
-  }
-
-  private setCustomTemplateValue(tpl: MemoryPromptTemplates, kind: MemoryTemplateKind, lang: 'zh' | 'en', val: string | undefined): void {
-    if (kind === 'rules') {
-      if (lang === 'zh') tpl.rulesZh = val;
-      else tpl.rulesEn = val;
-    } else if (kind === 'gate') {
-      if (lang === 'zh') tpl.gateZh = val;
-      else tpl.gateEn = val;
-    } else if (kind === 'extract') {
-      if (lang === 'zh') tpl.extractZh = val;
-      else tpl.extractEn = val;
-    } else if (kind === 'smartAddSingle') {
-      if (lang === 'zh') tpl.smartAddSingleZh = val;
-      else tpl.smartAddSingleEn = val;
-    } else if (kind === 'smartAddBatch') {
-      if (lang === 'zh') tpl.smartAddBatchZh = val;
-      else tpl.smartAddBatchEn = val;
-    } else if (kind === 'profileDistill') {
-      if (lang === 'zh') tpl.profileDistillZh = val;
-      else tpl.profileDistillEn = val;
-    } else {
-      if (lang === 'zh') tpl.legacyMigrateZh = val;
-      else tpl.legacyMigrateEn = val;
-    }
   }
 
   private openTemplateEditor(kind: MemoryTemplateKind): void {
@@ -382,19 +208,12 @@ export struct MemoryPanel {
     this.editTemplateText = getEffectiveMemoryTemplate(this.memorySettings, this.editTemplateKind, lang);
   }
 
-  private currentTemplateSpec(): TemplateRowSpec {
-    for (let i = 0; i < TEMPLATE_ROWS.length; i++) {
-      if (TEMPLATE_ROWS[i].kind === this.editTemplateKind) return TEMPLATE_ROWS[i];
-    }
-    return TEMPLATE_ROWS[0];
-  }
-
   private async saveTemplateEdit(): Promise<void> {
-    const next = this.cloneSettings();
+    const next = cloneMemorySettings(this.memorySettings);
     const tpl: MemoryPromptTemplates = next.templates || {};
     const defText = getDefaultMemoryTemplate(this.editTemplateKind, this.editTemplateLang).trim();
     const clean = this.editTemplateText.trim();
-    this.setCustomTemplateValue(tpl, this.editTemplateKind, this.editTemplateLang, clean === defText || clean.length === 0 ? undefined : clean);
+    setCustomMemoryTemplateValue(tpl, this.editTemplateKind, this.editTemplateLang, clean === defText || clean.length === 0 ? undefined : clean);
     next.templates = tpl;
     await this.onSaveSettings(next);
     this.statusTip = '已保存提示词模板';
@@ -405,9 +224,9 @@ export struct MemoryPanel {
   private async resetTemplateToDefault(): Promise<void> {
     const defText = getDefaultMemoryTemplate(this.editTemplateKind, this.editTemplateLang);
     this.editTemplateText = defText;
-    const next = this.cloneSettings();
+    const next = cloneMemorySettings(this.memorySettings);
     const tpl: MemoryPromptTemplates = next.templates || {};
-    this.setCustomTemplateValue(tpl, this.editTemplateKind, this.editTemplateLang, undefined);
+    setCustomMemoryTemplateValue(tpl, this.editTemplateKind, this.editTemplateLang, undefined);
     next.templates = tpl;
     await this.onSaveSettings(next);
     this.statusTip = '已恢复默认模板';
@@ -415,7 +234,7 @@ export struct MemoryPanel {
   }
 
   private async updateSettingFlag(field: 'useLegacyMemory' | 'enableThinking' | 'injectGlobal' | 'autoExtract' | 'recordTraces', val: boolean): Promise<void> {
-    const next = this.cloneSettings();
+    const next = cloneMemorySettings(this.memorySettings);
     if (field === 'useLegacyMemory') next.useLegacyMemory = val;
     else if (field === 'enableThinking') next.enableThinking = val;
     else if (field === 'injectGlobal') next.injectGlobal = val;
@@ -426,13 +245,13 @@ export struct MemoryPanel {
 
   private async updateInjectCount(nextVal: number): Promise<void> {
     const clamped = Math.max(1, Math.min(500, Math.floor(nextVal)));
-    const next = this.cloneSettings();
+    const next = cloneMemorySettings(this.memorySettings);
     next.maxInjectCount = clamped;
     await this.onSaveSettings(next);
   }
 
   private async updatePromptLanguage(lang: MemoryPromptLanguage): Promise<void> {
-    const next = this.cloneSettings();
+    const next = cloneMemorySettings(this.memorySettings);
     next.promptLanguage = lang;
     await this.onSaveSettings(next);
   }
@@ -464,22 +283,6 @@ export struct MemoryPanel {
       if (norm[i].value.trim().length > 0) c++;
     }
     return c;
-  }
-
-  private standardProfileValue(key: string): string {
-    const norm = normalizeUserProfileFields(this.userProfile);
-    const target = key.trim().toLowerCase();
-    for (let i = 0; i < norm.length; i++) {
-      if (profileFieldKey(norm[i]).toLowerCase() === target) {
-        return norm[i].value;
-      }
-    }
-    return '';
-  }
-
-  private customProfileFields(): UserProfileField[] {
-    const norm = normalizeUserProfileFields(this.userProfile);
-    return norm.filter((f: UserProfileField): boolean => !isStandardProfileKey(profileFieldKey(f)));
   }
 
   private async saveProfileFieldValue(key: string, val: string): Promise<void> {
@@ -564,7 +367,7 @@ export struct MemoryPanel {
     if (this.filterScope === 'all') return '全部范围';
     if (this.filterScope === 'global') return '全局';
     if (this.filterScope === 'orphan') return '孤立助手';
-    return this.personaName(this.filterScope);
+    return memoryPersonaName(this.personas, this.filterScope);
   }
 
   private openAddEntryEditor(): void {
@@ -760,7 +563,7 @@ export struct MemoryPanel {
     lines.push('## 记忆条目');
     for (let i = 0; i < this.memories.length; i++) {
       const m = this.memories[i];
-      lines.push(`- [${m.category}][${this.personaName(m.assistantId)}]${m.archived ? '[已归档]' : ''} ${m.content}`);
+      lines.push(`- [${m.category}][${memoryPersonaName(this.personas, m.assistantId)}]${m.archived ? '[已归档]' : ''} ${m.content}`);
     }
     try {
       await pasteboard.getSystemPasteboard().setData(
@@ -773,39 +576,13 @@ export struct MemoryPanel {
     }
   }
 
-  private traceStepsFor(tr: MemoryTrace): MemoryTraceStep[] {
-    return tr.steps || [];
-  }
-
-  private traceStatusLabel(tr: MemoryTrace): string {
-    if (tr.error) return '✕ 失败';
-    if (tr.gatekeeperPassed) return '✓ 门控通过';
-    return '○ 门控跳过';
-  }
-
-  private traceStepStatusLabel(st: MemoryTraceStep): string {
-    if (st.status === 'failed' || st.error) return '失败';
-    if (st.status === 'skipped') return '跳过';
-    return '成功';
-  }
-
-  private traceStepResponseText(st: MemoryTraceStep): string {
-    if (st.response && st.response.trim().length > 0) {
-      return st.response.slice(0, 600);
-    }
-    if (st.status === 'failed' || st.error) {
-      return st.error ? `错误：${st.error}` : '(模型返回空响应)';
-    }
-    return '';
-  }
-
   private subPageTitle(): string {
     if (this.subPage === 'list') return '记忆列表';
     if (this.subPage === 'profile') return '用户画像';
     if (this.subPage === 'legacy') return '旧版记忆（只读）';
     if (this.subPage === 'traces') return '流水线追踪';
     if (this.subPage === 'about') return '关于记忆';
-    if (this.subPage === 'template') return this.currentTemplateSpec().title;
+    if (this.subPage === 'template') return findMemoryTemplateSpec(this.editTemplateKind).title;
     if (this.subPage === 'modelPicker') return '选择记忆处理模型';
     return '记忆';
   }
@@ -1097,7 +874,7 @@ export struct MemoryPanel {
 
       this.sectionLabel('提示词模板')
       Column() {
-        ForEach(TEMPLATE_ROWS, (spec: TemplateRowSpec, idx: number) => {
+        ForEach(MEMORY_TEMPLATE_ROWS, (spec: MemoryTemplateRowSpec, idx: number) => {
           Column() {
             if (idx > 0) {
               Divider().color($r('app.color.line')).margin({ left: 14 })
@@ -1105,12 +882,12 @@ export struct MemoryPanel {
             this.navRow(
               spec.title,
               spec.subtitle,
-              this.isTemplateCustomized(spec.kind) ? '已自定义' : '默认',
+              isMemoryTemplateCustomized(this.memorySettings, spec.kind) ? '已自定义' : '默认',
               false,
               () => { this.openTemplateEditor(spec.kind); }
             )
           }
-        }, (spec: TemplateRowSpec) => `tpl_${spec.kind}`)
+        }, (spec: MemoryTemplateRowSpec) => `tpl_${spec.kind}`)
       }
       .width('100%')
       .backgroundColor($r('app.color.surface'))
@@ -1202,821 +979,6 @@ export struct MemoryPanel {
   }
 
   @Builder
-  private renderModelPickerSubPage() {
-    Column({ space: 10 }) {
-      Row({ space: 10 }) {
-        Column({ space: 2 }) {
-          Text('跟随当前对话模型')
-            .fontSize(15)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.ink'))
-          Text('不指定独立记忆模型，直接使用对话所选模型')
-            .fontSize(12)
-            .fontColor($r('app.color.muted'))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        if (!this.modelDefaults.memoryProviderId || !this.modelDefaults.memoryModelId) {
-          SymbolGlyph($r('sys.symbol.checkmark')).fontSize(16).fontColor([$r('app.color.accent')])
-        }
-      }
-      .width('100%')
-      .padding(14)
-      .backgroundColor($r('app.color.surface'))
-      .borderRadius(14)
-      .onClick(async () => {
-        const next = this.cloneModelDefaults();
-        next.memoryProviderId = '';
-        next.memoryModelId = '';
-        await this.onSaveModelDefaults(next);
-        this.statusTip = '记忆处理模型已设为跟随对话模型';
-        this.navigateSubPage('home');
-      })
-
-      ForEach(this.availableModelChoices(), (choice: RoleModelChoice) => {
-        Row({ space: 10 }) {
-          Column({ space: 2 }) {
-            Text(choice.modelId)
-              .fontSize(14)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.ink'))
-            Text(choice.providerName)
-              .fontSize(12)
-              .fontColor($r('app.color.muted'))
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-
-          if (this.modelDefaults.memoryProviderId === choice.providerId &&
-            this.modelDefaults.memoryModelId === choice.modelId) {
-            SymbolGlyph($r('sys.symbol.checkmark')).fontSize(16).fontColor([$r('app.color.accent')])
-          }
-        }
-        .width('100%')
-        .padding({ left: 14, right: 14, top: 10, bottom: 10 })
-        .backgroundColor($r('app.color.surface'))
-        .borderRadius(12)
-        .onClick(async () => {
-          const next = this.cloneModelDefaults();
-          next.memoryProviderId = choice.providerId;
-          next.memoryModelId = choice.modelId;
-          await this.onSaveModelDefaults(next);
-          this.statusTip = `处理模型已设为 ${choice.providerName} / ${choice.modelId}`;
-          this.navigateSubPage('home');
-        })
-      }, (choice: RoleModelChoice) => `mp_${choice.key}`)
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private renderTemplateSubPage() {
-    Column({ space: 12 }) {
-      Text(this.currentTemplateSpec().subtitle)
-        .fontSize(12)
-        .fontColor($r('app.color.muted'))
-
-      Row({ space: 8 }) {
-        Button('中文模板')
-          .type(ButtonType.Normal)
-          .layoutWeight(1)
-          .height(34)
-          .fontSize(12)
-          .borderRadius(10)
-          .fontColor(this.editTemplateLang === 'zh' ? $r('app.color.on_accent') : $r('app.color.ink'))
-          .backgroundColor(this.editTemplateLang === 'zh' ? $r('app.color.accent') : $r('app.color.surface'))
-          .onClick(() => { this.switchTemplateEditorLang('zh'); })
-        Button('English 模板')
-          .type(ButtonType.Normal)
-          .layoutWeight(1)
-          .height(34)
-          .fontSize(12)
-          .borderRadius(10)
-          .fontColor(this.editTemplateLang === 'en' ? $r('app.color.on_accent') : $r('app.color.ink'))
-          .backgroundColor(this.editTemplateLang === 'en' ? $r('app.color.accent') : $r('app.color.surface'))
-          .onClick(() => { this.switchTemplateEditorLang('en'); })
-      }
-      .width('100%')
-
-      TextArea({ text: this.editTemplateText, placeholder: '输入提示词模板内容...' })
-        .width('100%')
-        .height(360)
-        .fontSize(13)
-        .borderRadius(12)
-        .backgroundColor($r('app.color.surface'))
-        .onChange((v: string) => {
-          this.editTemplateText = v;
-        })
-
-      Row({ space: 8 }) {
-        Button('恢复默认')
-          .type(ButtonType.Normal)
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
-          .borderRadius(10)
-          .fontColor($r('app.color.warning'))
-          .backgroundColor($r('app.color.surface'))
-          .onClick(async () => { await this.resetTemplateToDefault(); })
-
-        Button('保存模板')
-          .type(ButtonType.Normal)
-          .layoutWeight(1)
-          .height(40)
-          .fontSize(13)
-          .borderRadius(10)
-          .fontColor($r('app.color.on_accent'))
-          .backgroundColor($r('app.color.accent'))
-          .onClick(async () => { await this.saveTemplateEdit(); })
-      }
-      .width('100%')
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private renderListSubPage() {
-    Column({ space: 10 }) {
-      Row({ space: 6 }) {
-        TextInput({ text: this.searchQuery, placeholder: '搜索记忆关键词...' })
-          .layoutWeight(1)
-          .height(38)
-          .borderRadius(12)
-          .backgroundColor($r('app.color.surface'))
-          .onChange((v: string) => {
-            this.searchQuery = v;
-            this.pageLimit = 40;
-          })
-        Button(this.multiSelect ? '取消多选' : '多选')
-          .type(ButtonType.Normal)
-          .height(38)
-          .fontSize(12)
-          .borderRadius(10)
-          .fontColor(this.multiSelect ? $r('app.color.on_accent') : $r('app.color.ink'))
-          .backgroundColor(this.multiSelect ? $r('app.color.accent') : $r('app.color.surface'))
-          .onClick(() => {
-            this.multiSelect = !this.multiSelect;
-            this.selectedIds = [];
-          })
-        Button('+ 添加')
-          .type(ButtonType.Normal)
-          .height(38)
-          .fontSize(12)
-          .borderRadius(10)
-          .fontColor($r('app.color.on_accent'))
-          .backgroundColor($r('app.color.accent'))
-          .onClick(() => { this.openAddEntryEditor(); })
-      }
-      .width('100%')
-
-      // Scope filter strip
-      Scroll() {
-        Row({ space: 6 }) {
-          Button('全部范围')
-            .type(ButtonType.Normal).height(28).fontSize(11).borderRadius(14).padding({ left: 12, right: 12 })
-            .fontColor(this.filterScope === 'all' ? $r('app.color.on_accent') : $r('app.color.ink'))
-            .backgroundColor(this.filterScope === 'all' ? $r('app.color.accent') : $r('app.color.surface'))
-            .onClick(() => { this.filterScope = 'all'; this.pageLimit = 40; })
-          Button('全局')
-            .type(ButtonType.Normal).height(28).fontSize(11).borderRadius(14).padding({ left: 12, right: 12 })
-            .fontColor(this.filterScope === 'global' ? $r('app.color.on_accent') : $r('app.color.ink'))
-            .backgroundColor(this.filterScope === 'global' ? $r('app.color.accent') : $r('app.color.surface'))
-            .onClick(() => { this.filterScope = 'global'; this.pageLimit = 40; })
-          if (this.orphanCount() > 0) {
-            Button(`孤立 (${this.orphanCount()})`)
-              .type(ButtonType.Normal).height(28).fontSize(11).borderRadius(14).padding({ left: 12, right: 12 })
-              .fontColor(this.filterScope === 'orphan' ? $r('app.color.on_accent') : $r('app.color.warning'))
-              .backgroundColor(this.filterScope === 'orphan' ? $r('app.color.warning') : $r('app.color.surface'))
-              .onClick(() => { this.filterScope = 'orphan'; this.pageLimit = 40; })
-          }
-          ForEach(this.personas, (p: Persona) => {
-            Button(p.name)
-              .type(ButtonType.Normal).height(28).fontSize(11).borderRadius(14).padding({ left: 12, right: 12 })
-              .fontColor(this.filterScope === p.id ? $r('app.color.on_accent') : $r('app.color.ink'))
-              .backgroundColor(this.filterScope === p.id ? $r('app.color.accent') : $r('app.color.surface'))
-              .onClick(() => { this.filterScope = p.id; this.pageLimit = 40; })
-          }, (p: Persona) => `fs_${p.id}`)
-        }
-      }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
-      .width('100%')
-
-      // Type + Status filter strip
-      Scroll() {
-        Row({ space: 6 }) {
-          ForEach(['all', 'identity', 'workflow', 'tone', 'instruction'], (cat: string) => {
-            Button(cat === 'all' ? '全部类型' : this.categoryLabel(cat as MemoryCategory))
-              .type(ButtonType.Normal).height(26).fontSize(11).borderRadius(8).padding({ left: 10, right: 10 })
-              .fontColor(this.filterCat === cat ? $r('app.color.accent') : $r('app.color.muted'))
-              .backgroundColor(this.filterCat === cat ? $r('app.color.tint') : $r('app.color.surface'))
-              .onClick(() => { this.filterCat = cat; this.pageLimit = 40; })
-          }, (cat: string) => `fc_${cat}`)
-
-          Button(this.filterStatus === 'active' ? '状态：生效中' : (this.filterStatus === 'archived' ? '状态：已归档' : '状态：全部'))
-            .type(ButtonType.Normal).height(26).fontSize(11).borderRadius(8).padding({ left: 10, right: 10 })
-            .fontColor($r('app.color.ink'))
-            .backgroundColor($r('app.color.surface'))
-            .onClick(() => {
-              this.filterStatus = this.filterStatus === 'active' ? 'archived' : (this.filterStatus === 'archived' ? 'all' : 'active');
-              this.pageLimit = 40;
-            })
-        }
-      }
-      .scrollable(ScrollDirection.Horizontal)
-      .scrollBar(BarState.Off)
-      .width('100%')
-
-      // Orphaned assistant memories banner
-      if (this.orphanCount() > 0) {
-        Column({ space: 8 }) {
-          Row({ space: 8 }) {
-            SymbolGlyph($r('sys.symbol.exclamationmark_triangle'))
-              .fontSize(18)
-              .fontColor([$r('app.color.warning')])
-            Text(`${this.orphanCount()} 条孤立助手记忆（原助手已删除）`)
-              .fontSize(13)
-              .fontWeight(FontWeight.Medium)
-              .fontColor($r('app.color.ink'))
-              .layoutWeight(1)
-          }
-          .width('100%')
-
-          Row({ space: 8 }) {
-            Button('转为全局')
-              .type(ButtonType.Normal)
-              .layoutWeight(1)
-              .height(30)
-              .fontSize(12)
-              .borderRadius(8)
-              .fontColor($r('app.color.accent'))
-              .backgroundColor($r('app.color.surface'))
-              .onClick(async () => { await this.cleanupOrphaned(true); })
-
-            Button('一键清理')
-              .type(ButtonType.Normal)
-              .layoutWeight(1)
-              .height(30)
-              .fontSize(12)
-              .borderRadius(8)
-              .fontColor($r('app.color.on_accent'))
-              .backgroundColor($r('app.color.warning'))
-              .onClick(async () => { await this.cleanupOrphaned(false); })
-          }
-          .width('100%')
-        }
-        .width('100%')
-        .padding(12)
-        .backgroundColor('#14BB0947')
-        .borderRadius(12)
-      }
-
-      if (this.multiSelect) {
-        Row({ space: 8 }) {
-          Text(`已选 ${this.selectedIds.length} 条`)
-            .fontSize(12)
-            .fontColor($r('app.color.ink'))
-          Blank()
-          Button(this.filterStatus === 'archived' ? '批量恢复' : '批量归档')
-            .type(ButtonType.Normal)
-            .height(28)
-            .fontSize(11)
-            .borderRadius(8)
-            .fontColor($r('app.color.accent'))
-            .backgroundColor($r('app.color.tint'))
-            .enabled(this.selectedIds.length > 0)
-            .onClick(async () => { await this.batchToggleArchiveSelected(); })
-          Button('批量删除')
-            .type(ButtonType.Normal)
-            .height(28)
-            .fontSize(11)
-            .borderRadius(8)
-            .fontColor($r('app.color.on_accent'))
-            .backgroundColor($r('app.color.warning'))
-            .enabled(this.selectedIds.length > 0)
-            .onClick(async () => { await this.batchDeleteSelected(); })
-        }
-        .width('100%')
-        .padding(10)
-        .backgroundColor($r('app.color.surface'))
-        .borderRadius(10)
-      }
-
-      Text(`当前筛选（${this.scopeLabelText()}）：共 ${this.filteredTotalCount()} 条`)
-        .fontSize(11)
-        .fontColor($r('app.color.muted'))
-        .padding({ left: 2 })
-
-      if (this.filteredTotalCount() === 0) {
-        Text('暂无匹配的记忆条目')
-          .fontSize(13)
-          .fontColor($r('app.color.muted'))
-          .padding(24)
-      } else {
-        ForEach(this.pagedEntries(), (item: MemoryEntry) => {
-          Column({ space: 8 }) {
-            Row({ space: 6 }) {
-              if (this.multiSelect) {
-                Button(this.selectedIds.indexOf(item.id) >= 0 ? '☑' : '☐')
-                  .type(ButtonType.Normal)
-                  .width(28)
-                  .height(26)
-                  .padding(0)
-                  .fontSize(13)
-                  .borderRadius(6)
-                  .fontColor(this.selectedIds.indexOf(item.id) >= 0 ? $r('app.color.accent') : $r('app.color.muted'))
-                  .backgroundColor(Color.Transparent)
-                  .onClick(() => { this.toggleSelected(item.id); })
-              }
-              Text(this.categoryLabel(item.category))
-                .fontSize(11)
-                .fontColor($r('app.color.accent'))
-                .backgroundColor($r('app.color.tint'))
-                .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-                .borderRadius(10)
-
-              Text(this.personaName(item.assistantId))
-                .fontSize(11)
-                .fontColor($r('app.color.muted'))
-                .backgroundColor($r('app.color.canvas'))
-                .padding({ left: 8, right: 8, top: 3, bottom: 3 })
-                .borderRadius(10)
-                .maxLines(1)
-
-              Blank()
-
-              Button('编辑')
-                .type(ButtonType.Normal)
-                .height(26)
-                .fontSize(11)
-                .padding({ left: 8, right: 8 })
-                .borderRadius(6)
-                .fontColor($r('app.color.accent'))
-                .backgroundColor($r('app.color.canvas'))
-                .onClick(() => { this.openEditEntryEditor(item); })
-
-              Button(item.archived ? '恢复' : '归档')
-                .type(ButtonType.Normal)
-                .height(26)
-                .fontSize(11)
-                .padding({ left: 8, right: 8 })
-                .borderRadius(6)
-                .fontColor($r('app.color.ink'))
-                .backgroundColor($r('app.color.canvas'))
-                .onClick(async () => { await this.toggleArchive(item.id); })
-
-              Button('删除')
-                .type(ButtonType.Normal)
-                .height(26)
-                .fontSize(11)
-                .padding({ left: 8, right: 8 })
-                .borderRadius(6)
-                .fontColor($r('app.color.warning'))
-                .backgroundColor($r('app.color.canvas'))
-                .onClick(async () => { await this.deleteMemory(item.id); })
-            }
-            .width('100%')
-
-            Text(item.content)
-              .fontSize(14)
-              .lineHeight(20)
-              .fontColor($r('app.color.ink'))
-              .copyOption(CopyOptions.LocalDevice)
-
-            Text(`更新于 ${this.formatDateOnly(item.updatedAt)} · ${this.sourceLabel(item.source)}${item.archived ? ' · 已归档' : ''}`)
-              .fontSize(11)
-              .fontColor($r('app.color.muted'))
-          }
-          .alignItems(HorizontalAlign.Start)
-          .padding(12)
-          .backgroundColor($r('app.color.surface'))
-          .borderRadius(12)
-          .width('100%')
-        }, (item: MemoryEntry) => `${item.id}_${item.updatedAt}_${item.archived}_${this.selectedIds.indexOf(item.id) >= 0}`)
-
-        if (this.remainingEntryCount() > 0) {
-          Button(`加载更多（剩余 ${this.remainingEntryCount()} 条）`)
-            .type(ButtonType.Normal)
-            .width('100%')
-            .height(40)
-            .fontSize(13)
-            .borderRadius(12)
-            .fontColor($r('app.color.accent'))
-            .backgroundColor($r('app.color.surface'))
-            .onClick(() => {
-              this.pageLimit += 50;
-            })
-        }
-      }
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private renderProfileSubPage() {
-    Column({ space: 12 }) {
-      this.sectionLabel('标准画像字段')
-      Column() {
-        ForEach(STANDARD_PROFILE_FIELDS, (spec: StandardProfileFieldSpec, idx: number) => {
-          Column() {
-            if (idx > 0) {
-              Divider().color($r('app.color.line')).margin({ left: 14 })
-            }
-            if (this.editingProfileKey === spec.key) {
-              Column({ space: 8 }) {
-                Text(spec.labelZh)
-                  .fontSize(14)
-                  .fontWeight(FontWeight.Medium)
-                  .fontColor($r('app.color.ink'))
-                TextInput({ text: this.editingProfileVal, placeholder: spec.placeholderZh })
-                  .height(38)
-                  .borderRadius(8)
-                  .backgroundColor($r('app.color.canvas'))
-                  .onChange((v: string) => { this.editingProfileVal = v; })
-                Row({ space: 8 }) {
-                  Button('清空')
-                    .type(ButtonType.Normal)
-                    .height(30)
-                    .fontSize(12)
-                    .borderRadius(8)
-                    .fontColor($r('app.color.warning'))
-                    .backgroundColor($r('app.color.canvas'))
-                    .onClick(async () => { await this.saveProfileFieldValue(spec.key, ''); })
-                  Blank()
-                  Button('取消')
-                    .type(ButtonType.Normal)
-                    .height(30)
-                    .fontSize(12)
-                    .borderRadius(8)
-                    .fontColor($r('app.color.muted'))
-                    .backgroundColor($r('app.color.canvas'))
-                    .onClick(() => { this.editingProfileKey = ''; })
-                  Button('保存')
-                    .type(ButtonType.Normal)
-                    .height(30)
-                    .fontSize(12)
-                    .borderRadius(8)
-                    .fontColor($r('app.color.on_accent'))
-                    .backgroundColor($r('app.color.accent'))
-                    .onClick(async () => { await this.saveProfileFieldValue(spec.key, this.editingProfileVal); })
-                }
-                .width('100%')
-              }
-              .width('100%')
-              .padding(14)
-              .alignItems(HorizontalAlign.Start)
-            } else {
-              Row({ space: 10 }) {
-                Column({ space: 2 }) {
-                  Text(spec.labelZh)
-                    .fontSize(15)
-                    .fontWeight(FontWeight.Medium)
-                    .fontColor($r('app.color.ink'))
-                  Text(this.standardProfileValue(spec.key).length > 0 ? this.standardProfileValue(spec.key) : '未设置')
-                    .fontSize(13)
-                    .fontColor(this.standardProfileValue(spec.key).length > 0 ? $r('app.color.ink') : $r('app.color.muted'))
-                }
-                .alignItems(HorizontalAlign.Start)
-                .layoutWeight(1)
-
-                SymbolGlyph($r('sys.symbol.chevron_right'))
-                  .fontSize(15)
-                  .fontColor([$r('app.color.muted')])
-              }
-              .width('100%')
-              .padding({ left: 14, right: 12, top: 12, bottom: 12 })
-              .onClick(() => {
-                this.editingProfileKey = spec.key;
-                this.editingProfileVal = this.standardProfileValue(spec.key);
-              })
-            }
-          }
-        }, (spec: StandardProfileFieldSpec) => `stdprof_${spec.key}`)
-      }
-      .width('100%')
-      .backgroundColor($r('app.color.surface'))
-      .borderRadius(14)
-
-      this.sectionLabel('自定义字段')
-      ForEach(this.customProfileFields(), (f: UserProfileField) => {
-        Row({ space: 8 }) {
-          Column({ space: 2 }) {
-            Text(profileKeyDisplayLabel(profileFieldKey(f)))
-              .fontSize(13)
-              .fontColor($r('app.color.accent'))
-            Text(f.value)
-              .fontSize(14)
-              .fontColor($r('app.color.ink'))
-          }
-          .alignItems(HorizontalAlign.Start)
-          .layoutWeight(1)
-
-          Button('编辑')
-            .type(ButtonType.Normal)
-            .height(28)
-            .fontSize(11)
-            .borderRadius(6)
-            .fontColor($r('app.color.accent'))
-            .backgroundColor($r('app.color.canvas'))
-            .onClick(() => {
-              this.newProfileKey = profileFieldKey(f);
-              this.newProfileVal = f.value;
-              this.openSheet('profile');
-            })
-          Button('删除')
-            .type(ButtonType.Normal)
-            .height(28)
-            .fontSize(11)
-            .borderRadius(6)
-            .fontColor($r('app.color.warning'))
-            .backgroundColor($r('app.color.canvas'))
-            .onClick(async () => {
-              await this.saveProfileFieldValue(profileFieldKey(f), '');
-            })
-        }
-        .width('100%')
-        .padding(12)
-        .backgroundColor($r('app.color.surface'))
-        .borderRadius(12)
-      }, (f: UserProfileField) => `cust_${f.id}_${f.key}_${f.value}`)
-
-      Button('+ 添加自定义字段')
-        .type(ButtonType.Normal)
-        .width('100%')
-        .height(42)
-        .fontSize(14)
-        .borderRadius(12)
-        .fontColor($r('app.color.accent'))
-        .backgroundColor($r('app.color.surface'))
-        .onClick(() => {
-          this.newProfileKey = '';
-          this.newProfileVal = '';
-          this.openSheet('profile');
-        })
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private renderLegacySubPage() {
-    Column({ space: 10 }) {
-      if (this.legacyList().length === 0) {
-        Text('暂无旧版只读记忆')
-          .fontSize(13)
-          .fontColor($r('app.color.muted'))
-          .padding(20)
-      } else {
-        ForEach(this.legacyList(), (item: string, idx: number) => {
-          Row({ space: 8 }) {
-            Text(`${idx + 1}.`)
-              .fontSize(12)
-              .fontColor($r('app.color.accent'))
-            Text(item)
-              .fontSize(13)
-              .lineHeight(19)
-              .fontColor($r('app.color.ink'))
-              .layoutWeight(1)
-              .copyOption(CopyOptions.LocalDevice)
-          }
-          .width('100%')
-          .padding(12)
-          .backgroundColor($r('app.color.surface'))
-          .borderRadius(12)
-          .alignItems(VerticalAlign.Top)
-        }, (item: string, idx: number) => `leg_${idx}_${item.slice(0, 16)}`)
-      }
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private renderTracesSubPage() {
-    Column({ space: 10 }) {
-      Row({ space: 10 }) {
-        Column({ space: 2 }) {
-          Text('记录流水线追踪')
-            .fontSize(15)
-            .fontWeight(FontWeight.Medium)
-            .fontColor($r('app.color.ink'))
-          Text('保存每轮记忆整理的步骤耗时与提示词详情')
-            .fontSize(12)
-            .fontColor($r('app.color.muted'))
-        }
-        .alignItems(HorizontalAlign.Start)
-        .layoutWeight(1)
-
-        Toggle({ type: ToggleType.Switch, isOn: this.memorySettings.recordTraces !== false })
-          .onChange(async (v: boolean) => {
-            await this.updateSettingFlag('recordTraces', v);
-          })
-          .systemMaterial(ImmersiveMaterialStyle.controlMaterial(this.immersiveLightEnabled))
-      }
-      .width('100%')
-      .padding(12)
-      .backgroundColor($r('app.color.surface'))
-      .borderRadius(12)
-
-      Row() {
-        Text(`共 ${this.memoryTraces.length} 条流水线记录`)
-          .fontSize(12)
-          .fontColor($r('app.color.muted'))
-        Blank()
-        if (this.memoryTraces.length > 0) {
-          Button('清空流水')
-            .type(ButtonType.Normal)
-            .height(28)
-            .fontSize(11)
-            .borderRadius(8)
-            .fontColor($r('app.color.warning'))
-            .backgroundColor($r('app.color.surface'))
-            .onClick(async () => {
-              await this.onClearTraces();
-              this.statusTip = '已清空流水线追踪记录';
-            })
-        }
-      }
-      .width('100%')
-
-      if (this.memoryTraces.length === 0) {
-        Text('尚无后台记忆流水线运行记录')
-          .fontSize(13)
-          .fontColor($r('app.color.muted'))
-          .padding(20)
-      } else {
-        ForEach(this.memoryTraces, (tr: MemoryTrace) => {
-          Column({ space: 6 }) {
-            Row({ space: 6 }) {
-              Text(this.traceStatusLabel(tr))
-                .fontSize(12)
-                .fontWeight(FontWeight.Medium)
-                .fontColor(tr.error ? $r('app.color.warning') : (tr.gatekeeperPassed ? $r('app.color.accent') : $r('app.color.muted')))
-              if (tr.trigger) {
-                Text(tr.trigger === 'manual' ? '手动' : '自动')
-                  .fontSize(10)
-                  .fontColor($r('app.color.muted'))
-                  .backgroundColor($r('app.color.canvas'))
-                  .padding({ left: 6, right: 6, top: 2, bottom: 2 })
-                  .borderRadius(6)
-              }
-              Text(`新增 ${tr.extractedCount} · 合并 ${tr.mergedCount}${tr.conflictCount ? ' · 冲突 ' + tr.conflictCount : ''}${tr.skippedCount ? ' · 跳过 ' + tr.skippedCount : ''}`)
-                .fontSize(11)
-                .fontColor($r('app.color.muted'))
-              Blank()
-              Text(this.formatTs(tr.ts))
-                .fontSize(10)
-                .fontColor($r('app.color.muted'))
-            }
-            .width('100%')
-
-            if (tr.modelId) {
-              Text(`模型：${tr.modelId}`)
-                .fontSize(11)
-                .fontColor($r('app.color.muted'))
-            }
-            Text(tr.summary)
-              .fontSize(13)
-              .fontColor(tr.error ? $r('app.color.warning') : $r('app.color.ink'))
-
-            if (this.traceStepsFor(tr).length > 0) {
-              Button(this.expandedTraceId === tr.id ? '收起阶段详情' : `查看 ${this.traceStepsFor(tr).length} 个阶段详情`)
-                .type(ButtonType.Normal)
-                .height(26)
-                .fontSize(11)
-                .borderRadius(6)
-                .fontColor($r('app.color.accent'))
-                .backgroundColor($r('app.color.tint'))
-                .onClick(() => {
-                  this.expandedTraceId = this.expandedTraceId === tr.id ? '' : tr.id;
-                })
-            }
-
-            if (this.expandedTraceId === tr.id && this.traceStepsFor(tr).length > 0) {
-              ForEach(this.traceStepsFor(tr), (st: MemoryTraceStep, si: number) => {
-                Column({ space: 4 }) {
-                  Row({ space: 6 }) {
-                    Text(st.stage)
-                      .fontSize(12)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor($r('app.color.accent'))
-                    Text(this.traceStepStatusLabel(st))
-                      .fontSize(10)
-                      .fontColor((st.status === 'failed' || st.error) ? $r('app.color.warning') : $r('app.color.muted'))
-                    Blank()
-                    if (st.durationMs !== undefined) {
-                      Text(`${st.durationMs}ms`)
-                        .fontSize(10)
-                        .fontColor($r('app.color.muted'))
-                    }
-                  }
-                  .width('100%')
-                  Text(st.summary)
-                    .fontSize(12)
-                    .fontColor($r('app.color.ink'))
-                  if (this.traceStepResponseText(st).length > 0) {
-                    Text(this.traceStepResponseText(st))
-                      .fontSize(11)
-                      .fontColor((st.status === 'failed' || st.error) ? $r('app.color.warning') : $r('app.color.muted'))
-                      .copyOption(CopyOptions.LocalDevice)
-                  }
-                }
-                .width('100%')
-                .padding(8)
-                .backgroundColor($r('app.color.canvas'))
-                .borderRadius(8)
-                .alignItems(HorizontalAlign.Start)
-              }, (st: MemoryTraceStep, si: number) => `${tr.id}_st_${si}`)
-            }
-          }
-          .alignItems(HorizontalAlign.Start)
-          .padding(12)
-          .backgroundColor($r('app.color.surface'))
-          .borderRadius(12)
-          .width('100%')
-        }, (tr: MemoryTrace) => `${tr.id}_${this.expandedTraceId === tr.id}`)
-      }
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
-  private renderAboutSubPage() {
-    Column({ space: 12 }) {
-      Column({ space: 6 }) {
-        Text('快速开始')
-          .fontSize(15)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.ink'))
-        Text('1. 在「设置 → 记忆」中选择处理模型。\n2. 在助手的「记忆」标签页开启长期记忆与自动整理。\n3. 进行几轮对话或点击「整理」，然后在记忆列表中查看提取结果。')
-          .fontSize(13)
-          .lineHeight(20)
-          .fontColor($r('app.color.ink'))
-      }
-      .width('100%')
-      .padding(14)
-      .backgroundColor($r('app.color.surface'))
-      .borderRadius(14)
-      .alignItems(HorizontalAlign.Start)
-
-      Column({ space: 6 }) {
-        Text('四种记忆类型')
-          .fontSize(15)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.ink'))
-        Text('• 身份 (identity)：用户背景、称呼、职业与长期偏好等稳定事实，用完整第三人称陈述。\n• 工作方式 (workflow)：偏好的工具链、流程与复盘习惯。\n• 表达风格 (voice)：偏好的语气、篇幅、句式与语言风格。\n• 用户指令 (instruction)：助手需长期遵守的固定规则，而非一次性任务。')
-          .fontSize(13)
-          .lineHeight(20)
-          .fontColor($r('app.color.ink'))
-      }
-      .width('100%')
-      .padding(14)
-      .backgroundColor($r('app.color.surface'))
-      .borderRadius(14)
-      .alignItems(HorizontalAlign.Start)
-
-      Column({ space: 6 }) {
-        Text('全局与助手范围')
-          .fontSize(15)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.ink'))
-        Text('全局记忆对所有启用长期记忆的助手可见；助手范围记忆仅对该助手可见。适合全局的是应跨助手跟随的个人事实，适合助手范围的是特定角色的创作设定或规则。')
-          .fontSize(13)
-          .lineHeight(20)
-          .fontColor($r('app.color.ink'))
-      }
-      .width('100%')
-      .padding(14)
-      .backgroundColor($r('app.color.surface'))
-      .borderRadius(14)
-      .alignItems(HorizontalAlign.Start)
-
-      Column({ space: 6 }) {
-        Text('记忆如何注入与工具协作')
-          .fontSize(15)
-          .fontWeight(FontWeight.Bold)
-          .fontColor($r('app.color.ink'))
-        Text('新对话开始时，每个分类最新的条目会按注入上限注入上下文。超出上限的分类会标记 mode="summary" 与总数，助手可通过 memory_search_profile / memory_read 按需检索，并通过 memory_update / memory_edit / memory_delete 实时维护。')
-          .fontSize(13)
-          .lineHeight(20)
-          .fontColor($r('app.color.ink'))
-      }
-      .width('100%')
-      .padding(14)
-      .backgroundColor($r('app.color.surface'))
-      .borderRadius(14)
-      .alignItems(HorizontalAlign.Start)
-    }
-    .width('100%')
-    .alignItems(HorizontalAlign.Start)
-  }
-
-  @Builder
   private navTitleBar() {
     if (this.subPage === 'home') {
       KelivoNavTitleBar({
@@ -2054,7 +1016,7 @@ export struct MemoryPanel {
       })
     } else if (this.subPage === 'template') {
       KelivoNavTitleBar({
-        titleText: this.currentTemplateSpec().title,
+        titleText: findMemoryTemplateSpec(this.editTemplateKind).title,
         subtitleText: this.editTemplateLang === 'zh' ? '中文模板' : 'English 模板',
         showBack: true,
         rightText: '保存',
@@ -2091,7 +1053,7 @@ export struct MemoryPanel {
     Column({ space: 10 }) {
       Flex({ wrap: FlexWrap.Wrap }) {
         ForEach(MEMORY_CATEGORIES, (cat: MemoryCategory) => {
-          Button(this.categoryLabel(cat))
+          Button(memoryCategoryLabel(cat))
             .type(ButtonType.Normal)
             .height(28)
             .fontSize(11)
@@ -2111,7 +1073,7 @@ export struct MemoryPanel {
         .onChange((v: string) => { this.entryContent = v; })
 
       Row({ space: 8 }) {
-        Button(this.entryScopeId === '' ? '范围：全局' : `范围：${this.personaName(this.entryScopeId)}`)
+        Button(this.entryScopeId === '' ? '范围：全局' : `范围：${memoryPersonaName(this.personas, this.entryScopeId)}`)
           .type(ButtonType.Normal)
           .height(34)
           .fontSize(12)
@@ -2234,19 +1196,88 @@ export struct MemoryPanel {
             if (this.subPage === 'home') {
               this.renderHomeSubPage()
             } else if (this.subPage === 'list') {
-              this.renderListSubPage()
+              MemoryListSubView({
+                personas: this.personas,
+                orphanCount: this.orphanCount(),
+                scopeLabel: this.scopeLabelText(),
+                filteredTotal: this.filteredTotalCount(),
+                remainingCount: this.remainingEntryCount(),
+                pagedItems: this.pagedEntries(),
+                searchQuery: this.searchQuery,
+                filterScope: this.filterScope,
+                filterCat: this.filterCat,
+                filterStatus: this.filterStatus,
+                pageLimit: this.pageLimit,
+                multiSelect: this.multiSelect,
+                selectedIds: this.selectedIds,
+                onOpenAdd: () => { this.openAddEntryEditor(); },
+                onOpenEdit: (item: MemoryEntry) => { this.openEditEntryEditor(item); },
+                onToggleArchive: (id: string) => this.toggleArchive(id),
+                onDeleteMemory: (id: string) => this.deleteMemory(id),
+                onCleanupOrphaned: (convertToGlobal: boolean) => this.cleanupOrphaned(convertToGlobal),
+                onBatchToggleArchive: () => this.batchToggleArchiveSelected(),
+                onBatchDelete: () => this.batchDeleteSelected(),
+                onToggleSelected: (id: string) => { this.toggleSelected(id); }
+              })
             } else if (this.subPage === 'profile') {
-              this.renderProfileSubPage()
+              MemoryProfileSubView({
+                userProfile: this.userProfile,
+                editingProfileKey: this.editingProfileKey,
+                editingProfileVal: this.editingProfileVal,
+                onSaveProfileField: (key: string, val: string) => this.saveProfileFieldValue(key, val),
+                onOpenCustomField: (key: string, val: string) => {
+                  this.newProfileKey = key;
+                  this.newProfileVal = val;
+                  this.openSheet('profile');
+                }
+              })
             } else if (this.subPage === 'legacy') {
-              this.renderLegacySubPage()
+              MemoryLegacySubView({
+                legacyItems: this.legacyList()
+              })
             } else if (this.subPage === 'traces') {
-              this.renderTracesSubPage()
+              MemoryTracesSubView({
+                memoryTraces: this.memoryTraces,
+                recordTraces: this.memorySettings.recordTraces !== false,
+                onToggleRecordTraces: (v: boolean) => this.updateSettingFlag('recordTraces', v),
+                onClearTraces: async () => {
+                  await this.onClearTraces();
+                  this.statusTip = '已清空流水线追踪记录';
+                }
+              })
             } else if (this.subPage === 'template') {
-              this.renderTemplateSubPage()
+              MemoryTemplateEditorSubView({
+                specSubtitle: findMemoryTemplateSpec(this.editTemplateKind).subtitle,
+                editLang: this.editTemplateLang,
+                editText: this.editTemplateText,
+                onSwitchLang: (lang: 'zh' | 'en') => { this.switchTemplateEditorLang(lang); },
+                onReset: () => this.resetTemplateToDefault(),
+                onSave: () => this.saveTemplateEdit()
+              })
             } else if (this.subPage === 'modelPicker') {
-              this.renderModelPickerSubPage()
+              MemoryModelPickerSubView({
+                selectedProviderId: this.modelDefaults.memoryProviderId,
+                selectedModelId: this.modelDefaults.memoryModelId,
+                choices: collectMemoryModelChoices(this.providers),
+                onSelectFollowChat: async () => {
+                  const next = cloneMemoryModelDefaults(this.modelDefaults);
+                  next.memoryProviderId = '';
+                  next.memoryModelId = '';
+                  await this.onSaveModelDefaults(next);
+                  this.statusTip = '记忆处理模型已设为跟随对话模型';
+                  this.navigateSubPage('home');
+                },
+                onSelectChoice: async (choice) => {
+                  const next = cloneMemoryModelDefaults(this.modelDefaults);
+                  next.memoryProviderId = choice.providerId;
+                  next.memoryModelId = choice.modelId;
+                  await this.onSaveModelDefaults(next);
+                  this.statusTip = `处理模型已设为 ${choice.providerName} / ${choice.modelId}`;
+                  this.navigateSubPage('home');
+                }
+              })
             } else {
-              this.renderAboutSubPage()
+              MemoryAboutSubView()
             }
           }
           .width('100%')
